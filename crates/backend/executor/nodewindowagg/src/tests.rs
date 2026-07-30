@@ -1,0 +1,15 @@
+use ::types_nodes::rawnodes::{
+    FRAMEOPTION_END_CURRENT_ROW, FRAMEOPTION_RANGE, FRAMEOPTION_START_UNBOUNDED_PRECEDING,
+};
+
+use crate::*;
+
+// parsenodes.h: RANGE | START_UNBOUNDED_PRECEDING | END_CURRENT_ROW == 0x422.
+#[test]
+fn frameoption_defaults_value_matches_c() {
+    assert_eq!(
+        FRAMEOPTION_DEFAULTS,
+        FRAMEOPTION_RANGE | FRAMEOPTION_START_UNBOUNDED_PRECEDING | FRAMEOPTION_END_CURRENT_ROW
+    );
+    assert_eq!(FRAMEOPTION_DEFAULTS, 0x422);
+}
