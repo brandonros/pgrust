@@ -23,6 +23,9 @@
 
 <br />
 
+> **New:** [Rebuilding Postgres for 300x faster analytics: batching, operator
+> fusion, and SIMD](https://malisper.me/how-we-made-postgres-hundreds-of-times-faster-the-query-engine/)
+
 pgrust is a re-implementation of Postgres meant to show what Postgres would
 look like if it was built in 2026. It is wire compatible and even SQL dialect
 compatible with Postgres. It passes
@@ -74,6 +77,10 @@ pgrust's builtin columnar layout.
 
 On sysbench-oltp, pgrust achieved 30% higher throughput than Postgres 18.3 on
 read-only workloads at 300GB scale.
+
+For a code-level walkthrough of one part of that speedup, read
+[Rebuilding Postgres for 300x faster analytics: batching, operator fusion, and
+SIMD](https://malisper.me/how-we-made-postgres-hundreds-of-times-faster-the-query-engine/).
 
 These runs were reviewed independently by **Greg Smith**, author of
 *PostgreSQL 9.0 High Performance*.
