@@ -23,8 +23,7 @@
 
 <br />
 
-> **New:** [Rebuilding Postgres for 300x faster analytics: batching, operator
-> fusion, and SIMD](https://malisper.me/how-we-made-postgres-hundreds-of-times-faster-the-query-engine/)
+> **New:** [How AI Changes the Economics of JIT Compilers](https://malisper.me/how-ai-changes-the-economics-of-jit-compilers/)
 
 pgrust is a re-implementation of Postgres meant to show what Postgres would
 look like if it was built in 2026. It is wire compatible and even SQL dialect
@@ -79,8 +78,7 @@ On sysbench-oltp, pgrust achieved 30% higher throughput than Postgres 18.3 on
 read-only workloads at 300GB scale.
 
 For a code-level walkthrough of one part of that speedup, read
-[Rebuilding Postgres for 300x faster analytics: batching, operator fusion, and
-SIMD](https://malisper.me/how-we-made-postgres-hundreds-of-times-faster-the-query-engine/).
+[Rebuilding Postgres for 300x faster analytics: batching, operator fusion, and SIMD](https://malisper.me/how-we-made-postgres-hundreds-of-times-faster-the-query-engine/).
 
 These runs were reviewed independently by **Greg Smith**, author of
 *PostgreSQL 9.0 High Performance*.
@@ -96,6 +94,17 @@ will not reproduce them exactly from a download.
 Benchmarks and durability settings are unchanged from a default install:
 `fsync` is on. The harnesses are in [`benchmarks/`](benchmarks/) so you can
 run them yourself.
+
+## Writing
+
+- [How AI Changes the Economics of JIT Compilers](https://malisper.me/how-ai-changes-the-economics-of-jit-compilers/):
+  building a copy-and-patch ARM64 JIT in Rust.
+- [Rebuilding Postgres for 300x faster analytics: batching, operator fusion, and SIMD](https://malisper.me/how-we-made-postgres-hundreds-of-times-faster-the-query-engine/):
+  how pgrust makes analytical queries faster.
+- [Postgres in Rust: three dead ends before we passed 100% of the regression suite](https://malisper.me/postgres-in-rust-regression-suite/): what failed
+  before pgrust reached full regression-suite compatibility.
+- [pgrust: Rebuilding Postgres in Rust with AI](https://malisper.me/pgrust-rebuilding-postgres-in-rust-with-ai/):
+  why we started the project.
 
 ## Testing
 
