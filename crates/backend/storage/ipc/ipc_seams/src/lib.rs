@@ -23,3 +23,11 @@ seam_core::seam!(
     // check_on_shmem_exit_lists_are_empty (ipc.c): FATAL if any registered.
     pub fn check_on_shmem_exit_lists_are_empty() -> types_error::PgResult<()>
 );
+
+seam_core::seam!(
+    // Process-wide exit hook (pgrust addition, no C counterpart): runs once,
+    // when the process itself exits -- the postmaster thread in server mode,
+    // the lone backend in single-user mode -- never when a backend thread
+    // leaves. For state shared by every backend, such as the objkv lease.
+    pub fn on_process_exit(callback: fn(code: i32, arg: usize), arg: usize)
+);

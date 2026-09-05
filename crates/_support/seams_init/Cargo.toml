@@ -77,6 +77,7 @@ executils = { path = "../../backend/executor/executils" }
 execexpr = { path = "../../backend/executor/execexpr" }
 execjunk = { path = "../../backend/executor/execjunk" }
 execmain = { path = "../../backend/executor/execmain" }
+objkv_lift = { path = "../../backend/access/objkv/objkv_lift" }
 execscan = { path = "../../backend/executor/execscan" }
 nodeseqscan = { path = "../../backend/executor/nodeseqscan" }
 nodesamplescan = { path = "../../backend/executor/nodesamplescan" }
