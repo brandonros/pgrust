@@ -1364,6 +1364,7 @@ dependencies = [
  "pgvector_hnsw",
  "spgist_validate",
  "syscache_seams",
+ "tableam_vocab",
  "types_core",
  "types_error",
  "types_gist",
@@ -2892,6 +2893,7 @@ dependencies = [
  "nbtree",
  "nbtsort",
  "nodes_core",
+ "objkv_build",
  "outfuncs",
  "pg_constraint",
  "pg_depend",
@@ -2912,6 +2914,7 @@ dependencies = [
  "syscache_seams",
  "table",
  "tableam",
+ "tableam_seams",
  "tablecmds_seams",
  "trigger",
  "tupdesc",
@@ -7865,6 +7868,7 @@ dependencies = [
  "indexam_seams",
  "mcx",
  "nbtree",
+ "objkv",
  "pgstat",
  "pgvector_hnsw",
  "predicate",
@@ -7917,6 +7921,7 @@ dependencies = [
  "clauses",
  "cmdtag",
  "coerce",
+ "commands_amcmds",
  "commands_comment",
  "commands_tablespace",
  "datum",
@@ -7961,6 +7966,8 @@ dependencies = [
  "snapmgr",
  "syscache_seams",
  "table",
+ "tableam",
+ "tableam_vocab",
  "tablecmds",
  "tupdesc",
  "types_array",
@@ -10762,6 +10769,21 @@ dependencies = [
  "pgsync",
  "rusty-s3",
  "ureq",
+]
+
+[[package]]
+name = "objkv_build"
+version = "0.1.0"
+dependencies = [
+ "datum",
+ "execindexing",
+ "exectuples",
+ "mcx",
+ "objkv",
+ "tableam",
+ "types_error",
+ "types_rel",
+ "types_slot",
 ]
 
 [[package]]
@@ -19732,6 +19754,7 @@ dependencies = [
  "datum",
  "gin_vocab",
  "mcx",
+ "objkv",
  "pgsync",
  "snapmgr",
  "tableam",

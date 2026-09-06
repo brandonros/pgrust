@@ -848,6 +848,7 @@ members = [
     "crates/backend/utils/adt/pseudorandomfuncs",
     "crates/backend/utils/adt/pg_upgrade_support",
     "crates/_support/objkv",
+    "crates/backend/access/objkv/objkv_build",
 ]
 
 [workspace.package]

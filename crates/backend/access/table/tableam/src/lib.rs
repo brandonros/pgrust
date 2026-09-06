@@ -134,6 +134,7 @@ fn objkv_row_lock_unsupported(mode: LockTupleMode) -> Box<::types_error::PgError
 }
 
 pub mod objkv_am;
+pub mod objkv_index;
 
 // --- The dispatch-facing scan values (closed per-AM extensions, rule 4) ---
 

@@ -149,7 +149,6 @@ thread_local! {
 /// An untouched index's entries are left alone.
 static INDEX_TABLES: Mutex<Option<BTreeMap<u32, u32>>> = Mutex::new(None);
 
-#[allow(dead_code)] // called by the index AM, the next change in this series
 pub(crate) fn note_index_table(index: ::types_core::Oid, relid: ::types_core::Oid) {
     let mut g = INDEX_TABLES.lock().unwrap();
     g.get_or_insert_with(BTreeMap::new).insert(index, relid);
@@ -427,7 +426,6 @@ pub(crate) fn stage_mark() -> u64 {
 /// Records that this transaction decided something from the bucket at `seq`.
 /// An insert-only transaction never takes an objkv snapshot, so without this
 /// two inserts of one unique value both commit.
-#[allow(dead_code)] // called by the index AM, the next change in this series
 pub(crate) fn observe_read_at(seq: u64) {
     XACT_SNAPSHOT.set(XACT_SNAPSHOT.get().min(seq));
     note_in_use(seq);
@@ -2291,6 +2289,10 @@ pub fn update_tuple_image(
     otid: &ItemPointerData,
     tup: &mut HeapTupleData<'_>,
 ) -> PgResult<()> {
+    // Same row id, new contents: the entries for the old contents would
+    // otherwise stay, pointing at a row that no longer carries that value.
+    let cx = ::mcx::MemoryContext::new("objkv retire entries");
+    crate::objkv_index::retire_entries(cx.mcx(), rel, rowid_of(otid))?;
     let image = catalog_image(rel, tup)?;
     let rowid = rowid_of(otid);
     update_row_in_place(scope(rel), relid(rel), rowid, image)?;
@@ -2300,6 +2302,11 @@ pub fn update_tuple_image(
 }
 
 pub fn tuple_delete(rel: &Relation<'_>, tid: &ItemPointerData) -> PgResult<()> {
+    // Before the row goes: the entry keys are read off the row as it stands.
+    // Its own context because eighty places delete a catalog row and none hand
+    // one down; nothing allocated here outlives the call.
+    let cx = ::mcx::MemoryContext::new("objkv retire entries");
+    crate::objkv_index::retire_entries(cx.mcx(), rel, rowid_of(tid))?;
     delete_row(scope(rel), relid(rel), rowid_of(tid))
 }
 
@@ -2311,6 +2318,7 @@ pub fn tuple_update<'mcx>(
     old_tid: &ItemPointerData,
     slot: &mut SlotData<'mcx>,
 ) -> PgResult<()> {
+    crate::objkv_index::retire_entries(mcx, rel, rowid_of(old_tid))?;
     delete_row(scope(rel), relid(rel), rowid_of(old_tid))?;
     tuple_insert(mcx, rel, slot)
 }
