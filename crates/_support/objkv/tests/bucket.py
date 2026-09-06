@@ -15,7 +15,8 @@ in a dependency for six lines of HMAC.
 import datetime, hashlib, hmac, os, sys, urllib.error, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 
-ENDPOINT = os.environ.get("OBJKV_S3_ENDPOINT", "http://127.0.0.1:9000")
+# No trailing slash: the request path is signed, and `//bucket` is not `/bucket`.
+ENDPOINT = os.environ.get("OBJKV_S3_ENDPOINT", "http://127.0.0.1:9000").rstrip("/")
 _url = urllib.parse.urlparse(ENDPOINT)
 HOST = _url.netloc
 

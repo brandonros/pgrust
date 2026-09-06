@@ -24,12 +24,18 @@ BEFORE=$(objects)
 
 echo "1. $WRITERS sessions, $PER single-statement transactions each, at once"
 WANT=$((WRITERS * PER))
+# Every session connects, then waits for the starting gun: against a local
+# store a PUT is faster than a psql start-up, and without the gate the first
+# session could be done before the last has connected, with nothing to group.
+GO="$WORK/gc.go"; rm -f "$GO"
 JOBS=""
 for w in $(seq 1 "$WRITERS"); do
-    ( seq 1 "$PER" | sed "s/.*/INSERT INTO gc VALUES ($w,&,'sync');/" \
+    ( { echo "\\! while [ ! -e '$GO' ]; do sleep 0.02; done"
+        seq 1 "$PER" | sed "s/.*/INSERT INTO gc VALUES ($w,&,'sync');/"; } \
         | psqlx -d postgres -q >/dev/null 2>&1 ) &
     JOBS="$JOBS $!"
 done
+sleep 1; touch "$GO"
 for j in $JOBS; do wait "$j"; done
 AFTER=$(objects)
 LANDED=$((AFTER - BEFORE))

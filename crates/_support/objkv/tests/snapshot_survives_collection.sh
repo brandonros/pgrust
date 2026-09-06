@@ -41,6 +41,8 @@ echo "  100 rows, count:sum = $WANT, $HISTORY commits of history"
 echo "1. session A opens REPEATABLE READ and reads"
 # A is one psql fed through a pipe and kept open across the churn. Its output
 # is a file psql flushes at exit, so progress is signalled with \! touch.
+# fresh_cluster keeps $WORK: a FIFO from an earlier run would fail mkfifo.
+rm -f "$WORK/a.in"
 mkfifo "$WORK/a.in"
 psqlx -d postgres -tA <"$WORK/a.in" >"$WORK/a.out" 2>&1 &
 A_PID=$!
