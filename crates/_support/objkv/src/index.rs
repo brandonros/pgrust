@@ -34,6 +34,11 @@ pub struct ScanState {
     /// place for each row. Eight-byte units because the tuple layout needs
     /// that alignment. Valid until the next row, as an AM's image is.
     pub itup: Vec<u64>,
+    /// A condition the key encoding could not seek on was left out of the
+    /// scan (a cross-type comparison the planner admitted by operator
+    /// family), so the rows are a superset and the executor must re-apply
+    /// the quals to each.
+    pub recheck: bool,
 }
 
 impl ScanState {
@@ -67,6 +72,7 @@ impl ScanState {
         self.resume = None;
         self.started = false;
         self.backward = false;
+        self.recheck = false;
     }
 }
 

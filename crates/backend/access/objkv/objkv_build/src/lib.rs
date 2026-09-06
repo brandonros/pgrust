@@ -69,7 +69,7 @@ pub fn objkvbuild<'mcx>(
             &values,
             &isnull,
             rowid,
-            false,
+            tableam::objkv_index::UniqueCheck::Yes,
         )?;
         n += 1.0;
     }

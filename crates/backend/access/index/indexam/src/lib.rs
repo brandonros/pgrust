@@ -1013,13 +1013,17 @@ fn objkv_gettuple(
     st.backward = backward;
     st.want_keys = scan.xs_want_itup;
 
+    // The conditions, once: a scan that fetches several windows reads the
+    // same keys for each, and expanding an IN list detoasts its array.
+    let mut conds: Option<Vec<tableam::objkv_index::Cond>> = None;
     // A window at a time, so a query that wants ten rows from a range of a
     // million reads ten. A window can come back empty without the range being
     // finished, which is why this is a loop rather than one call.
     while st.wants_more() {
         let mcx = *scan.keyData.allocator();
         let index = scan.index_rel();
-        let mut conds: Vec<tableam::objkv_index::Cond> = Vec::new();
+        if conds.is_none() {
+        let mut built: Vec<tableam::objkv_index::Cond> = Vec::new();
         for key in scan.keyData[..scan.numberOfKeys as usize].iter() {
             if key.sk_attno < 1 {
                 return Err(tableam::objkv_unsupported("index conditions on a whole row"));
@@ -1046,7 +1050,7 @@ fn objkv_gettuple(
             } else {
                 vec![key.sk_argument]
             };
-            conds.push(tableam::objkv_index::Cond {
+            built.push(tableam::objkv_index::Cond {
                 col: key.sk_attno as usize - 1,
                 strategy,
                 nulltest,
@@ -1060,8 +1064,10 @@ fn objkv_gettuple(
                 subtype: key.sk_subtype,
             });
         }
+        conds = Some(built);
+        }
         let at = tableam::objkv_am::snapshot_seq(scan.xs_snapshot.as_deref())?;
-        tableam::objkv_index::load_scan(mcx, index, &mut st, &conds, at)?;
+        tableam::objkv_index::load_scan(mcx, index, &mut st, conds.as_deref().unwrap_or(&[]), at)?;
     }
 
     match st.next() {
@@ -1074,8 +1080,9 @@ fn objkv_gettuple(
             // invalidates them, and every condition is applied before this
             // point. It has to be the AM's job -- genam does not recheck, and
             // a wrong pg_attribute row becomes a relcache entry built from
-            // another relation's columns.
-            scan.xs_recheck = false;
+            // another relation's columns. The one exception is a condition
+            // the encoding could not seek on, which the executor re-applies.
+            scan.xs_recheck = st.recheck;
             Ok(true)
         }
         None => Ok(false),
@@ -1091,7 +1098,7 @@ fn objkv_getbitmap(
 ) -> PgResult<i64> {
     let mut ntids: i64 = 0;
     while objkv_gettuple(scan, ScanDirection::ForwardScanDirection)? {
-        tbm.add_tuples(core::slice::from_ref(&scan.xs_heaptid), false)?;
+        tbm.add_tuples(core::slice::from_ref(&scan.xs_heaptid), scan.xs_recheck)?;
         ntids += 1;
     }
     Ok(ntids)
@@ -1270,9 +1277,14 @@ fn am_insert<'mcx>(
                 values,
                 isnull,
                 tableam::objkv_am::rowid_of(heap_t_ctid),
-                // A speculative or deferred check wants the duplicate
-                // reported, not raised: ON CONFLICT DO NOTHING is not an error.
-                checkUnique == IndexUniqueCheck::UNIQUE_CHECK_PARTIAL,
+                match checkUnique {
+                    IndexUniqueCheck::UNIQUE_CHECK_NO => tableam::objkv_index::UniqueCheck::No,
+                    IndexUniqueCheck::UNIQUE_CHECK_YES => tableam::objkv_index::UniqueCheck::Yes,
+                    // A speculative or deferred check wants the duplicate
+                    // reported, not raised: ON CONFLICT DO NOTHING is not an error.
+                    IndexUniqueCheck::UNIQUE_CHECK_PARTIAL => tableam::objkv_index::UniqueCheck::Partial,
+                    IndexUniqueCheck::UNIQUE_CHECK_EXISTING => tableam::objkv_index::UniqueCheck::Existing,
+                },
             )
         }
         IndexAmKind::Bloom => {

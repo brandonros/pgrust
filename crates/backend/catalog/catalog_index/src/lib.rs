@@ -1150,6 +1150,10 @@ pub fn index_build<'mcx>(
                 types_relscan::IndexAmKind::Brin => brin_build::brinbuildempty(indexRelation)?,
                 types_relscan::IndexAmKind::Hnsw => pgvector_hnsw_build::hnswbuildempty(indexRelation)?,
                 types_relscan::IndexAmKind::Bloom => bloom_build::blbuildempty(indexRelation)?,
+                // Nothing on disk to initialise: the entries are in the bucket.
+                // (An unlogged objkv table is refused at CREATE; this arm is
+                // what an unlogged index would need if one ever got here.)
+                types_relscan::IndexAmKind::Objkv => {}
                 #[allow(unreachable_patterns)]
                 other => unported(&format!("index_build: ambuildempty for AM {other:?}")),
             }

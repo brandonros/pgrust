@@ -448,6 +448,18 @@ fn row_entry_key(
     else {
         return Ok(None); // the row is gone; the entry is a leftover
     };
+    entry_key_of_image(mcx, index, heap, rowid, &image)
+}
+
+/// The entry `index` holds for the row whose image this is; `None` for a
+/// row a partial index does not cover.
+fn entry_key_of_image(
+    mcx: Mcx<'_>,
+    index: &Relation<'_>,
+    heap: &Relation<'_>,
+    rowid: u64,
+    image: &[u8],
+) -> PgResult<Option<Vec<u8>>> {
     let Some(ind) = index.rd_index.as_ref() else {
         return Ok(None);
     };
@@ -521,6 +533,21 @@ pub fn insert_unchecked(
 /// insert (`INSERT ... ON CONFLICT`) and a deferred constraint both want the
 /// duplicate reported rather than raised, so the caller can withdraw the row
 /// or queue the recheck. Returns whether the entry satisfies the constraint.
+/// What the executor asked of a unique index at insert: the four
+/// `IndexUniqueCheck` modes, with the same meanings nbtree gives them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UniqueCheck {
+    /// No check: a non-unique index, or a caller that will check later.
+    No,
+    /// A duplicate is an error.
+    Yes,
+    /// A duplicate is reported (`Ok(false)`), not raised: speculative
+    /// insertion and deferred constraints decide what to do with it.
+    Partial,
+    /// The entry is already there; only say whether it now has a duplicate.
+    Existing,
+}
+
 pub fn insert(
     mcx: Mcx<'_>,
     index: &Relation<'_>,
@@ -528,7 +555,7 @@ pub fn insert(
     values: &[Datum],
     isnull: &[bool],
     rowid: u64,
-    report_duplicate: bool,
+    check: UniqueCheck,
 ) -> PgResult<bool> {
     note_table_of(index);
     let owned = cols_of(mcx, index, values, isnull)?;
@@ -538,7 +565,7 @@ pub fn insert(
         .map_err(as_pg_error)?;
 
     // A NULL is never a duplicate, and is keyed with its rowid for that reason.
-    if unique && !cols.iter().any(Col::is_null) {
+    if unique && check != UniqueCheck::No && !cols.iter().any(Col::is_null) {
         let duplicate = match objkv_am::staged_op(&key) {
             // Ours, invisible to the store check below -- unless it names the
             // row being written, which is an updated catalog row's own entry.
@@ -554,7 +581,7 @@ pub fn insert(
             },
         };
         if duplicate {
-            if report_duplicate {
+            if check == UniqueCheck::Partial {
                 // Staged anyway, as nbtree inserts the tuple anyway: the row
                 // is withdrawn or the recheck fires, and either way that path
                 // removes the entry with it.
@@ -571,7 +598,10 @@ pub fn insert(
         }
     }
 
-    objkv_am::stage(key, Op::Put(index_key::payload(rowid)))?;
+    // The entry an `Existing` check asks about is already staged.
+    if check != UniqueCheck::Existing {
+        objkv_am::stage(key, Op::Put(index_key::payload(rowid)))?;
+    }
     Ok(true)
 }
 
@@ -997,11 +1027,14 @@ pub fn load_scan(
         // Read the value as the operator's type, then check it can be brought
         // to the column's encoding -- a text bound on a name column is fine,
         // one on an integer column is not, and would silently mis-order.
+        // The planner admits any operator of the column's family, so a
+        // `date` bound on a `timestamp` column arrives here too; that one
+        // is left out of the seek and the executor re-applies it to each
+        // row, which is slower than a seek and never wrong.
         let read_as = if c.subtype != 0 { c.subtype } else { col_type };
         if !same_encoding(col_type, read_as) {
-            return Err(refuse(format!(
-                "objkv indexes: comparing a column of type {col_type} against a value of type {read_as}"
-            )));
+            scan.recheck = true;
+            continue;
         }
         let (strategy, vals) = if c.nulltest || c.isnull {
             (c.strategy, vec![Owned::Null])
@@ -1293,6 +1326,21 @@ pub fn retire_entries(mcx: Mcx<'_>, heap: &Relation<'_>, rowid: u64) -> PgResult
     }
     let scope = objkv_am::scope(heap);
     let indexes = ::relcache_seams::relation_get_index_list::call(mcx, heap.rd_id)?;
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    // The row as it stands, read once for every index; a cold row is one
+    // object-store GET, not one per index.
+    let Some(image) = objkv_am::fetch_row(
+        scope,
+        objkv_am::relid(heap),
+        rowid,
+        ::objkv::key::LATEST,
+        ::types_core::xact::InvalidCommandId,
+    )?
+    else {
+        return Ok(()); // the row is gone; its entries are leftovers
+    };
     for &oid in indexes.iter() {
         // relation_open, not table_open: the latter refuses anything that is
         // not a table, and these are indexes.
@@ -1303,12 +1351,12 @@ pub fn retire_entries(mcx: Mcx<'_>, heap: &Relation<'_>, rowid: u64) -> PgResult
         )?;
         let ours = ::tableam_vocab::is_objkv_index_am_oid(index.rd_rel.relam);
         // A row a partial index does not cover has no entry, and
-        // row_entry_key says so by returning None.
-        // Not `?`: `row_entry_key` fails on a refused collation or type, on a
-        // malformed name, and on any object-store error, and returning through
-        // it would leave the relcache reference held -- which assertion builds
-        // report even though the abort releases it.
-        let key = match if ours { row_entry_key(mcx, &index, heap, scope, rowid) } else { Ok(None) }
+        // entry_key_of_image says so by returning None.
+        // Not `?`: it fails on a refused collation or type, on a malformed
+        // name, and on any object-store error, and returning through it would
+        // leave the relcache reference held -- which assertion builds report
+        // even though the abort releases it.
+        let key = match if ours { entry_key_of_image(mcx, &index, heap, rowid, &image) } else { Ok(None) }
         {
             Ok(key) => key,
             Err(e) => {

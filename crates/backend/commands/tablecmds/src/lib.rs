@@ -367,6 +367,20 @@ pub fn DefineRelation<'mcx>(
     } else {
         InvalidOid
     };
+    // Unlogged asks for an init fork to reset the relation from after a
+    // crash; objkv rows are in the bucket and survive one, so there is
+    // nothing the mode could mean.
+    if rv.relpersistence == types_core::RELPERSISTENCE_UNLOGGED && is_objkv_am(access_method_id)? {
+        return Err(Box::new(
+            PgError::new(ERROR, "objkv cannot store unlogged tables".to_string())
+                .with_sqlstate(types_error::ERRCODE_FEATURE_NOT_SUPPORTED)
+                .with_detail(
+                    "An unlogged table is emptied after a crash; objkv rows live in the object \
+                     store and are not."
+                        .to_string(),
+                ),
+        ));
+    }
     if rv.relpersistence == types_core::RELPERSISTENCE_TEMP && is_objkv_am(access_method_id)? {
         return Err(Box::new(
             PgError::new(ERROR, "objkv cannot store temporary tables".to_string())

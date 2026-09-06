@@ -2318,7 +2318,11 @@ pub fn tuple_update<'mcx>(
     old_tid: &ItemPointerData,
     slot: &mut SlotData<'mcx>,
 ) -> PgResult<()> {
-    crate::objkv_index::retire_entries(mcx, rel, rowid_of(old_tid))?;
+    // Its own context, as tuple_delete uses: an UPDATE runs this once per
+    // row, and the caller's context is the query's.
+    let cx = ::mcx::MemoryContext::new("objkv retire entries");
+    crate::objkv_index::retire_entries(cx.mcx(), rel, rowid_of(old_tid))?;
+    drop(cx);
     delete_row(scope(rel), relid(rel), rowid_of(old_tid))?;
     tuple_insert(mcx, rel, slot)
 }
