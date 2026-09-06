@@ -1066,8 +1066,14 @@ fn objkv_gettuple(
         }
         conds = Some(built);
         }
-        let at = tableam::objkv_am::snapshot_seq(scan.xs_snapshot.as_deref())?;
-        tableam::objkv_index::load_scan(mcx, index, &mut st, conds.as_deref().unwrap_or(&[]), at)?;
+        // Once per window, like nbtree once per page: a window is one or
+        // more object-store round trips, and a cancel should not wait for
+        // the whole range to be collected.
+        postgres_seams::check_for_interrupts::call()?;
+        let snapshot = scan.xs_snapshot.as_deref();
+        let at = tableam::objkv_am::snapshot_seq(snapshot)?;
+        let curcid = tableam::objkv_am::snapshot_cid(snapshot);
+        tableam::objkv_index::load_scan(mcx, index, &mut st, conds.as_deref().unwrap_or(&[]), at, curcid)?;
     }
 
     match st.next() {

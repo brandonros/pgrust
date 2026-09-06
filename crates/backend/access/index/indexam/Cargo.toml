@@ -25,6 +25,7 @@ predicate = { path = "../../../storage/lmgr/predicate" }
 types_nbtree = { path = "../../../../_support/types/types_nbtree" }
 relation_seams = { path = "../../common/relation_seams" }
 tableam = { path = "../../table/tableam" }
+postgres_seams = { path = "../../../tcop/postgres_seams" }
 indexam_seams = { path = "../indexam_seams" }
 types_relscan = { path = "../relscan" }
 spgist = { path = "../../spgist/spgist" }

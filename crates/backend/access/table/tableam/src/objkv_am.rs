@@ -210,13 +210,6 @@ fn note_snapshot(sn: &SnapshotData<'static>) {
     }
 }
 
-thread_local! {
-    /// The command id of the snapshot `snapshot_seq` last resolved, for
-    /// `objkv_index::load_scan`: its caller resolves the scan's snapshot to a
-    /// commit number with `snapshot_seq` and hands over only the number.
-    static LAST_SNAPSHOT_CID: std::cell::Cell<CommandId> = const { std::cell::Cell::new(InvalidCommandId) };
-}
-
 /// The command a snapshot reads as: heap's `curcid`. Only an MVCC snapshot
 /// draws the line; SnapshotSelf, SnapshotDirty and SnapshotAny see the current
 /// command's own writes, as they do on the heap, and so does a read with no
@@ -228,13 +221,7 @@ pub fn snapshot_cid(snapshot: Option<&SnapshotData<'_>>) -> CommandId {
     }
 }
 
-/// The command id of the snapshot `snapshot_seq` last resolved.
-pub fn last_snapshot_cid() -> CommandId {
-    LAST_SNAPSHOT_CID.with(|c| c.get())
-}
-
 pub fn snapshot_seq(snapshot: Option<&SnapshotData<'_>>) -> PgResult<u64> {
-    LAST_SNAPSHOT_CID.with(|c| c.set(snapshot_cid(snapshot)));
     let Some(sn) = snapshot else {
         return Ok(::objkv::key::LATEST);
     };

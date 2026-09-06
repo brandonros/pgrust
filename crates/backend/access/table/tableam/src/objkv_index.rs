@@ -991,17 +991,15 @@ pub fn load_scan(
     scan: &mut ::objkv::index::ScanState,
     conds: &[Cond],
     snapshot: u64,
+    // The command this scan reads as, off the scan's own snapshot. Entries
+    // the statement itself wrote are not its to read: a row it moved past
+    // the resume point would otherwise come back in a later window and be
+    // moved again (the Halloween problem).
+    curcid: ::types_core::xact::CommandId,
 ) -> PgResult<()> {
     let nkeys = index.rd_index.as_ref().map_or(0, |i| i.indnkeyatts as usize);
     let scope = objkv_am::scope(index);
     let unique = is_unique(index);
-    // The command this scan reads as. Entries the statement itself wrote are
-    // not its to read: a row it moved past the resume point would otherwise
-    // come back in a later window and be moved again (the Halloween problem).
-    // The caller resolved the scan's snapshot to `snapshot` with
-    // `objkv_am::snapshot_seq` just before this call; that is where the
-    // command id was read off it.
-    let curcid = objkv_am::last_snapshot_cid();
 
     // A comparison against NULL is unknown, never true -- `x = ANY(NULL)`, or
     // a runtime key whose parameter turned out to be NULL. nbtree reaches the

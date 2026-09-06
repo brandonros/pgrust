@@ -7871,6 +7871,7 @@ dependencies = [
  "objkv",
  "pgstat",
  "pgvector_hnsw",
+ "postgres_seams",
  "predicate",
  "relation_seams",
  "snapmgr",
