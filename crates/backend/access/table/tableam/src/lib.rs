@@ -2660,12 +2660,18 @@ pub fn table_tuple_delete<'mcx>(
             // No concurrency control: objkv has no per-row visibility, so the
             // snapshot and wait policy cannot be honoured. What it *can* do
             // honestly is refuse to report success for a row that is gone.
-            let _ = (mcx, cid, snapshot, crosscheck, wait, changingPart);
+            let _ = (mcx, snapshot, crosscheck, wait, changingPart);
             *tmfd = TM_FailureData::default();
-            // TM_Deleted would send the executor into EvalPlanQual, which needs
-            // row locking objkv does not have; it fails there with a much worse
-            // message. Say what actually happened instead.
             if !objkv_am::row_exists(rel, tid)? {
+                // This command already deleted it: a join that matched the
+                // row twice. The executor skips the second visit.
+                if objkv_am::deleted_by_command(rel, tid, cid) {
+                    tmfd.cmax = cid;
+                    return Ok(TM_Result::TM_SelfModified);
+                }
+                // TM_Deleted would send the executor into EvalPlanQual, which
+                // needs row locking objkv does not have; it fails there with a
+                // much worse message. Say what actually happened instead.
                 return Err(objkv_concurrent_update());
             }
             objkv_am::tuple_delete(rel, tid)?;
@@ -2707,9 +2713,15 @@ pub fn table_tuple_update<'mcx>(
             // Same caveat as delete: no snapshot honoured, no conflict
             // detection. It refuses rather than fabricating success when the
             // target row is already gone.
-            let _ = (cid, snapshot, crosscheck, wait, lockmode);
+            let _ = (snapshot, crosscheck, wait, lockmode);
             *tmfd = TM_FailureData::default();
             if !objkv_am::row_exists(rel, otid)? {
+                // Moved by this command already (an update stages a delete
+                // at the old key): the executor skips the second visit.
+                if objkv_am::deleted_by_command(rel, otid, cid) {
+                    tmfd.cmax = cid;
+                    return Ok(TM_Result::TM_SelfModified);
+                }
                 return Err(objkv_concurrent_update());
             }
             objkv_am::tuple_update(mcx, rel, otid, slot)?;

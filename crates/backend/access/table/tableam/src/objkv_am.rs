@@ -654,6 +654,14 @@ fn objkv_xact_callback(
         }
         XACT_EVENT_PRE_PREPARE | XACT_EVENT_PREPARE => {
             if PENDING.with(|p| p.borrow().iter().all(|f| f.writes.is_empty())) {
+                // A prepared transaction gets neither COMMIT nor ABORT here,
+                // so its read state goes now, or the next transaction
+                // inherits a stale snapshot and keeps the collection horizon.
+                if matches!(event, XACT_EVENT_PREPARE) {
+                    discard_pending();
+                    forget_snapshots();
+                    forget_emptied();
+                }
                 Ok(())
             } else {
                 Err(unsupported("PREPARE TRANSACTION"))
@@ -2319,6 +2327,15 @@ pub fn satisfies_snapshot(
 /// Whether the row is there now, this transaction's every write counted.
 pub fn row_exists(rel: &Relation<'_>, tid: &ItemPointerData) -> PgResult<bool> {
     Ok(fetch_row(scope(rel), relid(rel), rowid_of(tid), ::objkv::key::LATEST, InvalidCommandId)?.is_some())
+}
+
+/// Whether the command `cid` of this transaction already deleted (or moved)
+/// the row: heap's `TM_SelfModified` with `cmax == es_output_cid`. A
+/// `DELETE ... USING` or `UPDATE ... FROM` whose join matches one target
+/// row twice reaches the AM twice for it, and the executor skips the second.
+pub fn deleted_by_command(rel: &Relation<'_>, tid: &ItemPointerData, cid: CommandId) -> bool {
+    let key = row_key(scope(rel), relid(rel), rowid_of(tid));
+    matches!(staged_seen_by(&key, InvalidCommandId), Some((_, Op::Delete))) && staged_stamp(&key) == Some(cid)
 }
 
 pub fn index_fetch<'mcx>(
