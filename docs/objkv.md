@@ -13,9 +13,12 @@ something quietly different.
 ## Enabling it
 
 - Set `OBJKV_S3_ENDPOINT`, `OBJKV_S3_BUCKET`, `OBJKV_S3_KEY`, `OBJKV_S3_SECRET`.
-  If the endpoint is unset the server refuses to open objkv storage. There is
-  no memory mode; the in-memory store in the engine crate is a test double.
-  The store is logged at open.
+  If the endpoint is unset the server refuses to open objkv storage; the key
+  and secret are required, with no default. A plain `http://` endpoint is
+  accepted only for this machine (localhost, 127.0.0.0/8, ::1) unless
+  `OBJKV_S3_INSECURE=1` says the network is trusted. There is no memory mode;
+  the in-memory store in the engine crate is a test double. The store is
+  logged at open.
 - `CREATE TABLE ... USING objkv`. Indexes on objkv tables use `objkv_btree`.
 
 ## Isolation contract (differs from PostgreSQL)

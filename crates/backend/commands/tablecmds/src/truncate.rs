@@ -234,6 +234,11 @@ pub fn ExecuteTruncateGuts<'mcx>(
         // what is under it. The alternative -- a tombstone per row -- would put
         // a hundred million of them in one object.
         if tableam::table_is_objkv(rel) {
+            // As for heap: a serializable reader of this relation has a
+            // rw-conflict with the truncate.
+            if rel.rd_createSubid.get() != my_subid && rel.rd_newRelfilelocatorSubid.get() != my_subid {
+                predicate_seams::check_table_for_serializable_conflict_in::call(rel)?;
+            }
             tableam::objkv_truncate(mcx, rel)?;
             // Commit processing clears the relation's live and dead counts off
             // the back of this; without it they describe a table that is gone.

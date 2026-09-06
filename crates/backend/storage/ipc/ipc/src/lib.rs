@@ -292,6 +292,8 @@ static ON_PROCESS_EXIT_LIST: pgsync::Mutex<Vec<OnExit>> = pgsync::Mutex::new(Vec
 pub fn on_process_exit(function: OnExitCallback, arg: usize) {
     let mut l = ON_PROCESS_EXIT_LIST.lock().unwrap_or_else(|e| e.into_inner());
     if l.len() >= MAX_ON_EXITS {
+        // `out_of_slots` exits the process, and that drains this very list.
+        drop(l);
         out_of_slots("on_process_exit");
     }
     l.push(OnExit { function, arg });
@@ -301,7 +303,7 @@ fn drain_process_exit_callbacks(code: i32) {
     loop {
         let next = ON_PROCESS_EXIT_LIST.lock().unwrap_or_else(|e| e.into_inner()).pop();
         match next {
-            Some(cb) => (cb.function)(code, cb.arg),
+            Some(cb) => run_callback_guarded("on_process_exit", || (cb.function)(code, cb.arg)),
             None => return,
         }
     }

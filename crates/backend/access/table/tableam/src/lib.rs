@@ -2055,9 +2055,12 @@ pub fn table_scan_bitmap_batch_store_slot<'mcx>(
     scan: &mut TableScanDesc<'mcx>,
     i: u32,
     slot: &mut SlotData<'mcx>,
-) {
+) -> PgResult<()> {
     match scan {
-        TableScanDesc::Heap(h) => ::heapam::bitmap::heap_scan_bitmap_batch_store(mcx, h, i, slot),
+        TableScanDesc::Heap(h) => {
+            ::heapam::bitmap::heap_scan_bitmap_batch_store(mcx, h, i, slot);
+            Ok(())
+        }
         TableScanDesc::Objkv(s) => objkv_am::scan_bitmap_batch_store(mcx, s, i, slot),
         TableScanDesc::Pgrcolumnar(_) => cb_refused("bitmap scans"),
     }
@@ -2196,6 +2199,12 @@ pub fn table_beginscan_parallel<'mcx>(
     parallel_scan: &ParallelTableScanDescShared,
 ) -> PgResult<TableScanDesc<'mcx>> {
     debug_assert!(relation.rd_locator.get() == parallel_scan.pscan.phs_locator);
+
+    // Before a snapshot is registered below: refused here, nothing is left
+    // registered until transaction end.
+    if am(relation) == TableAm::Objkv {
+        return Err(objkv_unsupported("parallel scans"));
+    }
 
     let mut flags = SO_TYPE_SEQSCAN | SO_ALLOW_STRAT | SO_ALLOW_SYNC | SO_ALLOW_PAGEMODE;
     let mut registered = None;

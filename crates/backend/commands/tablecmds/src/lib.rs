@@ -406,6 +406,29 @@ pub fn DefineRelation<'mcx>(
     let (namespace_id, _existing_relid, relpersistence) =
         catalog_namespace::RangeVarGetAndCheckCreationNamespace(mcx, &creation_rv, types_rel::NoLock, false)?;
 
+    // The temp check again, now that the namespace has had its say:
+    // `CREATE TABLE pg_temp.t` is temporary whatever the statement said.
+    let access_method_id = if relpersistence == types_core::RELPERSISTENCE_TEMP
+        && rv.relpersistence != types_core::RELPERSISTENCE_TEMP
+        && is_objkv_am(access_method_id)?
+    {
+        if stmt.accessMethod.is_some() {
+            return Err(Box::new(
+                PgError::new(ERROR, "objkv cannot store temporary tables".to_string())
+                    .with_sqlstate(types_error::ERRCODE_FEATURE_NOT_SUPPORTED)
+                    .with_detail(
+                        "A temporary table is discarded at disconnect, and objkv has no \
+                         per-session namespace."
+                            .to_string(),
+                    ),
+            ));
+        }
+        // The default access method was objkv: scratch tables go to heap.
+        commands_amcmds::get_table_am_oid("heap", false)?
+    } else {
+        access_method_id
+    };
+
     if stmt.oncommit != OnCommitAction::ONCOMMIT_NOOP
         && relpersistence != types_core::RELPERSISTENCE_TEMP
     {

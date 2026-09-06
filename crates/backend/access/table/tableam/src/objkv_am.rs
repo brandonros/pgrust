@@ -126,6 +126,12 @@ thread_local! {
 
         static MY_COMMIT_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 
+    /// The number of this backend's last synchronous commit, so its next
+    /// snapshot waits for the decided prefix to reach it: a snapshot is a
+    /// prefix, and a commit acknowledged while an older number was still
+    /// undecided would otherwise be invisible to the session that made it.
+    static LAST_CONFIRMED_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
     static XACT_SNAPSHOT: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
 
     /// One read view per snapshot this transaction reads at, keyed by the
@@ -248,7 +254,23 @@ pub fn snapshot_seq(snapshot: Option<&SnapshotData<'_>>) -> PgResult<u64> {
         0 => {
             // The number and the view under one acquisition: the view is what
             // every read at this snapshot goes through from here on.
-            let (seq, v) = with_db(|db| (db.current_seq(), db.view()))?;
+            //
+            // A snapshot is the decided prefix, and this backend's own last
+            // commit can sit above it while an older number is still being
+            // decided by another backend. Waiting for the prefix to reach
+            // it keeps "INSERT; COMMIT; SELECT" honest; the wait is short
+            // (the other commit is in flight) and bounded, since a stuck
+            // writer must not hang every new statement.
+            let mine = LAST_CONFIRMED_SEQ.get();
+            let mut waited = 0u32;
+            let (seq, v) = loop {
+                let (seq, v) = with_db(|db| (db.current_seq(), db.view()))?;
+                if seq >= mine || waited >= 200 {
+                    break (seq, v);
+                }
+                waited += 1;
+                ::pgsync::thread::sleep(std::time::Duration::from_millis(1));
+            };
             sn.am_commit_seq.set(seq);
             remember_view(seq, v);
             seq
@@ -486,7 +508,7 @@ fn flatten_pending() -> BTreeMap<Vec<u8>, Op> {
     let covered: Vec<(Vec<Vec<u8>>, u64)> = EMPTIED.with(|e| {
         e.borrow()
             .iter()
-            .map(|(marker, since)| (covered_prefixes(marker), *since))
+            .filter_map(|(marker, marks)| marks.last().map(|(_, since)| (covered_prefixes(marker), *since)))
             .collect()
     });
     PENDING.with(|p| {
@@ -542,6 +564,17 @@ fn objkv_subxact_callback(
     match event {
         SUBXACT_EVENT_START_SUB | SUBXACT_EVENT_PRE_COMMIT_SUB => {}
         SUBXACT_EVENT_COMMIT_SUB => PENDING.with(|p| {
+            // A truncate's mark released into the parent belongs to the
+            // parent now: a ROLLBACK TO an ancestor drops it with the frame.
+            EMPTIED.with(|e| {
+                for marks in e.borrow_mut().values_mut() {
+                    for (subid, _) in marks.iter_mut() {
+                        if *subid == my_subid {
+                            *subid = parent_subid;
+                        }
+                    }
+                }
+            });
             let mut stack = p.borrow_mut();
             while stack.last().is_some_and(|f| f.subid == my_subid) {
                 let f = stack.pop().unwrap();
@@ -570,11 +603,16 @@ fn objkv_subxact_callback(
                     stack.pop();
                 }
             });
-            // A truncate in the rolled-back subtransaction goes with it: its
-            // marker was one of the writes just dropped.
+            // A truncate in the rolled-back subtransaction goes with it, and
+            // the mark of an earlier truncate of the same relation stands
+            // again: the marks are a stack per relation, popped by
+            // subtransaction, never lowered by hand.
             EMPTIED.with(|e| {
-                e.borrow_mut()
-                    .retain(|k, _| PENDING.with(|p| p.borrow().iter().any(|f| f.writes.contains_key(k))));
+                let mut e = e.borrow_mut();
+                for marks in e.values_mut() {
+                    marks.retain(|(subid, _)| *subid < my_subid);
+                }
+                e.retain(|_, marks| !marks.is_empty());
             });
         }
     }
@@ -591,23 +629,28 @@ fn objkv_xact_callback(
         XACT_EVENT_PRE_COMMIT | XACT_EVENT_PARALLEL_PRE_COMMIT => at_pre_commit(),
         XACT_EVENT_ABORT | XACT_EVENT_PARALLEL_ABORT => {
             // An abort after pre-commit leaves an object nothing stands behind.
+            // The per-transaction state is cleared whatever the discard
+            // says: left in place, the next transaction would fold these
+            // writes into its own commit and keep the collection horizon
+            // pinned.
             let seq = MY_COMMIT_SEQ.replace(0);
-            if seq != 0 {
-                discard_commit(seq)?;
-            }
+            let result = if seq != 0 { discard_commit(seq) } else { Ok(()) };
             discard_pending();
             forget_snapshots();
             forget_emptied();
-            Ok(())
+            result
         }
         XACT_EVENT_COMMIT | XACT_EVENT_PARALLEL_COMMIT => {
             let seq = MY_COMMIT_SEQ.replace(0);
-            if seq != 0 {
-                with_db(|db| db.mark_confirmed(seq))?;
-            }
+            let result = if seq != 0 {
+                LAST_CONFIRMED_SEQ.set(seq);
+                with_db(|db| db.mark_confirmed(seq))
+            } else {
+                Ok(())
+            };
             forget_snapshots();
             forget_emptied();
-            Ok(())
+            result
         }
         XACT_EVENT_PRE_PREPARE | XACT_EVENT_PREPARE => {
             if PENDING.with(|p| p.borrow().iter().all(|f| f.writes.is_empty())) {
@@ -715,6 +758,19 @@ fn compactor_loop() {
     }
 }
 
+/// The object is in the bucket; before anyone is told so, the bucket is asked
+/// whether the lease is still ours (`Lease::verify_in_store`, one point read,
+/// outside the storage lock). A takeover found here is recorded in the lease,
+/// and the `flight_written` that follows sees it and fences the process
+/// instead of acknowledging: the object is stale by the new epoch's fence,
+/// and no client hears "committed" for it.
+fn verify_lease_after_landing(key: &str) {
+    let Ok(Some(lease)) = with_db_raw(|db| db.lease()) else { return };
+    if let Err(e) = lease.verify_in_store() {
+        eprintln!("objkv writer: {key} landed, but {e}");
+    }
+}
+
 fn writer_loop() {
     const ATTEMPTS: u32 = 3;
     loop {
@@ -739,8 +795,12 @@ fn writer_loop() {
         loop {
             attempt += 1;
             let done = match store().put_if_absent(&flight.key, &flight.bytes) {
-                Ok(::objkv::s3::PutOutcome::Written) => with_db_raw(|db| db.flight_written(flight.first)).map(|_| true),
+                Ok(::objkv::s3::PutOutcome::Written) => {
+                    verify_lease_after_landing(&flight.key);
+                    with_db_raw(|db| db.flight_written(flight.first)).map(|_| true)
+                }
                 Ok(::objkv::s3::PutOutcome::AlreadyExists) => {
+                    verify_lease_after_landing(&flight.key);
                     with_db_raw(|db| db.flight_lost(&flight)).map(|r| {
                         if let Err(e) = r {
                             eprintln!("objkv writer: {e}");
@@ -1002,6 +1062,20 @@ fn choose_store() -> PgResult<Arc<dyn Store>> {
     Ok(store)
 }
 
+/// Whether an endpoint names this machine: localhost, 127.0.0.0/8, or ::1.
+fn endpoint_is_loopback(endpoint: &str) -> bool {
+    let rest = endpoint.split("://").nth(1).unwrap_or(endpoint);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = if let Some(h) = host.strip_prefix('[') {
+        h.split(']').next().unwrap_or("")
+    } else {
+        host.split(':').next().unwrap_or("")
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 /// LOG, once the server's error machinery is up; unit tests have no elog.
 fn log_store(msg: String) {
     if ::elog_seams::ereport_msg::is_installed() {
@@ -1012,8 +1086,41 @@ fn log_store(msg: String) {
 /// The object-store client.
 fn object_store(endpoint: &str) -> PgResult<Arc<dyn Store>> {
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
-    let key = env("OBJKV_S3_KEY", "minioadmin");
-    let secret = env("OBJKV_S3_SECRET", "minioadmin");
+    let required = |k: &str| -> PgResult<String> {
+        match std::env::var(k) {
+            Ok(v) if !v.is_empty() => Ok(v),
+            _ => Err(Box::new(
+                PgError::error(format!("objkv storage is not configured: {k} is unset"))
+                    .with_detail(
+                        "objkv authenticates to the object store with the credentials in the \
+                         environment, and there is no default."
+                            .to_string(),
+                    )
+                    .with_hint(format!("Set {k}."))
+                    .with_sqlstate(::types_error::ERRCODE_CONFIG_FILE_ERROR),
+            )),
+        }
+    };
+    let key = required("OBJKV_S3_KEY")?;
+    let secret = required("OBJKV_S3_SECRET")?;
+    // Every request carries the credentials in its signature. Plain HTTP is
+    // for a store on this machine; anywhere else it needs saying out loud.
+    let insecure_ok = std::env::var("OBJKV_S3_INSECURE").is_ok_and(|v| v == "1");
+    if endpoint.starts_with("http://") && !insecure_ok && !endpoint_is_loopback(endpoint) {
+        return Err(Box::new(
+            PgError::error(format!(
+                "objkv: OBJKV_S3_ENDPOINT {endpoint} is plain HTTP to a host that is not this \
+                 machine"
+            ))
+            .with_detail(
+                "Every request is signed with the credentials, and over HTTP the network can \
+                 read and replay them."
+                    .to_string(),
+            )
+            .with_hint("Use an https:// endpoint, or set OBJKV_S3_INSECURE=1 to accept the risk.".to_string())
+            .with_sqlstate(::types_error::ERRCODE_CONFIG_FILE_ERROR),
+        ));
+    }
     let bucket = env("OBJKV_S3_BUCKET", "objkv");
     let region = env("OBJKV_S3_REGION", "us-east-1");
     let built = match std::env::var("OBJKV_S3_TOKEN") {
@@ -1153,23 +1260,28 @@ pub fn empty_marker_key(db: u32, oid: u32) -> Vec<u8> {
 
 // Which of this transaction's writes a TRUNCATE it ran covers. Removing them
 // outright would defeat a rollback to a savepoint, so it records where the
-// writes had got to and reads skip the earlier ones.
+// writes had got to and reads skip the earlier ones. One stack per relation,
+// each entry the subtransaction that truncated and the mark it recorded: a
+// rolled-back savepoint pops its own truncate and leaves an earlier one's
+// mark standing, so a row staged between the two is covered by neither.
 thread_local! {
-    static EMPTIED: RefCell<BTreeMap<Vec<u8>, u64>> = const { RefCell::new(BTreeMap::new()) };
+    static EMPTIED: RefCell<BTreeMap<Vec<u8>, Vec<(SubTransactionId, u64)>>> =
+        const { RefCell::new(BTreeMap::new()) };
 }
 
 /// The line below which this transaction's own staged writes for `key` are
 /// covered by a truncate it performed.
 fn staged_empty_mark(marker: &[u8]) -> u64 {
-    EMPTIED.with(|e| e.borrow().get(marker).copied().unwrap_or(0))
+    EMPTIED.with(|e| e.borrow().get(marker).and_then(|m| m.last()).map_or(0, |(_, mark)| *mark))
 }
 
 /// Empties a relation as of now: one small object, not a tombstone per row.
 pub fn empty_relation(db: u32, oid: u32) -> PgResult<()> {
     let key = empty_marker_key(db, oid);
     stage(key.clone(), Op::Put(Vec::new()))?;
+    let subid = ::xact::GetCurrentSubTransactionId();
     EMPTIED.with(|e| {
-        e.borrow_mut().insert(key, stage_mark());
+        e.borrow_mut().entry(key).or_default().push((subid, stage_mark()));
     });
     Ok(())
 }
@@ -2077,9 +2189,9 @@ pub fn scan_bitmap_batch_store<'mcx>(
     scan: &mut ObjkvScanDescData<'mcx>,
     i: u32,
     slot: &mut SlotData<'mcx>,
-) {
+) -> PgResult<()> {
     let (rowid, image) = scan.rows[i as usize].clone();
-    let _ = store_image(mcx, slot, &image, tid_of(rowid));
+    store_image(mcx, slot, &image, tid_of(rowid))
 }
 
 pub fn scan_bitmap_next_tuple<'mcx>(

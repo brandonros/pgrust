@@ -7464,6 +7464,24 @@ fn ATPrepSetAccessMethod<'mcx>(
     if rel.rd_rel.relam == amoid {
         return Ok(());
     }
+    // Into objkv is a rewrite too, and the same file swap the objkv side
+    // refuses (ATRewriteTableOne): the rows would be copied into a file the
+    // new access method never reads.
+    if amoid != InvalidOid && amoid == commands_amcmds::get_table_am_oid("objkv", true)? {
+        return Err(Box::new(
+            PgError::new(
+                ERROR,
+                format!("cannot change the access method of \"{}\" to objkv", rel.name()),
+            )
+            .with_sqlstate(ERRCODE_FEATURE_NOT_SUPPORTED)
+            .with_detail(
+                "SET ACCESS METHOD rewrites the table into a file, and objkv rows live in \
+                 the object store."
+                    .to_string(),
+            )
+            .with_hint("Create a new table USING objkv and INSERT ... SELECT into it.".to_string()),
+        ));
+    }
     tab.rewrite |= AT_REWRITE_ACCESS_METHOD;
     tab.new_access_method = amoid;
     tab.chg_access_method = true;

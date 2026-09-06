@@ -202,7 +202,7 @@ pub fn bitmap_scan_batch_fetch<'mcx>(
         .ss_currentScanDesc
         .as_mut()
         .expect("bitmap heap scan without a table scan descriptor");
-    ::tableam::table_scan_bitmap_batch_store_slot(mcx, scandesc, i, estate.slot_mut(slot_id));
+    ::tableam::table_scan_bitmap_batch_store_slot(mcx, scandesc, i, estate.slot_mut(slot_id))?;
     if !node.recheck {
         return Ok(true);
     }

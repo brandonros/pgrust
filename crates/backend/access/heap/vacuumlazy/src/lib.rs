@@ -2146,8 +2146,24 @@ pub fn init_seams() {
         if tableam_vocab::is_pgrcolumnar_am_oid(rel.rd_rel.relam) {
             return Ok(());
         }
-        // objkv: same reasoning -- no pages, and no xmin to freeze.
+        // objkv: no pages, and no xmin to freeze. But relfrozenxid must
+        // still advance, or autovacuum forces this no-op for ever and the
+        // cluster's wraparound horizon stops at this relation: nothing in
+        // the bucket carries an xid, so the oldest one that could is
+        // OldestXmin, exactly what a heap vacuum of an empty table records.
         if tableam_vocab::is_objkv_am_oid(rel.rd_rel.relam) {
+            let (_, cutoffs) = commands_vacuum::vacuum_get_cutoffs(rel, params)?;
+            vacuum_seams::vac_update_relstats::call(
+                rel,
+                0,
+                f64::from(rel.rd_rel.reltuples),
+                0,
+                0,
+                rel.rd_rel.relhasindex,
+                cutoffs.OldestXmin,
+                cutoffs.OldestMxact,
+                false,
+            )?;
             return Ok(());
         }
         heap_vacuum_rel(mcx, rel, params, bstrategy)

@@ -1426,6 +1426,11 @@ fn set_rel_consider_parallel(run: &mut PlannerRun<'_>, rel: RelId, rti: usize) -
             if lsyscache::get_rel_persistence(rte.relid)? != b'p' as i8 {
                 return Ok(());
             }
+            // objkv has no parallel scan: a partial path would plan fine and
+            // then fail at table_parallelscan_initialize.
+            if tableam_vocab::is_objkv_am_oid(lsyscache::get_rel_relam(rte.relid)?) {
+                return Ok(());
+            }
             if let Some(ts) = rte.tablesample {
                 let tsc = ts.as_table_sample_clause().expect("TableSampleClause");
                 const PROPARALLEL_SAFE: i8 = b's' as i8;

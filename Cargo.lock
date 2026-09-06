@@ -18237,6 +18237,7 @@ dependencies = [
  "multixact",
  "objkv",
  "pgrcolumnar",
+ "pgsync",
  "procarray",
  "relation_seams",
  "relcache_seams",
