@@ -872,3 +872,15 @@ rawsync	crates/backend/tcop/postgres_seams/src/lib.rs	2	DST-REVIEW(night/stmt-as
 spawn	crates/backend/executor/execmain/src/lanev2/stmt_task.rs	1	DST-REVIEW(night/stmt-as-task-2): the quantum-yield sweeper thread (pgsync::thread::Builder, spawned once on the first armed span under the DEFAULT-OFF PGRUST_STMT_TASK_YIELD; a pure timer/observer on the waiter timed-park surface — the slease-v2 pg-slease-sweeper precedent verbatim; wasm arm cannot exist and the spawn is cfg'd out)
 fs	crates/backend/access/parquet_read/src/lib.rs	5	DST-REVIEW(t46 compose, night/parquet-reader): the reader crate's footer/dictionary/page positioned reads (File::open + pread class, read-only COPY FORMAT parquet source; the branch never paid its ledger — no standard CONFIRM ran there); P1 Vfs choke routing rides the crate-wide migration
 fs	crates/backend/commands/copy/src/memheadroom.rs	2	DST-REVIEW(night/copyfast): kernel pseudo-file probes (/proc/self/cgroup + the /sys/fs/cgroup hierarchy walk + /proc/meminfo) for the memruns auto budget — read-only host-posture introspection on the load-vehicle knob path, never data-file I/O; Vfs choke routing rides the crate-wide migration
+
+# objkv: Postgres tables in an S3 bucket. The store is a blocking HTTP client
+# by design, the writer and compactor are daemon threads that exist only once
+# the bucket is opened, and the tests reach the fault points through the
+# environment. None of it runs unless a table uses the access method; routing
+# onto the sanctioned surfaces rides objkv's own follow-up, not this ratchet.
+blocking	crates/_support/objkv/src/s3.rs	1	DST-REVIEW(objkv): retry backoff sleep between S3 attempts (ureq, blocking client by design)
+rawsync	crates/_support/objkv/src/run.rs	1	DST-REVIEW(objkv): the per-run block cache mutex, held for a map lookup only
+rawsync	crates/_support/objkv/src/store.rs	1	DST-REVIEW(objkv): the in-memory test store's map mutex
+spawn	crates/_support/objkv/src/lease.rs	1	DST-REVIEW(objkv): the lease heartbeat thread, started once per Db::open, renewing the single-writer lease every HEARTBEAT_MS
+blocking	crates/_support/objkv/src/lease.rs	1	DST-REVIEW(objkv): the heartbeat's 250 ms sleep slices between renewals; the stop flag is checked every slice
+time	crates/_support/objkv/src/lease.rs	1	DST-REVIEW(objkv): SystemClock::now_ms, the wall clock the lease expiry is written in; the Db and lease tests inject a FakeClock
