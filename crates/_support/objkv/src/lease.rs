@@ -34,10 +34,10 @@
 //! is for: it is stamped into every commit object, and `db.rs` records a
 //! fence at each takeover so such an object is recognised and never applied.
 //! The writer closes the last gap itself: after a commit object lands and
-//! before the commit is acknowledged, `verify_in_store` asks the bucket
-//! whether `owner/<E+1>/0` exists. A takeover is exactly that key, so a
-//! writer that lost the lease -- by expiry, by a wrong clock, or by a
-//! same-host claimant that mistook it for dead -- learns so before any
+//! before the commit is acknowledged, `verify_in_store` lists the owner
+//! keys and looks for an epoch above its own. A takeover is exactly such a
+//! key, so a writer that lost the lease -- by expiry, by a wrong clock, or
+//! by a same-host claimant that mistook it for dead -- learns so before any
 //! client is told its transaction committed.
 
 use std::io;
@@ -284,9 +284,9 @@ impl Lease {
                     // A same-host owner whose pid is gone crashed: no need to
                     // wait out its lease. A pid namespace can make a live
                     // owner look gone (two containers with one hostname); the
-                    // owner is safe even then, because it asks the bucket for
-                    // `owner/<E+1>/0` after every commit object lands and
-                    // acknowledges nothing once that key exists
+                    // owner is safe even then, because it lists the owner
+                    // keys after every commit object lands and acknowledges
+                    // nothing once a newer epoch is there
                     // (`verify_in_store`). `b.owner == me` is exact: the
                     // nonce is this process's own.
                     Some(b) if now <= b.expires_ms && b.owner != me && !same_host_dead(&b.owner, &me) => {
@@ -395,14 +395,18 @@ impl Lease {
         if let Some(why) = self.why_invalid() {
             return Err(io::Error::other(format!("objkv: {why}")));
         }
-        if i.store.get(&key(i.epoch + 1, 0))?.is_some() {
-            i.lost_to.fetch_max(i.epoch + 1, Ordering::AcqRel);
-            return Err(io::Error::other(format!(
-                "objkv: the lease (epoch {}) was taken over by epoch {}; this commit is not \
-                 acknowledged and this server writes nothing more",
-                i.epoch,
-                i.epoch + 1
-            )));
+        // The listing, not a point read of `owner/<E+1>/0`: a claimant
+        // deletes the keys of the claim it replaced, so after two takeovers
+        // that one key is gone while a newer epoch owns the bucket.
+        if let Some(newest) = newest_epoch(&i.store)? {
+            if newest > i.epoch {
+                i.lost_to.fetch_max(newest, Ordering::AcqRel);
+                return Err(io::Error::other(format!(
+                    "objkv: the lease (epoch {}) was taken over by epoch {}; this commit is not \
+                     acknowledged and this server writes nothing more",
+                    i.epoch, newest
+                )));
+            }
         }
         Ok(())
     }
@@ -843,6 +847,22 @@ mod tests {
         assert!(err.contains("taken over by epoch 2"), "{err}");
         assert!(!l.valid(), "and from here on every check refuses");
         assert!(l.check().is_err());
+    }
+
+    #[test]
+    fn verify_in_store_notices_a_takeover_whose_own_claim_was_taken_over_since() {
+        let s = store();
+        let c = FakeClock::at(1_000);
+        let l = Lease::acquire(&s, c.clone()).unwrap();
+        // Epoch 2 claims, then epoch 3 claims and, as `acquire` does, deletes
+        // the keys of the claim it replaced. `owner/2/0` is gone.
+        s.put_if_absent(&key(2, 0), &foreign(c.now_ms() + TTL_MS).encode()).unwrap();
+        s.put_if_absent(&key(3, 0), &foreign(c.now_ms() + TTL_MS).encode()).unwrap();
+        s.delete(&key(2, 0)).unwrap();
+        assert!(l.valid());
+        let err = l.verify_in_store().unwrap_err().to_string();
+        assert!(err.contains("taken over by epoch 3"), "{err}");
+        assert!(!l.valid());
     }
 
     #[test]
