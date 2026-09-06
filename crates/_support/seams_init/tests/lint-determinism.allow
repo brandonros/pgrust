@@ -148,7 +148,7 @@ fs	crates/backend/libpq/fdnb/src/lib.rs	2	DST-REVIEW(p4-simnet): the SHARED nobl
 fs	crates/backend/postmaster/launch_backend/src/lib.rs	4	DST-REVIEW(night/fdlimit GL-FDLIMIT-1): +3 = report_startup_failure_to_client's raw-socket refusal (fcntl F_GETFL/F_SETFL + close) — the child-thread twin of postmaster.c's report_fork_failure_to_client, MOVED here from serverloop.rs (that row is deleted, net zero for the category): a connection whose child thread never came up is answered and closed on the accepted fd itself, with no session, no buffers and no transport provider to route through. Base 1 = the pre-existing client-socket close at child-thread exit
 # --- crates/backend/postmaster/pgarch (4 sites) ---
 fs	crates/backend/postmaster/pgarch/src/lib.rs	4
-fs	crates/backend/postmaster/postmaster/src/crash_signals.rs	1
+fs	crates/backend/postmaster/postmaster/src/crash_signals.rs	3	DST-REVIEW(crash-handler): +2 = two more libc::write(2) calls to fd 2 in the async-signal-safe hex frame dump that replaced backtrace_symbols_fd (the flush inside the frame loop and the final line). All three sites are the fatal-signal handler writing to the server log; no file is opened or read
 fs	crates/backend/postmaster/postmaster/src/main_entry.rs	8
 fs	crates/backend/storage/file/vfs/src/sim_boot.rs	8	DST-REVIEW(provider-seam): the §9.3 asset ingest IS the declared host boundary — the one place the sim world is seeded from a pinned host snapshot (std::fs read-only walk, pre-schedule, digest-covered via asset_hash); sim cfg only, dead in product builds
 env	crates/backend/storage/file/vfs/src/sim_boot.rs	2	DST-REVIEW(provider-seam): PGRUST_PGSHAREDIR/PGRUST_TZDIR are sim-harness asset locators consumed once at boot ingest (§9.3); sim cfg only, dead in product builds
