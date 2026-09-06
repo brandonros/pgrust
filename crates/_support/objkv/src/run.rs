@@ -26,7 +26,8 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::Mutex;
+use std::sync::Arc;
+use pgsync::Mutex;
 
 use crate::bloom::Bloom;
 use crate::commit::{get_u32, get_u64, put_u32, put_u64, Op};
@@ -83,7 +84,7 @@ pub fn run_key_of_seal(seal_key: &str) -> Option<String> {
 }
 
 fn crc(bytes: &[u8]) -> u32 {
-    crc32c::pg_comp_crc32c(0xffff_ffff, bytes) ^ 0xffff_ffff
+    crate::crc(bytes)
 }
 
 /// Anything a run can be read from: an S3 object, or a byte slice in tests.
@@ -197,7 +198,7 @@ pub struct Run<S: RangeSource> {
 /// random, where the two behave the same and FIFO is simpler to reason about.
 #[derive(Default)]
 struct BlockCache {
-    blocks: HashMap<u64, Vec<u8>>,
+    blocks: HashMap<u64, Arc<[u8]>>,
     order: std::collections::VecDeque<u64>,
     bytes: usize,
     cap: usize,
@@ -206,11 +207,11 @@ struct BlockCache {
 }
 
 impl BlockCache {
-    fn get(&mut self, off: u64) -> Option<Vec<u8>> {
+    fn get(&mut self, off: u64) -> Option<Arc<[u8]>> {
         match self.blocks.get(&off) {
             Some(b) => {
                 self.hits += 1;
-                Some(b.clone())
+                Some(Arc::clone(b))
             }
             None => {
                 self.misses += 1;
@@ -218,8 +219,13 @@ impl BlockCache {
             }
         }
     }
-    fn insert(&mut self, off: u64, block: Vec<u8>) {
+    fn insert(&mut self, off: u64, block: Arc<[u8]>) {
         if self.cap == 0 || block.len() > self.cap {
+            return;
+        }
+        // Two readers can miss the same block and both arrive here; counting
+        // it twice leaks capacity, since eviction subtracts it once.
+        if self.blocks.contains_key(&off) {
             return;
         }
         while self.bytes + block.len() > self.cap {
@@ -377,15 +383,15 @@ impl<S: RangeSource> Run<S> {
 
     /// One block, from the cache or one ranged GET. Verified on the way in,
     /// so the cache holds only blocks that checked out.
-    fn block_at(&self, off: u64, len: u32) -> io::Result<Vec<u8>> {
+    fn block_at(&self, off: u64, len: u32) -> io::Result<Arc<[u8]>> {
         // Scoped: inlining this into a match holds the guard across the miss
         // arm and self-deadlocks.
         let cached = self.cache.lock().unwrap().get(off);
         match cached {
             Some(b) => Ok(b),
             None => {
-                let b = verify_block(self.src.range(off, len as u64)?)?;
-                self.cache.lock().unwrap().insert(off, b.clone());
+                let b: Arc<[u8]> = verify_block(self.src.range(off, len as u64)?)?.into();
+                self.cache.lock().unwrap().insert(off, Arc::clone(&b));
                 Ok(b)
             }
         }

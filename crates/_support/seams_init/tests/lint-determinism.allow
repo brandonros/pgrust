@@ -873,14 +873,12 @@ spawn	crates/backend/executor/execmain/src/lanev2/stmt_task.rs	1	DST-REVIEW(nigh
 fs	crates/backend/access/parquet_read/src/lib.rs	5	DST-REVIEW(t46 compose, night/parquet-reader): the reader crate's footer/dictionary/page positioned reads (File::open + pread class, read-only COPY FORMAT parquet source; the branch never paid its ledger — no standard CONFIRM ran there); P1 Vfs choke routing rides the crate-wide migration
 fs	crates/backend/commands/copy/src/memheadroom.rs	2	DST-REVIEW(night/copyfast): kernel pseudo-file probes (/proc/self/cgroup + the /sys/fs/cgroup hierarchy walk + /proc/meminfo) for the memruns auto budget — read-only host-posture introspection on the load-vehicle knob path, never data-file I/O; Vfs choke routing rides the crate-wide migration
 
-# objkv: Postgres tables in an S3 bucket. The store is a blocking HTTP client
-# by design, the writer and compactor are daemon threads that exist only once
-# the bucket is opened, and the tests reach the fault points through the
-# environment. None of it runs unless a table uses the access method; routing
-# onto the sanctioned surfaces rides objkv's own follow-up, not this ratchet.
-blocking	crates/_support/objkv/src/s3.rs	1	DST-REVIEW(objkv): retry backoff sleep between S3 attempts (ureq, blocking client by design)
-rawsync	crates/_support/objkv/src/run.rs	1	DST-REVIEW(objkv): the per-run block cache mutex, held for a map lookup only
-rawsync	crates/_support/objkv/src/store.rs	1	DST-REVIEW(objkv): the in-memory test store's map mutex
-spawn	crates/_support/objkv/src/lease.rs	1	DST-REVIEW(objkv): the lease heartbeat thread, started once per Db::open, renewing the single-writer lease every HEARTBEAT_MS
-blocking	crates/_support/objkv/src/lease.rs	1	DST-REVIEW(objkv): the heartbeat's 250 ms sleep slices between renewals; the stop flag is checked every slice
-time	crates/_support/objkv/src/lease.rs	1	DST-REVIEW(objkv): SystemClock::now_ms, the wall clock the lease expiry is written in; the Db and lease tests inject a FakeClock
+# objkv: Postgres tables in an S3 bucket. The engine crate uses the sanctioned
+# surfaces (pgsync for threads, sleeps and mutexes; pg_clock for the wall
+# clock); rows below are for what is left.
+blocking	crates/_support/objkv/src/s3.rs	1	DST-REVIEW(objkv): retry backoff between S3 attempts (pgsync::thread::sleep; the client is blocking by design)
+blocking	crates/_support/objkv/src/lease.rs	1	DST-REVIEW(objkv): the heartbeat's 250 ms slices between renewals (pgsync::thread::sleep); the stop flag is checked every slice
+spawn	crates/_support/objkv/src/lease.rs	1	DST-REVIEW(objkv): the lease heartbeat thread (pgsync::thread::Builder), started once per Db::open, renewing the single-writer lease every HEARTBEAT_MS
+join	crates/_support/objkv/src/lease.rs	1	DST-REVIEW(objkv): release/stop_heartbeat join the heartbeat so no renewal is on the wire when the release number is chosen; the thread exits within one 250 ms slice of the stop flag, or after the renewal in flight
+once	crates/_support/objkv/src/lease.rs	1	DST-REVIEW(objkv): the process nonce in Owner::me, a pure init closure over pg_clock and the pid (P3 row-19 pure/env-read)
+rawsync	crates/_support/objkv/src/lease.rs	1	DST-REVIEW(objkv): that nonce's OnceLock; same cell as the once row above

@@ -40,9 +40,15 @@ One server writes a bucket at a time. Ownership is a lease object with a
 30 s expiry (`objkv::lease::TTL_MS`), renewed every 10 s by a heartbeat
 thread using a conditional write. A second server on the same bucket is
 refused while the lease is live, naming the owner. After a crash the lease
-expires and any host may take over; the takeover bumps an epoch that is
-stamped into every commit object, so a resumed stale writer's later objects
-are ignored and its next PUT is refused. Clean shutdown releases the lease.
+expires and any host may take over (a claimant on the same host that finds
+the owner's pid gone takes over at once); the takeover bumps an epoch that
+is stamped into every commit object, so a resumed stale writer's later
+objects are ignored. The writer also asks the bucket, after each commit
+object lands and before the commit is acknowledged, whether a higher epoch
+has been claimed; if one has, nothing is acknowledged and the server writes
+nothing more. A lease that expires (the store unreachable for the whole
+TTL) is not renewed again: the server refuses writes until it is restarted.
+Clean shutdown releases the lease.
 
 ## Time travel
 
@@ -63,7 +69,8 @@ below the collection horizon is refused rather than guessed.
   blank-trimmed, as in PostgreSQL.
 - A scan cannot change direction mid-way (cursor `FETCH BACKWARD` after
   `FORWARD` errors).
-- Index rows are limited to 400 encoded bytes.
+- Index rows are limited to 2704 encoded bytes (the key is stored hex-encoded,
+  so 5408 bytes in the bucket).
 
 ## Storage limits
 

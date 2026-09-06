@@ -144,23 +144,25 @@ impl Rule {
         Rule { op, prefix: prefix.to_string(), nth: None, fault, times: Some(times), seen: 0, fired: 0 }
     }
 
-    fn matches(&mut self, op: OpKind, key: &str) -> Option<Fault> {
+    /// Whether this operation is one the rule is about. Every rule counts
+    /// every such operation, whichever rule ends up firing, so `nth` is a
+    /// position in the real operation sequence.
+    fn counts(&mut self, op: OpKind, key: &str) -> bool {
         if op != self.op || !key.starts_with(&self.prefix) || !self.fault.applies_to(op) {
-            return None;
+            return false;
         }
+        self.seen += 1;
+        true
+    }
+
+    /// The fault this rule wants for the operation `counts` just admitted.
+    fn wants(&self) -> Option<Fault> {
         if self.times.is_some_and(|t| self.fired >= t) {
             return None;
         }
-        self.seen += 1;
-        let hit = match self.nth {
-            Some(n) => self.seen == n,
-            None => true,
-        };
-        if hit {
-            self.fired += 1;
-            Some(self.fault)
-        } else {
-            None
+        match self.nth {
+            Some(n) if self.seen != n => None,
+            _ => Some(self.fault),
         }
     }
 }
@@ -361,10 +363,17 @@ impl FaultStore {
         } else {
             let mut b = body.to_vec();
             let flips = 1 + rng.below(3) as usize;
-            for _ in 0..flips {
+            // Distinct (byte, bit) pairs: two flips of the same bit would
+            // restore it, and a "torn" object that is byte-identical to the
+            // original is a fault that was never injected.
+            let mut done: Vec<(usize, u8)> = Vec::new();
+            while done.len() < flips {
                 let i = rng.below(b.len() as u64) as usize;
-                let bit = 1u8 << rng.below(8);
-                b[i] ^= bit;
+                let bit = rng.below(8) as u8;
+                if !done.contains(&(i, bit)) {
+                    done.push((i, bit));
+                    b[i] ^= 1u8 << bit;
+                }
             }
             b
         }
@@ -379,7 +388,15 @@ impl FaultStore {
         if !s.enabled {
             return (n, None);
         }
-        let mut fault = s.rules.iter_mut().find_map(|r| r.matches(op, key));
+        let mut fault = None;
+        for r in s.rules.iter_mut() {
+            if r.counts(op, key) && fault.is_none() {
+                if let Some(f) = r.wants() {
+                    r.fired += 1;
+                    fault = Some(f);
+                }
+            }
+        }
         let rate = s.rate;
         if fault.is_none() && rate > 0.0 && s.rng.chance(rate) {
             let applicable: Vec<Fault> = s.kinds.iter().copied().filter(|f| f.applies_to(op)).collect();

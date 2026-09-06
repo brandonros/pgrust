@@ -33,10 +33,18 @@
 //! paused past its expiry from making one more PUT. That is what the epoch
 //! is for: it is stamped into every commit object, and `db.rs` records a
 //! fence at each takeover so such an object is recognised and never applied.
+//! The writer closes the last gap itself: after a commit object lands and
+//! before the commit is acknowledged, `verify_in_store` asks the bucket
+//! whether `owner/<E+1>/0` exists. A takeover is exactly that key, so a
+//! writer that lost the lease -- by expiry, by a wrong clock, or by a
+//! same-host claimant that mistook it for dead -- learns so before any
+//! client is told its transaction committed.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+use pgsync::thread;
 
 use crate::s3::PutOutcome;
 use crate::store::Store;
@@ -60,20 +68,43 @@ pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
-        let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
-        since.map_or(0, |d| d.as_millis() as u64)
+        // The workspace's wall clock: SimClock-backed under the sim harness,
+        // so a lease expiry can be replayed.
+        u64::try_from(pg_clock::wall_us() / 1_000).unwrap_or(0)
     }
 }
 
+/// Who holds a lease. The nonce is drawn once per process, so `owner == me`
+/// means this very process and nothing else: a hostname and a pid are shared
+/// by two containers with the same `hostname:` and postgres as pid 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Owner {
     pub host: String,
     pub pid: u32,
+    pub nonce: u64,
 }
 
 impl Owner {
     pub fn me() -> Owner {
-        Owner { host: hostname(), pid: std::process::id() }
+        static NONCE: OnceLock<u64> = OnceLock::new();
+        let nonce = *NONCE.get_or_init(|| {
+            // Time, pid and a stack address, mixed: not a secret, only
+            // something two processes will not both draw.
+            let t = pg_clock::wall_ns() as u64;
+            let stack = 0u8;
+            let a = &stack as *const u8 as u64;
+            let mut x = t ^ (u64::from(std::process::id()) << 32) ^ a.rotate_left(17);
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            x ^= x >> 33;
+            x | 1
+        });
+        Owner { host: hostname(), pid: std::process::id(), nonce }
+    }
+
+    /// Same host and pid, whoever that is now.
+    fn same_host_pid(&self, other: &Owner) -> bool {
+        self.host == other.host && self.pid == other.pid
     }
 }
 
@@ -90,8 +121,11 @@ impl Body {
     /// looks dead, or a dead one that looks alive for ever, and either is a
     /// second writer. Unreadable, it is left to the operator instead.
     pub fn encode(&self) -> Vec<u8> {
-        let text = format!("objkv-lease\n{}\n{}\n{}\n", self.owner.host, self.owner.pid, self.expires_ms);
-        let crc = crc32c::pg_comp_crc32c(0xffff_ffff, text.as_bytes()) ^ 0xffff_ffff;
+        let text = format!(
+            "objkv-lease\n{}\n{}\n{:016x}\n{}\n",
+            self.owner.host, self.owner.pid, self.owner.nonce, self.expires_ms
+        );
+        let crc = crate::crc(text.as_bytes());
         format!("{text}crc:{crc:08x}\n").into_bytes()
     }
     fn decode(b: &[u8]) -> Option<Body> {
@@ -99,7 +133,7 @@ impl Body {
         let (text, crc_line) = s.strip_suffix('\n')?.rsplit_once('\n')?;
         let want = u32::from_str_radix(crc_line.strip_prefix("crc:")?, 16).ok()?;
         let text = format!("{text}\n");
-        if crc32c::pg_comp_crc32c(0xffff_ffff, text.as_bytes()) ^ 0xffff_ffff != want {
+        if crate::crc(text.as_bytes()) != want {
             return None;
         }
         let mut it = text.lines();
@@ -107,7 +141,11 @@ impl Body {
             return None;
         }
         let body = Body {
-            owner: Owner { host: it.next()?.to_string(), pid: it.next()?.parse().ok()? },
+            owner: Owner {
+                host: it.next()?.to_string(),
+                pid: it.next()?.parse().ok()?,
+                nonce: u64::from_str_radix(it.next()?, 16).ok()?,
+            },
             expires_ms: it.next()?.parse().ok()?,
         };
         it.next().is_none().then_some(body)
@@ -145,16 +183,34 @@ pub struct Held {
 /// fail separately: an owner object that does not decode still proves its
 /// epoch is taken.
 pub fn current(store: &Arc<dyn Store>) -> io::Result<Option<Held>> {
-    let keys: Vec<String> = store.list("owner/")?.into_iter().map(|i| i.key).collect();
-    let Some((epoch, renewal, k)) = keys
-        .iter()
-        .filter_map(|k| parse_key(k).map(|(e, n)| (e, n, k.clone())))
-        .max()
-    else {
-        return Ok(None);
-    };
-    let body = store.get(&k)?.and_then(|b| Body::decode(&b));
-    Ok(Some(Held { epoch, renewal, key: k, body, keys }))
+    // The listing and the read are two round trips, and a live holder renews
+    // between them: its newest key is deleted just after it was listed. That
+    // is a healthy owner, not an unreadable one, so the listing is taken
+    // again. Only an object that is there and does not decode is reported as
+    // unreadable.
+    for _ in 0..8 {
+        let keys: Vec<String> = store.list("owner/")?.into_iter().map(|i| i.key).collect();
+        let Some((epoch, renewal, k)) = keys
+            .iter()
+            .filter_map(|k| parse_key(k).map(|(e, n)| (e, n, k.clone())))
+            .max()
+        else {
+            return Ok(None);
+        };
+        match store.get(&k)? {
+            Some(b) => return Ok(Some(Held { epoch, renewal, key: k, body: Body::decode(&b), keys })),
+            None => continue,
+        }
+    }
+    Err(io::Error::other(
+        "objkv: the newest owner object keeps disappearing between the listing and the read",
+    ))
+}
+
+/// The newest epoch anything has claimed, from the listing alone: what the
+/// holder's takeover check needs, without the read `current` adds.
+fn newest_epoch(store: &Arc<dyn Store>) -> io::Result<Option<u64>> {
+    Ok(store.list("owner/")?.into_iter().filter_map(|i| parse_key(&i.key).map(|(e, _)| e)).max())
 }
 
 struct Inner {
@@ -170,6 +226,9 @@ struct Inner {
     released: AtomicBool,
     /// Tells the heartbeat thread to stop.
     stop: AtomicBool,
+    /// The heartbeat thread, so a release can wait for a renewal in flight
+    /// instead of racing it for the next renewal number.
+    heartbeat: pgsync::Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 /// A held lease. Cloning shares it; the heartbeat thread holds one clone.
@@ -194,10 +253,11 @@ impl Lease {
     pub fn acquire_with_heartbeat(store: &Arc<dyn Store>) -> io::Result<Lease> {
         let lease = Lease::acquire(store, Arc::new(SystemClock))?;
         let beat = lease.clone();
-        std::thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("objkv-lease".into())
             .spawn(move || beat.heartbeat())
             .map_err(|e| io::Error::other(format!("objkv: cannot start the lease heartbeat: {e}")))?;
+        *lease.inner.heartbeat.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         Ok(lease)
     }
 
@@ -215,21 +275,25 @@ impl Lease {
                     // expired: a live server and a corrupt object look the same.
                     None => {
                         return Err(io::Error::other(format!(
-                            "this bucket is owned by a lease this version cannot read \\
-                             (`{}`). If that server is definitely gone, delete the object \\
+                            "this bucket is owned by a lease this version cannot read \
+                             (`{}`). If that server is definitely gone, delete the object \
                              and start again.",
                             h.key
                         )))
                     }
                     // A same-host owner whose pid is gone crashed: no need to
-                    // wait out its lease. (A pid namespace can make a live
-                    // owner look gone; the epoch check on every PUT is the
-                    // defence for that case.)
+                    // wait out its lease. A pid namespace can make a live
+                    // owner look gone (two containers with one hostname); the
+                    // owner is safe even then, because it asks the bucket for
+                    // `owner/<E+1>/0` after every commit object lands and
+                    // acknowledges nothing once that key exists
+                    // (`verify_in_store`). `b.owner == me` is exact: the
+                    // nonce is this process's own.
                     Some(b) if now <= b.expires_ms && b.owner != me && !same_host_dead(&b.owner, &me) => {
                         return Err(io::Error::other(format!(
-                            "this bucket is owned by {}:{} (lease epoch {}, valid for another \\
-                             {} ms). Two servers sharing one bucket would overwrite each \\
-                             other's rows. A server that stops renewing is taken over \\
+                            "this bucket is owned by {}:{} (lease epoch {}, valid for another \
+                             {} ms). Two servers sharing one bucket would overwrite each \
+                             other's rows. A server that stops renewing is taken over \
                              automatically once its lease expires.",
                             b.owner.host,
                             b.owner.pid,
@@ -263,6 +327,7 @@ impl Lease {
                         lost_to: AtomicU64::new(0),
                         released: AtomicBool::new(false),
                         stop: AtomicBool::new(false),
+                        heartbeat: pgsync::Mutex::new(None),
                     }),
                 });
             }
@@ -293,7 +358,7 @@ impl Lease {
         let lost = i.lost_to.load(Ordering::Acquire);
         if lost != 0 {
             return Some(format!(
-                "the lease (epoch {}) was taken over by epoch {lost}; another server owns \\
+                "the lease (epoch {}) was taken over by epoch {lost}; another server owns \
                  the bucket now",
                 i.epoch
             ));
@@ -302,7 +367,7 @@ impl Lease {
         let expires = i.expires_ms.load(Ordering::Acquire);
         if now + SKEW_MARGIN_MS >= expires {
             return Some(format!(
-                "the lease (epoch {}) expired: last renewed to {expires} ms, now {now} ms; \\
+                "the lease (epoch {}) expired: last renewed to {expires} ms, now {now} ms; \
                  another server may own the bucket",
                 i.epoch
             ));
@@ -316,6 +381,30 @@ impl Lease {
             Some(why) => Err(io::Error::other(format!("objkv: {why}"))),
             None => Ok(()),
         }
+    }
+
+    /// The bucket's answer to "is this lease still the newest?": one point
+    /// read of the key a takeover would have created. Meant for the writer,
+    /// after a commit object lands and before the commit is acknowledged, so
+    /// that a lease lost by any route -- expiry, a wrong clock, a same-host
+    /// claimant that took a live owner for dead -- is found before a client
+    /// is told anything. A lost lease is recorded, and every later `check`
+    /// refuses.
+    pub fn verify_in_store(&self) -> io::Result<()> {
+        let i = &self.inner;
+        if let Some(why) = self.why_invalid() {
+            return Err(io::Error::other(format!("objkv: {why}")));
+        }
+        if i.store.get(&key(i.epoch + 1, 0))?.is_some() {
+            i.lost_to.fetch_max(i.epoch + 1, Ordering::AcqRel);
+            return Err(io::Error::other(format!(
+                "objkv: the lease (epoch {}) was taken over by epoch {}; this commit is not \
+                 acknowledged and this server writes nothing more",
+                i.epoch,
+                i.epoch + 1
+            )));
+        }
+        Ok(())
     }
 
     /// Writes the next renewal, then looks for a takeover. Either failure
@@ -336,19 +425,14 @@ impl Lease {
         let n = i.renewal.load(Ordering::Acquire) + 1;
         let expires_ms = now + TTL_MS;
         let body = Body { owner: i.me.clone(), expires_ms };
-        match i.store.put_if_absent(&key(i.epoch, n), &body.encode())? {
-            PutOutcome::Written => {}
+        let landed = match i.store.put_if_absent(&key(i.epoch, n), &body.encode())? {
+            PutOutcome::Written => expires_ms,
             // Only this process writes under its epoch, so an existing
             // object is our own, from an attempt whose response was lost.
             PutOutcome::AlreadyExists => {
                 let found = i.store.get(&key(i.epoch, n))?.and_then(|b| Body::decode(&b));
                 match found {
-                    Some(b) if b.owner == i.me => {
-                        i.expires_ms.fetch_max(b.expires_ms, Ordering::AcqRel);
-                        i.renewal.store(n, Ordering::Release);
-                        let _ = i.store.delete(&key(i.epoch, n - 1));
-                        return self.check_takeover();
-                    }
+                    Some(b) if b.owner == i.me => b.expires_ms,
                     _ => {
                         return Err(io::Error::other(format!(
                             "objkv: renewal object `{}` exists and is not ours",
@@ -357,21 +441,26 @@ impl Lease {
                     }
                 }
             }
-        }
-        i.expires_ms.fetch_max(expires_ms, Ordering::AcqRel);
+        };
         i.renewal.store(n, Ordering::Release);
+        // The takeover check comes before the expiry is believed: a renewal
+        // that landed beside a newer epoch's claim renewed nothing.
+        self.check_takeover()?;
+        i.expires_ms.fetch_max(landed, Ordering::AcqRel);
+        // Best effort, and last: the renewal is done whether or not the
+        // previous object goes; a leftover is one more key in a listing.
         let _ = i.store.delete(&key(i.epoch, n - 1));
-        self.check_takeover()
+        Ok(())
     }
 
     fn check_takeover(&self) -> io::Result<()> {
         let i = &self.inner;
-        if let Some(h) = current(&i.store)? {
-            if h.epoch > i.epoch {
-                i.lost_to.fetch_max(h.epoch, Ordering::AcqRel);
+        if let Some(epoch) = newest_epoch(&i.store)? {
+            if epoch > i.epoch {
+                i.lost_to.fetch_max(epoch, Ordering::AcqRel);
                 return Err(io::Error::other(format!(
                     "objkv: the lease (epoch {}) was taken over by epoch {}",
-                    i.epoch, h.epoch
+                    i.epoch, epoch
                 )));
             }
         }
@@ -384,59 +473,108 @@ impl Lease {
     /// The claim is expired, not deleted: a renewal whose expiry is already
     /// past goes in as the newest object under this epoch, so the epoch
     /// stays visible (and is never handed out again) until the next claim
-    /// supersedes it. A renewal already on the wire when this runs can land
-    /// after it, which costs the next open a wait of at most the TTL; the
-    /// heartbeat checks `released` before each renewal, so that needs the
-    /// two to cross within one round trip.
+    /// supersedes it. The heartbeat is stopped and waited for first, so no
+    /// renewal is on the wire when the number is chosen; a renewal whose
+    /// response was lost earlier can still occupy it, and then the release
+    /// goes in under the next number.
     pub fn release(&self) -> io::Result<()> {
         let i = &self.inner;
         i.stop.store(true, Ordering::Release);
+        self.join_heartbeat();
         if i.released.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
         if i.lost_to.load(Ordering::Acquire) != 0 {
             return Ok(()); // the next epoch's claim has superseded ours already
         }
-        let n = i.renewal.load(Ordering::Acquire) + 1;
         let body = Body { owner: i.me.clone(), expires_ms: 0 };
-        // The previous object goes only once the new one is known to be
-        // there: a store that reports "exists" for an object it does not hold
-        // would otherwise leave this epoch with no object at all, and the
-        // next claimant counting on from whatever older leftover it lists.
-        if i.store.put_if_absent(&key(i.epoch, n), &body.encode())? == PutOutcome::AlreadyExists
-            && i.store.get(&key(i.epoch, n))?.is_none()
-        {
-            return Err(io::Error::other(format!(
-                "objkv: release: `{}` was reported to exist but is not there; the claim is left to expire",
-                key(i.epoch, n)
-            )));
+        let mut n = i.renewal.load(Ordering::Acquire) + 1;
+        for _ in 0..4 {
+            let k = key(i.epoch, n);
+            match i.store.put_if_absent(&k, &body.encode())? {
+                PutOutcome::Written => {}
+                // The previous object goes only once the new one is known to
+                // be there: a store that reports "exists" for an object it
+                // does not hold would otherwise leave this epoch with no
+                // object at all, and the next claimant counting on from
+                // whatever older leftover it lists.
+                PutOutcome::AlreadyExists => match i.store.get(&k)?.and_then(|b| Body::decode(&b)) {
+                    None => {
+                        return Err(io::Error::other(format!(
+                            "objkv: release: `{k}` was reported to exist but is not there or does \
+                             not read; the claim is left to expire"
+                        )))
+                    }
+                    // A renewal of ours whose response was lost: it is live,
+                    // so the release must be the newer object.
+                    Some(b) if b.expires_ms != 0 => {
+                        n += 1;
+                        continue;
+                    }
+                    Some(_) => {}
+                },
+            }
+            i.renewal.store(n, Ordering::Release);
+            i.expires_ms.store(0, Ordering::Release);
+            // Every older object under this epoch: the release is the newest
+            // and the only one that matters.
+            for old in i.store.list(&format!("owner/{:016x}/", i.epoch))? {
+                if old.key != k {
+                    let _ = i.store.delete(&old.key);
+                }
+            }
+            return Ok(());
         }
-        i.renewal.store(n, Ordering::Release);
-        i.expires_ms.store(0, Ordering::Release);
-        i.store.delete(&key(i.epoch, n - 1))
+        Err(io::Error::other("objkv: release: could not find a free renewal number"))
+    }
+
+    fn join_heartbeat(&self) {
+        let handle = self.inner.heartbeat.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(h) = handle {
+            if thread::current().id() != h.thread().id() {
+                let _ = h.join();
+            }
+        }
     }
 
     /// Stops the heartbeat without releasing: for a process that has been
     /// fenced and must not touch the bucket again.
     pub fn stop_heartbeat(&self) {
         self.inner.stop.store(true, Ordering::Release);
+        self.join_heartbeat();
     }
 
     fn heartbeat(self) {
         const SLICE_MS: u64 = 250;
+        // Renewals are due on a schedule, not an interval: one that took
+        // long (a store retrying to its timeouts) is followed by the next as
+        // soon as it is due, not HEARTBEAT_MS later.
+        let mut due = self.inner.clock.now_ms() + HEARTBEAT_MS;
         loop {
-            for _ in 0..HEARTBEAT_MS / SLICE_MS {
+            while self.inner.clock.now_ms() < due {
                 if self.inner.stop.load(Ordering::Acquire) {
                     return;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(SLICE_MS));
+                thread::sleep(std::time::Duration::from_millis(SLICE_MS));
             }
             if self.inner.released.load(Ordering::Acquire) {
                 return;
             }
+            due = self.inner.clock.now_ms() + HEARTBEAT_MS;
             if let Err(e) = self.renew() {
                 eprintln!("objkv lease: renewal failed: {e}");
                 if self.inner.lost_to.load(Ordering::Acquire) != 0 {
+                    return;
+                }
+                // An expiry does not come back: `renew` refuses to write into
+                // the claimants' window. Every write is refused from here on
+                // (`check`), and the server needs a restart to claim again.
+                if self.why_invalid().is_some() {
+                    eprintln!(
+                        "objkv lease: epoch {} is over; this server writes nothing more until \
+                         it is restarted",
+                        self.inner.epoch
+                    );
                     return;
                 }
             }
@@ -446,7 +584,7 @@ impl Lease {
 
 /// True when `owner` is a process on this host that no longer exists.
 fn same_host_dead(owner: &Owner, me: &Owner) -> bool {
-    if owner.host != me.host || owner.pid == 0 {
+    if owner.host != me.host || owner.pid == 0 || owner.same_host_pid(me) {
         return false;
     }
     let rc = unsafe { libc::kill(owner.pid as libc::pid_t, 0) };
@@ -504,7 +642,7 @@ mod tests {
     }
 
     fn foreign(expires_ms: u64) -> Body {
-        Body { owner: Owner { host: "some-other-machine".into(), pid: 12345 }, expires_ms }
+        Body { owner: Owner { host: "some-other-machine".into(), pid: 12345, nonce: 7 }, expires_ms }
     }
 
     #[test]
@@ -520,6 +658,11 @@ mod tests {
         let expiry_flipped = text.replace("5000", "5008").into_bytes();
         assert_eq!(Body::decode(&expiry_flipped), None);
         assert_eq!(Body::decode(b"objkv-lease\nh\n1\n2\n"), None, "the old bare format is refused");
+        assert_eq!(
+            Body::decode(b"objkv-lease\nh\n1\n2\ncrc:00000000\n"),
+            None,
+            "a body without the nonce line is refused"
+        );
     }
 
     #[test]
@@ -678,6 +821,98 @@ mod tests {
         l.renew().unwrap();
         assert_eq!(l.expires_ms(), mine.expires_ms);
         assert!(l.valid());
+    }
+
+    #[test]
+    fn verify_in_store_notices_a_takeover_claim_before_anything_is_acknowledged() {
+        let s = store();
+        let c = FakeClock::at(1_000);
+        let l = Lease::acquire(&s, c.clone()).unwrap();
+        l.verify_in_store().unwrap();
+        // A claimant that took this live owner for dead (same hostname,
+        // another pid namespace) claims the next epoch.
+        s.put_if_absent(&key(2, 0), &foreign(c.now_ms() + TTL_MS).encode()).unwrap();
+        assert!(l.valid(), "the clock alone says nothing is wrong");
+        let err = l.verify_in_store().unwrap_err().to_string();
+        assert!(err.contains("taken over by epoch 2"), "{err}");
+        assert!(!l.valid(), "and from here on every check refuses");
+        assert!(l.check().is_err());
+    }
+
+    #[test]
+    fn release_after_a_lost_renewal_response_goes_in_under_the_next_number() {
+        let s = store();
+        let c = FakeClock::at(1_000);
+        let l = Lease::acquire(&s, c.clone()).unwrap();
+        // A renewal landed at n = 1 but its response was lost, so the lease
+        // still counts itself at n = 0.
+        let live = Body { owner: Owner::me(), expires_ms: c.now_ms() + TTL_MS };
+        s.put_if_absent(&key(1, 1), &live.encode()).unwrap();
+        l.release().unwrap();
+        let held = current(&s).unwrap().unwrap();
+        assert_eq!((held.epoch, held.renewal), (1, 2), "the release is the newest object");
+        assert_eq!(held.body.unwrap().expires_ms, 0, "and it is expired");
+        assert!(s.get(&key(1, 1)).unwrap().is_none(), "the live renewal is gone");
+        // The next claimant does not wait.
+        let next = Lease::acquire(&s, c).unwrap();
+        assert_eq!(next.epoch(), 2);
+    }
+
+    #[test]
+    fn a_live_owner_with_this_host_and_pid_but_another_nonce_is_another_process() {
+        let s = store();
+        let c = FakeClock::at(1_000);
+        let me = Owner::me();
+        let twin = Owner { host: me.host.clone(), pid: me.pid, nonce: me.nonce ^ 1 };
+        let body = Body { owner: twin, expires_ms: c.now_ms() + TTL_MS };
+        s.put_if_absent(&key(1, 0), &body.encode()).unwrap();
+        let err = Lease::acquire(&s, c).unwrap_err().to_string();
+        assert!(err.contains("owned by"), "a container with our hostname and pid is not us: {err}");
+    }
+
+    /// Lists a key that is gone by the time it is read, once: the holder
+    /// renewed between the listing and the read.
+    struct VanishesOnce {
+        inner: Arc<dyn Store>,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl Store for VanishesOnce {
+        fn put_if_absent(&self, key: &str, body: &[u8]) -> io::Result<PutOutcome> {
+            self.inner.put_if_absent(key, body)
+        }
+        fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+            self.inner.get(key)
+        }
+        fn get_range(&self, key: &str, offset: u64, len: u64) -> io::Result<Option<Vec<u8>>> {
+            self.inner.get_range(key, offset, len)
+        }
+        fn list(&self, prefix: &str) -> io::Result<Vec<crate::s3::ObjectInfo>> {
+            let mut all = self.inner.list(prefix)?;
+            if self.armed.swap(false, Ordering::SeqCst) {
+                all.push(crate::s3::ObjectInfo { key: key(1, 9), size: 0 });
+            }
+            Ok(all)
+        }
+        fn delete(&self, key: &str) -> io::Result<()> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn a_key_that_vanishes_between_the_listing_and_the_read_is_listed_again() {
+        let inner = store();
+        let c = FakeClock::at(1_000);
+        let s: Arc<dyn Store> = Arc::new(VanishesOnce {
+            inner: Arc::clone(&inner),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        });
+        let held = Lease::acquire(&inner, c.clone()).unwrap();
+        // The stale listing names owner/1/9, which no longer exists.
+        let seen = current(&s).unwrap().unwrap();
+        assert_eq!((seen.epoch, seen.renewal), (1, 0), "the real newest object, not an error");
+        assert!(seen.body.is_some());
+        drop(held);
     }
 
     #[test]

@@ -5,7 +5,8 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use pgsync::Mutex;
 
 use crate::run::RangeSource;
 use crate::s3::Client;
@@ -14,6 +15,9 @@ use crate::s3::{ObjectInfo, PutOutcome};
 pub trait Store: Send + Sync {
     fn put_if_absent(&self, key: &str, body: &[u8]) -> io::Result<PutOutcome>;
     fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>>;
+    /// `None` only when the object is absent. A range that does not fit the
+    /// object is an error, on every implementation alike, so a short or torn
+    /// object is never mistaken for a deleted one.
     fn get_range(&self, key: &str, offset: u64, len: u64) -> io::Result<Option<Vec<u8>>>;
     fn list(&self, prefix: &str) -> io::Result<Vec<ObjectInfo>>;
     /// Removes an object; succeeds if it was already gone.

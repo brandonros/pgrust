@@ -87,7 +87,7 @@ impl Commit {
         put_u64(&mut out, self.epoch);
         debug_assert_eq!(out.len(), HEADER_LEN);
         out.extend_from_slice(&payload);
-        let crc = crc32c::pg_comp_crc32c(0xffff_ffff, &out) ^ 0xffff_ffff;
+        let crc = crate::crc(&out);
         put_u32(&mut out, crc);
         out
     }
@@ -145,7 +145,7 @@ impl Commit {
 
         let body = &buf[..buf.len() - 4];
         let want = get_u32(buf, buf.len() - 4);
-        let got = crc32c::pg_comp_crc32c(0xffff_ffff, body) ^ 0xffff_ffff;
+        let got = crate::crc(body);
         if want != got {
             return Err(bad("checksum mismatch"));
         }
@@ -276,7 +276,7 @@ pub fn encode_batch_members(members: &[&[u8]]) -> Vec<u8> {
         put_u32(&mut out, bytes.len() as u32);
         out.extend_from_slice(bytes);
     }
-    let crc = crc32c::pg_comp_crc32c(0xffff_ffff, &out) ^ 0xffff_ffff;
+    let crc = crate::crc(&out);
     put_u32(&mut out, crc);
     out
 }
@@ -307,7 +307,7 @@ pub fn decode_members(buf: &[u8]) -> io::Result<Vec<(Commit, u32)>> {
     }
     let body = &buf[..buf.len() - 4];
     let want = get_u32(buf, buf.len() - 4);
-    let got = crc32c::pg_comp_crc32c(0xffff_ffff, body) ^ 0xffff_ffff;
+    let got = crate::crc(body);
     if want != got {
         return Err(bad("checksum mismatch"));
     }
@@ -462,7 +462,7 @@ mod tests {
             put_u32(&mut out, bytes.len() as u32);
             out.extend_from_slice(&bytes);
         }
-        let crc = crc32c::pg_comp_crc32c(0xffff_ffff, &out) ^ 0xffff_ffff;
+        let crc = crate::crc(&out);
         put_u32(&mut out, crc);
         assert!(decode_object(&out).unwrap_err().to_string().contains("sequence order"));
 
@@ -493,7 +493,7 @@ mod tests {
         let mut b = sample().encode();
         b[4] = 1;
         let n = b.len();
-        let crc = crc32c::pg_comp_crc32c(0xffff_ffff, &b[..n - 4]) ^ 0xffff_ffff;
+        let crc = crate::crc(&b[..n - 4]);
         b[n - 4..].copy_from_slice(&crc.to_le_bytes());
         let err = Commit::decode(&b).unwrap_err().to_string();
         assert!(err.contains("unsupported version 1"), "{err}");
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!(b[at - 1], 1, "the tag byte before it says delete");
         b[at..at + 4].copy_from_slice(&3u32.to_le_bytes());
         let n = b.len();
-        let crc = crc32c::pg_comp_crc32c(0xffff_ffff, &b[..n - 4]) ^ 0xffff_ffff;
+        let crc = crate::crc(&b[..n - 4]);
         b[n - 4..].copy_from_slice(&crc.to_le_bytes());
         let err = Commit::decode(&b).unwrap_err().to_string();
         assert!(err.contains("delete entry"), "{err}");
@@ -530,7 +530,7 @@ mod tests {
             let mut b = good.clone();
             b[off..off + 4].copy_from_slice(&val.to_le_bytes());
             let n = b.len();
-            let crc = crc32c::pg_comp_crc32c(0xffff_ffff, &b[..n - 4]) ^ 0xffff_ffff;
+            let crc = crate::crc(&b[..n - 4]);
             b[n - 4..].copy_from_slice(&crc.to_le_bytes());
             b
         };
@@ -548,7 +548,7 @@ mod tests {
         let mut b = good.clone();
         b[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         let n = b.len();
-        let crc = crc32c::pg_comp_crc32c(0xffff_ffff, &b[..n - 4]) ^ 0xffff_ffff;
+        let crc = crate::crc(&b[..n - 4]);
         b[n - 4..].copy_from_slice(&crc.to_le_bytes());
         assert!(Commit::decode(&b).is_err());
 

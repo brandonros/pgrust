@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 pgsync = { path = "../pgsync" }
 crc32c = { path = "../../port/crc32c" }
+pg_clock = { path = "../../port/pg_clock" }
 libc = "0.2"
-ureq = { version = "2", default-features = false, features = ["tls", "native-certs"] }
+ureq = { version = "2.12", default-features = false, features = ["tls", "native-certs"] }
 rusty-s3 = { version = "0.10.2" }

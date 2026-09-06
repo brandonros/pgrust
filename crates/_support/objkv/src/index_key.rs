@@ -435,6 +435,11 @@ fn payload_rowid(payload: &[u8]) -> Option<u64> {
 }
 
 /// The rowid an entry points at, from the key or from the payload.
+///
+/// `key` is the entry key as written, never the versioned form a run stores
+/// (`key::versioned`): the version suffix has the same shape as a rowid
+/// field and would be read as one. Callers that hold run keys strip them
+/// with `key::row_of` first, as the collector does.
 pub fn rowid_of(key: &[u8], payload: &[u8]) -> Option<u64> {
     let fields = key.iter().filter(|&&b| b == b'/').count() + 1;
     if fields >= 5 {
@@ -460,7 +465,8 @@ pub struct EntryRef {
 
 /// Reads an entry key back, or `None` if it is not one. Deciding from the key
 /// alone is what keeps the collector free of catalog lookups, which it must be
-/// while holding the storage lock a catalog read would want.
+/// while holding the storage lock a catalog read would want. Unversioned
+/// keys only; see `rowid_of`.
 pub fn entry_of(key: &[u8], payload: &[u8]) -> Option<EntryRef> {
     let mut fields = key.split(|&b| b == b'/');
     let db = hex32(fields.next()?)?;

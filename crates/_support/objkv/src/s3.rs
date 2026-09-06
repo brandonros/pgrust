@@ -13,21 +13,32 @@ use rusty_s3::actions::{ListObjectsV2, S3Action};
 use rusty_s3::{Bucket, Credentials, UrlStyle};
 
 /// Socket deadline. Without one a network black hole becomes an unbounded
-/// stall, which is the failure mode that matters most here.
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// stall, which is the failure mode that matters most here. Short enough
+/// that a lease renewal (one PUT and one LIST, each retried to this limit)
+/// fits inside the lease's validity.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a presigned URL stays valid; it only has to cover clock skew.
 const SIGN_EXPIRY: Duration = Duration::from_secs(300);
 
 /// Attempts per request, including the first. Transport failures and 5xx are
 /// retried; every 4xx except the conditional-write conflict is permanent.
-const MAX_ATTEMPTS: u32 = 4;
-const RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
+const MAX_ATTEMPTS: u32 = 3;
+/// Backoff between attempts: doubling from this, capped, with full jitter so
+/// the threads that all hit one throttled prefix do not come back in step.
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+/// The most a `Retry-After` header is believed.
+const RETRY_AFTER_CAP: Duration = Duration::from_secs(5);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PutOutcome {
     Written,
-    /// The key already existed; `If-None-Match: *` was refused.
+    /// The key already existed when the PUT was tried: `If-None-Match: *` was
+    /// refused. That is not always "somebody else won". `execute` re-sends a
+    /// PUT whose response was lost, and if the first attempt landed the
+    /// retry is refused by our own object. A caller that cannot rule that out
+    /// reads the key back and compares before treating the write as lost.
     AlreadyExists,
 }
 
@@ -98,11 +109,13 @@ impl Client {
 
         match self.execute("PUT", url.as_str(), &hdrs, Some(body)) {
             Ok(_) => Ok(PutOutcome::Written),
-            // 412 is the conditional-write refusal: the key exists, we lost. 409 is
-            // deliberately not folded in -- S3 returns it when a concurrent request for
-            // the same key is in flight and documents it as retryable, so the outcome is
-            // unknown rather than lost. `execute` retries it.
-            Err(Fail::Status(412, _)) => Ok(PutOutcome::AlreadyExists),
+            // 412 is the conditional-write refusal: the key exists -- see
+            // `PutOutcome::AlreadyExists` for why that is not always a loss.
+            // 409 is deliberately not folded in -- S3 returns it when a
+            // concurrent request for the same key is in flight and documents
+            // it as retryable, so the outcome is unknown rather than lost.
+            // `execute` retries it.
+            Err(Fail::Status(412, ..)) => Ok(PutOutcome::AlreadyExists),
             Err(e) => Err(e.into()),
         }
     }
@@ -111,7 +124,7 @@ impl Client {
         let url = self.bucket.get_object(Some(&self.creds), key).sign(SIGN_EXPIRY);
         match self.execute("GET", url.as_str(), &[], None) {
             Ok(r) => Ok(Some(r.body)),
-            Err(Fail::Status(404, _)) => Ok(None),
+            Err(Fail::Status(404, ..)) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
@@ -143,9 +156,12 @@ impl Client {
                 }
                 Ok(Some(r.body))
             }
-            Err(Fail::Status(404, _)) => Ok(None),
-            // A range past the end of the object.
-            Err(Fail::Status(416, _)) => Ok(None),
+            Err(Fail::Status(404, ..)) => Ok(None),
+            // A range past the end of the object is a short object, not an
+            // absent one: the run reader must hear "corrupt", never "gone".
+            Err(Fail::Status(416, ..)) => Err(io::Error::other(format!(
+                "s3: ranged GET of {key} at {offset}+{len} is past the end of the object"
+            ))),
             Err(e) => Err(e.into()),
         }
     }
@@ -154,7 +170,7 @@ impl Client {
     pub fn delete(&self, key: &str) -> io::Result<()> {
         let url = self.bucket.delete_object(Some(&self.creds), key).sign(SIGN_EXPIRY);
         match self.execute("DELETE", url.as_str(), &[], None) {
-            Ok(_) | Err(Fail::Status(404, _)) => Ok(()),
+            Ok(_) | Err(Fail::Status(404, ..)) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
@@ -208,7 +224,7 @@ impl Client {
             match self.send_once(method, url, headers, body) {
                 Ok(r) => return Ok(r),
                 Err(e) if e.retryable() && attempt < MAX_ATTEMPTS => {
-                    std::thread::sleep(RETRY_BASE_DELAY * (1 << (attempt - 1)));
+                    pgsync::thread::sleep(backoff(attempt, e.retry_after()));
                 }
                 Err(e) => return Err(e),
             }
@@ -241,12 +257,16 @@ impl Client {
                 // else outside 2xx) comes back here as `Ok`, and would pass for
                 // a stored object. Success is 2xx and nothing else.
                 if !(200..300).contains(&status) {
-                    return Err(Fail::Status(status, String::from_utf8_lossy(&buf).into_owned()));
+                    return Err(Fail::Status(status, String::from_utf8_lossy(&buf).into_owned(), None));
                 }
                 Ok(Response { status, body: buf })
             }
             Err(ureq::Error::Status(code, r)) => {
-                Err(Fail::Status(code, r.into_string().unwrap_or_default()))
+                let retry_after = r
+                    .header("retry-after")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map(Duration::from_secs);
+                Err(Fail::Status(code, r.into_string().unwrap_or_default(), retry_after))
             }
             Err(e) => Err(Fail::Transport(e.to_string())),
         }
@@ -262,21 +282,48 @@ struct Response {
 /// retry loop in `execute` needs.
 #[derive(Debug)]
 enum Fail {
-    Status(u16, String),
+    /// Status, body, and the `Retry-After` the store asked for, if any.
+    Status(u16, String, Option<Duration>),
     Transport(String),
 }
 
 impl Fail {
     fn retryable(&self) -> bool {
         match self {
-            // A dropped connection says nothing about whether the request applied, but
-            // every operation here is idempotent or guarded by put-if-absent.
+            // A dropped connection says nothing about whether the request
+            // applied. GET, LIST and DELETE do not care; a PUT is conditional,
+            // so a retry of one that landed is refused rather than repeated,
+            // and the caller reads back to tell the two apart (see
+            // `PutOutcome::AlreadyExists`).
             Fail::Transport(_) => true,
-            Fail::Status(409, _) => true,
-            Fail::Status(429, _) => true,
-            Fail::Status(c, _) => *c >= 500,
+            Fail::Status(409, ..) => true,
+            Fail::Status(429, ..) => true,
+            Fail::Status(c, ..) => *c >= 500,
         }
     }
+
+    fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Fail::Status(_, _, after) => *after,
+            Fail::Transport(_) => None,
+        }
+    }
+}
+
+/// Capped exponential backoff with full jitter, or the store's own
+/// `Retry-After` (capped) when it named one.
+fn backoff(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    if let Some(after) = retry_after {
+        return after.min(RETRY_AFTER_CAP);
+    }
+    let ceiling = (RETRY_BASE_DELAY * (1 << (attempt - 1).min(8))).min(RETRY_MAX_DELAY);
+    // Not a secret and not a statistic: any spread across threads will do.
+    let mut x = pg_clock::wall_ns() as u64 ^ (u64::from(std::process::id()) << 20);
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    let frac = (x.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64 / (1u64 << 53) as f64;
+    Duration::from_secs_f64(ceiling.as_secs_f64() * frac)
 }
 
 impl From<Fail> for io::Error {
@@ -284,7 +331,7 @@ impl From<Fail> for io::Error {
         match f {
             // char_indices, not a byte slice: keys are arbitrary UTF-8 and S3 echoes
             // them into error bodies, so a byte cut can split a codepoint and panic.
-            Fail::Status(code, body) => {
+            Fail::Status(code, body, _) => {
                 let cut = body
                     .char_indices()
                     .map(|(i, _)| i)
@@ -354,13 +401,13 @@ mod tests {
     #[test]
     fn retry_classification() {
         assert!(Fail::Transport("reset".into()).retryable());
-        assert!(Fail::Status(409, String::new()).retryable());
-        assert!(Fail::Status(503, String::new()).retryable());
-        assert!(!Fail::Status(412, String::new()).retryable());
-        assert!(!Fail::Status(404, String::new()).retryable());
-        assert!(!Fail::Status(403, String::new()).retryable());
-        assert!(!Fail::Status(301, String::new()).retryable(), "a redirect is a misconfiguration");
-        assert!(!Fail::Status(307, String::new()).retryable());
+        assert!(Fail::Status(409, String::new(), None).retryable());
+        assert!(Fail::Status(503, String::new(), None).retryable());
+        assert!(!Fail::Status(412, String::new(), None).retryable());
+        assert!(!Fail::Status(404, String::new(), None).retryable());
+        assert!(!Fail::Status(403, String::new(), None).retryable());
+        assert!(!Fail::Status(301, String::new(), None).retryable(), "a redirect is a misconfiguration");
+        assert!(!Fail::Status(307, String::new(), None).retryable());
     }
 
     /// One HTTP exchange served by hand on a local socket, answering with
