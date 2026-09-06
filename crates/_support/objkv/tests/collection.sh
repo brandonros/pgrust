@@ -25,6 +25,20 @@ refused_below_retention() {  # refused_below_retention <what>
                 -c "SELECT n FROM churn WHERE id = 1;" 2>&1 | tail -1)
     contains "$1" "has been collected" "$out"
 }
+settled() {  # the bucket's byte count, once it has held still for 8s
+    # Tidy-up runs on its own thread after the statement that asked for it
+    # returns, and a merge changes nothing in the bucket until its PUT lands;
+    # a debug build takes seconds over a megabyte, so a short quiet spell
+    # proves little. Four samples two seconds apart, up to two minutes.
+    local prev=-1 cur same=0 i
+    for i in $(seq 1 60); do
+        cur=$(bytes)
+        if [ "$cur" = "$prev" ]; then same=$((same + 1)); else same=0; fi
+        [ "$same" -ge 3 ] && { echo "$cur"; return; }
+        prev=$cur; sleep 2
+    done
+    echo "$cur"
+}
 
 fresh_cluster
 
@@ -37,7 +51,9 @@ echo "  $WRITES updates, $GREW bytes in the bucket"
 
 echo "2. retention on: the same workload again"
 churn "$KEEP" "$WRITES"
-KEPT=$(bytes)
+# Collection is asynchronous: measure once it has finished, not where the
+# workload happened to stop.
+KEPT=$(settled)
 echo "  $WRITES more updates, $KEPT bytes"
 if [ "$KEPT" -lt "$GREW" ]; then
     ok "the bucket shrank while the workload continued ($GREW -> $KEPT bytes)"
@@ -70,19 +86,6 @@ CHURNED=$(bytes)
 # otherwise this measures where the workload happened to stop, not what
 # collection kept. Then wait for the bucket to stop changing.
 churn "$KEEP" "$SETTLE"
-settled() {  # the bucket's byte count, once it has held still for 8s
-    # A merge changes nothing in the bucket until its PUT lands, and a debug
-    # build takes seconds over a megabyte, so a short quiet spell proves
-    # little. Four samples two seconds apart, up to two minutes.
-    local prev=-1 cur same=0 i
-    for i in $(seq 1 60); do
-        cur=$(bytes)
-        if [ "$cur" = "$prev" ]; then same=$((same + 1)); else same=0; fi
-        [ "$same" -ge 3 ] && { echo "$cur"; return; }
-        prev=$cur; sleep 2
-    done
-    echo "$cur"
-}
 INDEXED_END=$(settled)
 echo "  50 rows x $ROUNDS updates: $INDEXED_START -> $CHURNED bytes, $INDEXED_END once settled"
 

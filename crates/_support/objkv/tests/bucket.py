@@ -22,7 +22,7 @@ HOST = _url.netloc
 # `rm` issues signed deletes against whatever the listing returns, so plaintext
 # to anywhere but this machine lets whoever is in the middle pick the keys.
 if _url.scheme != "https" and (_url.hostname or "") not in ("127.0.0.1", "::1", "localhost"):
-    if not os.environ.get("OBJKV_S3_INSECURE"):
+    if os.environ.get("OBJKV_S3_INSECURE") != "1":
         sys.exit(f"bucket.py: refusing plaintext to {HOST}; use https:// or set OBJKV_S3_INSECURE=1")
 BUCKET = os.environ.get("OBJKV_S3_BUCKET", "objkv")
 KEY = os.environ.get("OBJKV_S3_KEY", "minioadmin")

@@ -6,7 +6,9 @@
 # reading and a place to stop.
 #
 . "$(dirname "$0")/server.sh"
-ROWS="${ROWS:-20000}"
+# Fixed, not a knob: the bounds and counts below ('user-019999', 9999 rows
+# under 'user-00%', the 5000..5100 window) are written for exactly this many.
+ROWS=20000
 export PGRUST_OBJKV_TRACE=1
 
 echo "0. a table big enough that reading it all would show"
@@ -52,8 +54,15 @@ echo "4b. a bound of another type"
 # bound of another width is restated at the column's width before it is
 # encoded (objkv_index.rs, fit_int): a literal the column cannot hold keeps
 # its Postgres answer instead of being refused or mis-sorted.
-check "a text bound on a name column works" "t" \
-      "$(idx "SELECT count(*) > 0 FROM pg_class WHERE relname LIKE 'pg\_cl%';")"
+# On an objkv table with a name column, so it is objkv's encoding under
+# test: pg_class is a heap catalog served by a plain btree.
+sql "CREATE TABLE named (n name) USING objkv;" >/dev/null
+sql "CREATE INDEX named_n ON named (n);" >/dev/null
+sql "INSERT INTO named VALUES ('pg_class'), ('pg_clone'), ('pg_attribute'), ('zz');" >/dev/null
+check "a text bound on a name column works" "2" \
+      "$(idx "SELECT count(*) FROM named WHERE n LIKE 'pg\_cl%';")"
+check "and a text range on it"              "3" \
+      "$(idx "SELECT count(*) FROM named WHERE n > 'pg_b';")"
 check "an int8 literal above int4 range: > matches nothing" "0" \
       "$(idx "SELECT count(*) FROM events WHERE id > 5000000000;")"
 check "and < matches everything" "$ROWS" \

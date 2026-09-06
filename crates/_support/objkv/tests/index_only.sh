@@ -82,10 +82,17 @@ if timing_enabled; then
             | grep -o '"Execution Time": [0-9.]*' | head -1 | sed 's/.*: //'
     }
     faster() { check "$1" "t" "$(awk -v a="${2:-1}" -v b="${3:-0}" 'BEGIN{print (a < b) ? "t" : "f"}')"; }
-    N_ONLY=$(ms "SELECT count(tag) FROM readings WHERE tag > 'tag-00000';")
+    # The timing means nothing unless the "index alone" side really is an
+    # index-only scan, under the same planner options the timed run uses.
+    only() { shows "$1" "Index Only Scan" "$(plan "$2")"; }
+    N_ONLY_Q="SELECT count(tag) FROM readings WHERE tag > 'tag-00000';"
+    W_ONLY_Q="SELECT count(k)   FROM wide WHERE k > 0;"
+    only "narrow rows: the plan is an index-only scan" "$N_ONLY_Q"
+    only "2KB rows: the plan is an index-only scan" "$W_ONLY_Q"
+    N_ONLY=$(ms "$N_ONLY_Q")
     N_ROWS=$(ms "SELECT count(id)  FROM readings WHERE tag > 'tag-00000';")
     echo "  narrow rows: ${N_ONLY}ms from the index alone, ${N_ROWS}ms fetching each row"
-    W_ONLY=$(ms "SELECT count(k)   FROM wide WHERE k > 0;")
+    W_ONLY=$(ms "$W_ONLY_Q")
     W_ROWS=$(ms "SELECT count(pad) FROM wide WHERE k > 0;")
     echo "  2KB rows:    ${W_ONLY}ms from the index alone, ${W_ROWS}ms fetching each row"
     faster "on rows worth not reading, it is faster" "$W_ONLY" "$W_ROWS"

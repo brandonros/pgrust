@@ -7,7 +7,7 @@
 #
 . "$(dirname "$0")/server.sh"
 ROWS="${ROWS:-3000}"
-WALK="${WALK:-60}"   # how many commits back step 6 looks for the pre-truncate table
+WALK="${WALK:-500}"   # how far up from the first commit step 6 looks for the pre-truncate table
 
 echo "0. a table with rows and two indexes"
 fresh_cluster
@@ -72,11 +72,12 @@ sql "INSERT INTO past SELECT g, 'old-' || g FROM generate_series(1,20) g;" >/dev
 check "twenty rows"    "20" "$(sql "SELECT count(*) FROM past;")"
 sql "TRUNCATE past;" >/dev/null
 check "and now none"   "0"  "$(sql "SELECT count(*) FROM past;")"
-# Which commit the truncate was is not readable from SQL, so walk back from
-# the most recent WALK commits until a snapshot shows the full table.
+# Which commit the truncate was is not readable from SQL, so walk up from the
+# first commit until a snapshot shows the full table: the fill commit comes
+# before the truncate, and everything this script ran fits well inside WALK.
 at_seq() { psqlx -d postgres -tA -c "SET pgrust.objkv_snapshot_seq = $1;" -c "$2" 2>/dev/null | tail -1; }
 FOUND=0
-for seq in $(seq "$WALK" -1 1); do
+for seq in $(seq 1 "$WALK"); do
     if [ "$(at_seq "$seq" "SELECT count(*) FROM past;")" = "20" ]; then FOUND=$seq; break; fi
 done
 check "some earlier commit still has all twenty" "t" "$([ "$FOUND" != 0 ] && echo t || echo f)"

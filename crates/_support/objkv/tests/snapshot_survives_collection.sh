@@ -48,6 +48,8 @@ exec 3>"$WORK/a.in"
 a() { printf '%s\n' "$1" >&3; }
 a_reached() {  # a_reached <mark>: true once A has run everything sent before it
     local i
+    # A stale marker from an earlier run would answer before A has done anything.
+    rm -f "$WORK/a.$1"
     a "\\! touch '$WORK/a.$1'"
     for i in $(seq 1 240); do [ -e "$WORK/a.$1" ] && return 0; sleep 0.25; done
     fail "session A did not get to '$1' within 60s: $(tail -3 "$WORK/a.out" 2>/dev/null | tr '\n' ' ')"

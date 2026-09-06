@@ -62,8 +62,7 @@ echo "3. a writer that stops renewing is taken over after the TTL, and fenced wh
 # let A take over, then resume B: B's next write must be refused.
 kill -STOP "$B_PID"
 sleep 33
-boot   # A, on $PGDATA, port $PORT
-OBJKV_PIDS="$OBJKV_PIDS $B_PID"
+boot   # A, on $PGDATA, port $PORT (boot_b already registered B for the exit trap)
 START=$(date +%s)
 OUT=$(sql "INSERT INTO t VALUES (2, 'A again');" | tail -1)
 check "A takes over the expired lease" "INSERT 0 1" "$OUT"

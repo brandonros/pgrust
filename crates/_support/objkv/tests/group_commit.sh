@@ -27,7 +27,7 @@ WANT=$((WRITERS * PER))
 JOBS=""
 for w in $(seq 1 "$WRITERS"); do
     ( seq 1 "$PER" | sed "s/.*/INSERT INTO gc VALUES ($w,&,'sync');/" \
-        | psql -h "$SOCKDIR" -p "$PORT" -d postgres -q >/dev/null 2>&1 ) &
+        | psqlx -d postgres -q >/dev/null 2>&1 ) &
     JOBS="$JOBS $!"
 done
 for j in $JOBS; do wait "$j"; done
@@ -54,10 +54,10 @@ sql "INSERT INTO ac VALUES (1, 0), (2, 0);" >/dev/null
 # Timing, informational: one session, sequential single-row transactions.
 N=30
 t0=$(date +%s%N)
-seq 1 $N | sed "s/.*/INSERT INTO gc VALUES (0,&,'sync');/" | psql -h "$SOCKDIR" -p "$PORT" -d postgres -q >/dev/null 2>&1
+seq 1 $N | sed "s/.*/INSERT INTO gc VALUES (0,&,'sync');/" | psqlx -d postgres -q >/dev/null 2>&1
 t1=$(date +%s%N)
 { echo "SET pgrust.objkv_async_commit = on;"; seq 1 $N | sed "s/.*/INSERT INTO gc VALUES (-1,&,'async');/"; } \
-    | psql -h "$SOCKDIR" -p "$PORT" -d postgres -q >/dev/null 2>&1
+    | psqlx -d postgres -q >/dev/null 2>&1
 t2=$(date +%s%N)
 SYNC_MS=$(( (t1 - t0) / 1000000 )); ASYNC_MS=$(( (t2 - t1) / 1000000 ))
 echo "  $N sequential commits: sync ${SYNC_MS}ms, async ${ASYNC_MS}ms"
@@ -94,7 +94,7 @@ echo "4. a clean shutdown loses no asynchronous commit"
 # Queue a burst and stop straight away: the exit path drains the queue
 # before publishing the watermark.
 { echo "SET pgrust.objkv_async_commit = on;"; seq 1 40 | sed "s/.*/INSERT INTO gc VALUES (-2,&,'tail');/"; } \
-    | psql -h "$SOCKDIR" -p "$PORT" -d postgres -q >/dev/null 2>&1
+    | psqlx -d postgres -q >/dev/null 2>&1
 stop
 boot
 check "every async commit before shutdown is back" "40" "$(sql "SELECT count(*) FROM gc WHERE who = -2;")"
