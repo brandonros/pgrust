@@ -283,7 +283,10 @@ pub enum Outcome {
 #[derive(Debug)]
 pub struct Flight {
     pub key: String,
-    pub bytes: Vec<u8>,
+    /// Shared with the `InFlight` record, not copied: a bulk load's object
+    /// can be hundreds of megabytes, and up to `MAX_IN_FLIGHT` are in the
+    /// air at once.
+    pub bytes: Arc<[u8]>,
     /// The first member's sequence number: how the writer reports back.
     pub first: u64,
 }
@@ -292,9 +295,9 @@ pub struct Flight {
 #[derive(Debug)]
 struct InFlight {
     key: String,
-    /// A copy of what was sent, so a failed PUT can be checked against what
-    /// the bucket holds.
-    bytes: Vec<u8>,
+    /// What was sent, so a failed PUT can be checked against what the
+    /// bucket holds.
+    bytes: Arc<[u8]>,
     members: Vec<Pending>,
     /// The PUT landed, but an earlier flight has not: the members wait for
     /// it, so what a client is told is durable is always a prefix.
@@ -855,6 +858,13 @@ impl Db {
         self.epoch
     }
 
+    /// The lease this process writes under, for the writer to verify in
+    /// the store after a commit object lands (`Lease::verify_in_store`),
+    /// with no lock held. `None` when opened read-only.
+    pub fn lease(&self) -> Option<Lease> {
+        self.lease.clone()
+    }
+
     /// Gives the lease up so the next open, on any host, need not wait for
     /// it to expire. For a clean shutdown, after the last write has been
     /// drained; every write after this is refused.
@@ -1108,16 +1118,20 @@ impl Db {
             return None;
         }
         self.check_lease().ok()?;
-        let members = std::mem::take(&mut self.unwritten);
+        let mut members = std::mem::take(&mut self.unwritten);
         let first = members[0].seq;
         let key = commit::key_for(first);
-        let bytes = if members.len() == 1 {
-            members[0].bytes.clone()
+        let bytes: Arc<[u8]> = if members.len() == 1 {
+            std::mem::take(&mut members[0].bytes).into()
         } else {
             let parts: Vec<&[u8]> = members.iter().map(|m| m.bytes.as_slice()).collect();
-            commit::encode_batch_members(&parts)
+            commit::encode_batch_members(&parts).into()
         };
-        self.in_flight.insert(first, InFlight { key: key.clone(), bytes: bytes.clone(), members, landed: false });
+        // The members' own copies have served: the object is what travels.
+        for m in &mut members {
+            m.bytes = Vec::new();
+        }
+        self.in_flight.insert(first, InFlight { key: key.clone(), bytes: Arc::clone(&bytes), members, landed: false });
         Some(Flight { key, bytes, first })
     }
 
@@ -1167,8 +1181,13 @@ impl Db {
                 self.objects.insert(first, last.seq);
             }
             for m in f.members {
-                // A member discarded while in flight has no holder waiting.
-                if !self.discarded.contains_key(&m.seq) {
+                // A member discarded while in flight has no holder waiting,
+                // and an asynchronous one never waits: its transaction
+                // committed in Postgres when it was staged. Only a
+                // synchronous holder collects, so only it gets an entry;
+                // otherwise the map grows by one per asynchronous commit
+                // for the life of the process.
+                if m.sync && !self.discarded.contains_key(&m.seq) {
                     self.outcomes.insert(m.ticket, Outcome::Durable(m.seq));
                 }
             }
@@ -1191,7 +1210,7 @@ impl Db {
     pub fn flight_failed(&mut self, first: u64, why: &str) {
         let Some(mut f) = self.in_flight.remove(&first) else { return };
         match self.store.get(&f.key) {
-            Ok(Some(b)) if b == f.bytes => {
+            Ok(Some(b)) if b.as_slice() == &*f.bytes => {
                 f.landed = true;
                 self.in_flight.insert(first, f);
                 self.flight_written(first);
@@ -1251,7 +1270,7 @@ impl Db {
     /// impossible; see [`Db::foreign_object_at`].
     pub fn flight_lost(&mut self, flight: &Flight) -> io::Result<()> {
         match self.store.get(&flight.key) {
-            Ok(Some(b)) if b == flight.bytes => {
+            Ok(Some(b)) if b.as_slice() == &*flight.bytes => {
                 self.flight_written(flight.first);
                 Ok(())
             }
@@ -1384,13 +1403,16 @@ impl Db {
         snapshot: u64,
         probe_runs: bool,
     ) -> io::Result<Option<Conflict>> {
+        // Per write key, a binary search in each newer commit: a
+        // transaction writes a handful of rows, while the unfolded layer can
+        // hold a bulk load's million entries, and this runs under the lock.
         for c in self.commits.iter().map(|c| &**c).chain(self.staged.values().map(|s| &s.commit)) {
             if c.seq <= snapshot {
                 continue;
             }
-            for e in &c.entries {
-                if writes.contains_key(&e.key) {
-                    return Ok(Some(Conflict { key: e.key.clone(), by: c.seq }));
+            for key in writes.keys() {
+                if c.lookup(key).is_some() {
+                    return Ok(Some(Conflict { key: key.clone(), by: c.seq }));
                 }
             }
         }
@@ -3085,7 +3107,7 @@ mod tests {
         assert_eq!(b.epoch(), 2);
         commit(&mut b, &s, one(b"k", b"2"));
         drop(b);
-        let leftover = crate::lease::Body { owner: crate::lease::Owner { host: "somehost".into(), pid: 1 }, expires_ms: 0 };
+        let leftover = crate::lease::Body { owner: crate::lease::Owner { host: "somehost".into(), pid: 1, nonce: 3 }, expires_ms: 0 };
         f.inner.put_if_absent(&crate::lease::key(1, 9), &leftover.encode()).unwrap();
         f.next_list_stale("owner/");
         let err = Db::open(Arc::clone(&s)).map(|_| ()).unwrap_err().to_string();
@@ -3801,7 +3823,7 @@ mod tests {
         let now = crate::lease::Clock::now_ms(&crate::lease::SystemClock);
         let clock = FakeClock::at(now);
         let expires_ms = now + TTL_MS;
-        let other = crate::lease::Body { owner: crate::lease::Owner { host: "some-other-machine".into(), pid: 4242 }, expires_ms };
+        let other = crate::lease::Body { owner: crate::lease::Owner { host: "some-other-machine".into(), pid: 4242, nonce: 3 }, expires_ms };
         m.put_if_absent(&crate::lease::key(1, 0), &other.encode()).unwrap();
         let err = Db::open(Arc::clone(&s)).err().expect("refused").to_string();
         assert!(err.contains("owned by some-other-machine:4242"), "{err}");

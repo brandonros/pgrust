@@ -243,6 +243,9 @@ struct Env {
     /// The oldest snapshot each worker reads at, as `IN_USE` in the AM.
     in_use: Mutex<BTreeMap<usize, u64>>,
     done_workers: AtomicUsize,
+    /// The writer thread panicked: workers waiting on an outcome would
+    /// otherwise wait for ever, and the test would hang rather than fail.
+    writer_dead: std::sync::atomic::AtomicBool,
 }
 
 impl Env {
@@ -257,6 +260,7 @@ impl Env {
             signal: (Mutex::new(()), Condvar::new()),
             in_use: Mutex::new(BTreeMap::new()),
             done_workers: AtomicUsize::new(0),
+            writer_dead: std::sync::atomic::AtomicBool::new(false),
         };
         (env, mem)
     }
@@ -708,7 +712,13 @@ fn run_threaded(cfg: Config) -> RunResult {
                                 std::thread::yield_now();
                             }
                         }
-                        Progress::Waiting => env.wait(Duration::from_millis(1)),
+                        Progress::Waiting => {
+                            assert!(
+                                !env.writer_dead.load(Ordering::Acquire),
+                                "the writer thread died; see its panic above"
+                            );
+                            env.wait(Duration::from_millis(1))
+                        }
                         Progress::Done => break,
                     }
                 }
@@ -722,7 +732,20 @@ fn run_threaded(cfg: Config) -> RunResult {
     let writer = {
         let env = Arc::clone(&env);
         let w = Writer::new(Rng::new(cfg.seed ^ 0x5757));
-        std::thread::spawn(move || w.run(&env))
+        std::thread::spawn(move || {
+            // A drop guard: on a panic, tell the workers before unwinding.
+            struct Dying<'a>(&'a Env);
+            impl Drop for Dying<'_> {
+                fn drop(&mut self) {
+                    if std::thread::panicking() {
+                        self.0.writer_dead.store(true, Ordering::Release);
+                        self.0.notify();
+                    }
+                }
+            }
+            let _guard = Dying(&env);
+            w.run(&env)
+        })
     };
     let compactor = {
         let env = Arc::clone(&env);
@@ -891,6 +914,37 @@ fn check(r: &RunResult) -> Result<(), Vec<String>> {
 
     // 1. Final lists: every committed append exactly once, in commit order,
     //    no aborted append anywhere.
+    // 0. A refusal names a real, newer writer of the key: `by` is above the
+    //    refused transaction's snapshot and belongs to a transaction that
+    //    committed (or was staged and later aborted) with that key. An
+    //    engine that refuses spuriously, or refuses everything, would
+    //    otherwise pass every other oracle with an empty model.
+    for t in &r.history {
+        if let Fate::Conflict { key, by, at } = &t.fate {
+            if *by <= t.snapshot {
+                out.push(format!(
+                    "{} was refused at {at} by seq {by}, which is not above its snapshot {}",
+                    tname(t.id),
+                    t.snapshot
+                ));
+            }
+            let committed_writer = m.per_key.get(*key).is_some_and(|l| l.iter().any(|(s, _)| s == by));
+            let aborted_writer = r.history.iter().any(|o| {
+                o.writes.contains(key)
+                    && matches!(
+                        o.fate,
+                        Fate::AbortedAfterLanded { seq } | Fate::AbortedInFlight { seq } if seq == *by
+                    )
+            });
+            if !committed_writer && !aborted_writer {
+                out.push(format!(
+                    "{} was refused at {at} by seq {by}, but no transaction wrote key {key} at {by}",
+                    tname(t.id)
+                ));
+            }
+        }
+    }
+
     let mut finals: Vec<Vec<u32>> = Vec::with_capacity(cfg.keys);
     for k in 0..cfg.keys {
         let got = decode(r.db.get(&key_bytes(k)).expect("final read"));
@@ -1116,11 +1170,15 @@ fn report(r: &RunResult, violations: &[String]) -> ! {
     panic!("{} mode, seed {}: {} isolation violation(s)", r.mode, r.cfg.seed, violations.len());
 }
 
-fn verify(r: RunResult) -> (usize, usize) {
+fn verify(r: RunResult) -> (usize, usize, usize) {
     if let Err(v) = check(&r) {
         report(&r, &v);
     }
     let committed = r.history.iter().filter(|t| matches!(t.fate, Fate::Committed { .. })).count();
+    let refused = r.history.iter().filter(|t| matches!(t.fate, Fate::Conflict { .. })).count();
+    // A seed that commits nothing tests nothing: the oracles above are all
+    // satisfied by an empty model.
+    assert!(committed > 0, "seed {}: no transaction committed", r.cfg.seed);
     let RunResult { cfg, mode, history, db, store, folds } = r;
     // Durability: what a restart sees. Dropping the writer releases its lease.
     drop(db);
@@ -1137,23 +1195,31 @@ fn verify(r: RunResult) -> (usize, usize) {
     if let Err(v) = check_reopened(&again, &again.db) {
         report(&again, &v);
     }
-    (again.history.len(), committed)
+    (again.history.len(), committed, refused)
 }
 
 fn sweep(mode: &str, seeds: std::ops::RangeInclusive<u64>, txns_per_worker: usize) {
     let mut txns = 0;
     let mut committed = 0;
+    let mut refused = 0;
     for seed in seeds.clone() {
         let cfg = config(seed, txns_per_worker);
         let r = match mode {
             "threaded" => run_threaded(cfg),
             _ => run_scheduled(cfg),
         };
-        let (t, c) = verify(r);
+        let (t, c, f) = verify(r);
         txns += t;
         committed += c;
+        refused += f;
     }
-    eprintln!("{mode}: {} seeds, {txns} txns, {committed} committed, no violations", seeds.count());
+    // Four workers on twenty keys overlap constantly; a sweep that saw no
+    // refusal at all would mean first-committer-wins never ran.
+    assert!(refused > 0, "{mode}: no transaction was ever refused across {} seeds", seeds.clone().count());
+    eprintln!(
+        "{mode}: {} seeds, {txns} txns, {committed} committed, {refused} refused, no violations",
+        seeds.count()
+    );
 }
 
 // ---------------------------------------------------------------------------
