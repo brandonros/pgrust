@@ -485,7 +485,11 @@ pub fn GetNewObjectId() -> PgResult<Oid> {
             // LIST against the object store, and every other allocator in the
             // cluster would otherwise wait on that latency. Allocation itself
             // stays atomic -- the block is installed back under the lock.
-            let want = tv.nextOid.load(Relaxed);
+            // Never below FirstNormalObjectId: below it the oids initdb and
+            // genbki assigned are in use, and a claim that started there
+            // would be clamped locally while the bucket's boundary stayed
+            // low, so the next claim could hand out part of the same range.
+            let want = tv.nextOid.load(Relaxed).max(FirstNormalObjectId);
             LWLockRelease(OidGenLock())?;
             let claimed = tableam_seams::objkv_claim_oid_block::call(want, VAR_OID_PREFETCH);
             LWLockAcquire(OidGenLock(), LW_EXCLUSIVE, globals::MyProcNumber())?;
@@ -497,12 +501,9 @@ pub fn GetNewObjectId() -> PgResult<Oid> {
                 }
             };
             if tv.oidCount.load(Relaxed) == 0 {
-                // The floor at the top of this function ran before the bucket
-                // was asked, so it cannot have corrected this value. Allocation
-                // wraps (`wrapping_add` below), so a long-lived cluster's
-                // marker passes u32::MAX and the bucket hands back a small
-                // start; below FirstNormalObjectId it collides with the oids
-                // initdb and genbki already assigned.
+                // `want` was already at or above FirstNormalObjectId and the
+                // bucket never answers below what it was asked, so this is
+                // the claimed range exactly; the `max` only restates it.
                 tv.nextOid.store(start.max(FirstNormalObjectId), Relaxed);
                 tv.oidCount.store(VAR_OID_PREFETCH, Relaxed);
             }

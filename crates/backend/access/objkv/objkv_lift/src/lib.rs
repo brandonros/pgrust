@@ -1012,7 +1012,7 @@ fn local_sums_subset(
 }
 
 fn crc(bytes: &[u8]) -> u32 {
-    ::crc32c::pg_comp_crc32c(0xffff_ffff, bytes) ^ 0xffff_ffff
+    ::crc32c::fin_crc32c(::crc32c::pg_comp_crc32c(::crc32c::CRC32C_INIT, bytes))
 }
 
 fn local_sums(mcx: Mcx<'_>, t: &Target, rw: &Rewrite) -> PgResult<Vec<u32>> {
