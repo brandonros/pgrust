@@ -102,6 +102,9 @@ pub fn proc_exit(code: i32, my_pid: i32) -> ! {
         EXIT_CALLBACKS_DEFERRED.with(|c| c.set(true));
     } else {
         drain_exit_callbacks(code);
+        // The process itself is leaving (postmaster thread, or a standalone
+        // backend): run the process-wide hooks after this thread's own.
+        drain_process_exit_callbacks(code);
     }
 
     std::panic::resume_unwind(Box::new(ProcExitThread { code }));
@@ -281,6 +284,29 @@ fn out_of_slots(which: &str) -> ! {
     unreachable!("ereport(FATAL) returned");
 }
 
+/// Process-wide exit hooks, as opposed to the thread-local `on_proc_exit`
+/// lists: registered from any thread, drained once by `proc_exit` on the
+/// thread whose exit ends the process. Last registered runs first, as in C.
+static ON_PROCESS_EXIT_LIST: pgsync::Mutex<Vec<OnExit>> = pgsync::Mutex::new(Vec::new());
+
+pub fn on_process_exit(function: OnExitCallback, arg: usize) {
+    let mut l = ON_PROCESS_EXIT_LIST.lock().unwrap_or_else(|e| e.into_inner());
+    if l.len() >= MAX_ON_EXITS {
+        out_of_slots("on_process_exit");
+    }
+    l.push(OnExit { function, arg });
+}
+
+fn drain_process_exit_callbacks(code: i32) {
+    loop {
+        let next = ON_PROCESS_EXIT_LIST.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        match next {
+            Some(cb) => (cb.function)(code, cb.arg),
+            None => return,
+        }
+    }
+}
+
 pub fn on_proc_exit(function: OnExitCallback, arg: usize) {
     let i = ON_PROC_EXIT_INDEX.with(Cell::get);
     if i >= MAX_ON_EXITS {
@@ -433,6 +459,7 @@ pub fn init_seams() {
     ipc_seams::before_shmem_exit::set(before_shmem_exit);
     ipc_seams::on_shmem_exit::set(on_shmem_exit);
     ipc_seams::on_proc_exit::set(on_proc_exit);
+    ipc_seams::on_process_exit::set(on_process_exit);
     ipc_seams::check_on_shmem_exit_lists_are_empty::set(check_on_shmem_exit_lists_are_empty);
     ipc_portal_seams::shmem_exit_inprogress::set(shmem_exit_inprogress);
 }

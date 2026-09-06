@@ -8219,6 +8219,7 @@ dependencies = [
  "ipc_seams",
  "lwlock",
  "pgstat_seams",
+ "pgsync",
  "types_error",
 ]
 
@@ -17147,6 +17148,7 @@ dependencies = [
  "procarray",
  "resowner_seams",
  "s_lock_seams",
+ "seam_core",
  "shmem_seams",
  "snapmgr_portal_seams",
  "snapmgr_seams",
@@ -18214,9 +18216,11 @@ dependencies = [
 name = "tableam"
 version = "0.1.0"
 dependencies = [
+ "arrayfuncs",
  "bufmgr_seams",
  "catalog_storage",
  "datum",
+ "detoast_seams",
  "elog_seams",
  "exectuples",
  "format_type",
@@ -18225,13 +18229,20 @@ dependencies = [
  "heapam",
  "heapam_handler",
  "heapam_visibility_seams",
+ "heaptuple",
  "init_small",
+ "ipc_seams",
+ "lsyscache",
  "mcx",
  "multixact",
+ "objkv",
  "pgrcolumnar",
  "procarray",
+ "relation_seams",
+ "relcache_seams",
  "smgr",
  "snapmgr",
+ "table",
  "tableam_seams",
  "tableam_vocab",
  "tidbitmap",
@@ -18244,6 +18255,7 @@ dependencies = [
  "types_snapshot",
  "types_storage",
  "types_tuple",
+ "varlena",
  "xact",
  "xact_seams",
 ]
@@ -18252,12 +18264,14 @@ dependencies = [
 name = "tableam_seams"
 version = "0.0.0"
 dependencies = [
+ "datum",
  "mcx",
  "seam_core",
  "tableam_vocab",
  "types_core",
  "types_error",
  "types_rel",
+ "types_slot",
  "types_snapshot",
  "types_storage",
  "types_tuple",

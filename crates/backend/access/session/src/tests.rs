@@ -809,7 +809,23 @@ fn tls_source_census_and_session_surface_are_pinned() {
     // NOTE for whoever merges this to main: the same one declaration lands on a
     // DIFFERENT absolute total there (562 -> 563 at t56). Re-derive the pin at
     // the tip it will be enforced against; do not carry this number across.
-    assert_eq!(count_tree(crates), 544, "TLS census changed; classify the delta in SESSION_ENVELOPE_MANIFEST or document it as non-session TLS");
+    // objkv table AM (+7), all deliberately NON-SESSION TLS, none a
+    // SESSION_ENVELOPE_MANIFEST member:
+    //   access/table/tableam/src/objkv_am.rs — five blocks: the transaction's
+    //   staged writes, its registration and commit number (PENDING,
+    //   XACT_REGISTERED, MY_COMMIT_SEQ); the command id the last snapshot was
+    //   taken at (LAST_SNAPSHOT_CID); the staged-write ordinal a TRUNCATE
+    //   compares against (STAGE_ORD); the relations this transaction has
+    //   emptied (EMPTIED); and a #[cfg(test)] counter (TEST_CID). All
+    //   transaction-scoped: cleared by the xact callback on every commit and
+    //   abort, so they never carry state across a transaction boundary.
+    //   access/table/tableam_vocab/src/lib.rs — two blocks: the pg_am oids
+    //   that name the objkv table and index access methods (OBJKV_AMS,
+    //   OBJKV_INDEX_AMS), the same per-thread registry pgrcolumnar keeps
+    //   beside them, filled at relcache build.
+    // The tree stood at 545 before objkv (the 544 pin lagged it by one; see
+    // the NOTE above about re-deriving at the tip).
+    assert_eq!(count_tree(crates), 552, "TLS census changed; classify the delta in SESSION_ENVELOPE_MANIFEST or document it as non-session TLS");
     let session_sources = [
         ("backend/access/session/src/lib.rs", 1),
         ("backend/utils/init/init_small/src/globals.rs", 4),

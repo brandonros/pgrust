@@ -9,6 +9,7 @@ name = "ipc"
 path = "src/lib.rs"
 
 [dependencies]
+pgsync = { path = "../../../../_support/pgsync" }
 datum = { path = "../../../../_support/types/datum" }
 types_error = { path = "../../../../_support/types/types_error" }
 elog = { path = "../../../utils/error/elog" }
