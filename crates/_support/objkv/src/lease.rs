@@ -532,6 +532,9 @@ impl Lease {
         let handle = self.inner.heartbeat.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(h) = handle {
             if thread::current().id() != h.thread().id() {
+                // The thread parks between slices; the stop flag is already
+                // set, so waking it is all a prompt exit needs.
+                h.thread().unpark();
                 let _ = h.join();
             }
         }
@@ -548,14 +551,17 @@ impl Lease {
         const SLICE_MS: u64 = 250;
         // Renewals are due on a schedule, not an interval: one that took
         // long (a store retrying to its timeouts) is followed by the next as
-        // soon as it is due, not HEARTBEAT_MS later.
+        // soon as it is due, not HEARTBEAT_MS later. Between slices the
+        // thread parks, so a stop (which unparks it) is seen at once rather
+        // than at the end of a slice: a release, and every `Db` drop, waits
+        // for this thread.
         let mut due = self.inner.clock.now_ms() + HEARTBEAT_MS;
         loop {
             while self.inner.clock.now_ms() < due {
                 if self.inner.stop.load(Ordering::Acquire) {
                     return;
                 }
-                thread::sleep(std::time::Duration::from_millis(SLICE_MS));
+                thread::park_timeout(std::time::Duration::from_millis(SLICE_MS));
             }
             if self.inner.released.load(Ordering::Acquire) {
                 return;
