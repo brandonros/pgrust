@@ -2949,11 +2949,15 @@ dependencies = [
 name = "catalog_indexing"
 version = "0.1.0"
 dependencies = [
+ "catalog",
  "execindexing",
  "exectuples",
  "heapam",
  "heaptuple",
+ "inval",
  "mcx",
+ "objkv_marker",
+ "tableam_seams",
  "tableam_vocab",
  "types_error",
  "types_rel",
@@ -4890,6 +4894,7 @@ dependencies = [
  "standby",
  "superuser",
  "table",
+ "tableam",
  "transam_xlog",
  "types_core",
  "types_error",
@@ -6578,6 +6583,7 @@ dependencies = [
  "heaptuple",
  "indexam",
  "init_small",
+ "inval",
  "lsyscache",
  "mcx",
  "miscinit",
@@ -6588,6 +6594,7 @@ dependencies = [
  "snapmgr_seams",
  "syscache_seams",
  "tableam",
+ "tableam_vocab",
  "transam_seams",
  "transam_xlog_seams",
  "types_core",
@@ -10788,6 +10795,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "objkv_lift"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "datum",
+ "execindexing",
+ "exectuples",
+ "genam",
+ "heaptoast_seams",
+ "heaptuple",
+ "indexam",
+ "init_small",
+ "mcx",
+ "objkv",
+ "objkv_marker",
+ "procarray",
+ "relcache",
+ "superuser_seams",
+ "table",
+ "tableam",
+ "types_core",
+ "types_error",
+ "types_fmgr",
+ "types_rel",
+ "types_slot",
+ "types_storage",
+ "types_tuple",
+ "varlena",
+ "varsup",
+]
+
+[[package]]
+name = "objkv_marker"
+version = "0.1.0"
+dependencies = [
+ "init_small",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14018,6 +14064,7 @@ dependencies = [
  "miscinit",
  "miscinit_seams",
  "namespace_seams",
+ "objkv_marker",
  "parallel_seams",
  "pg_database_seams",
  "pg_db_role_setting_seams",
@@ -14041,12 +14088,15 @@ dependencies = [
  "superuser_seams",
  "sync_seams",
  "table",
+ "tableam",
+ "tableam_vocab",
  "timeout_seams",
  "timestamp_seams",
  "transam_xlog_seams",
  "types_core",
  "types_error",
  "types_guc",
+ "types_relscan",
  "types_resowner",
  "types_storage",
  "walsender_seams",
@@ -15093,6 +15143,7 @@ dependencies = [
  "miscinit_seams",
  "namespace_seams",
  "nodes_core",
+ "objkv_marker",
  "parallel_seams",
  "readfuncs",
  "relcache_build_seams",
@@ -16290,6 +16341,7 @@ dependencies = [
  "nodetidscan",
  "nodeunique",
  "nodewindowagg",
+ "objkv_lift",
  "opclasscmds",
  "operatorcmds",
  "orderedsetaggs",
@@ -17076,12 +17128,14 @@ dependencies = [
  "libc",
  "mcx",
  "md",
+ "objkv_marker",
  "pgstat",
  "pgstat_seams",
  "relmapper_seams",
  "relpath_seams",
  "smgr_seams",
  "sync_seams",
+ "tableam_vocab",
  "tablespace_seams",
  "types_core",
  "types_error",
@@ -20384,6 +20438,7 @@ dependencies = [
  "mcx",
  "miscinit",
  "miscinit_seams",
+ "objkv_marker",
  "pg_sema_seams",
  "pgstat_seams",
  "pmsignal",
@@ -20395,6 +20450,7 @@ dependencies = [
  "sync_seams",
  "syncrep_seams",
  "syscache_seams",
+ "tableam_seams",
  "timeout_seams",
  "transam_xlog_seams",
  "types_core",

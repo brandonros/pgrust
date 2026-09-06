@@ -889,3 +889,7 @@ once	crates/backend/access/table/tableam/src/objkv_am.rs	3	DST-REVIEW(objkv): th
 rawsync	crates/backend/access/table/tableam/src/objkv_am.rs	1	DST-REVIEW(objkv): the storage lock; every S3 round trip is made outside it
 spawn	crates/backend/access/table/tableam/src/objkv_am.rs	2	DST-REVIEW(objkv): the writer threads and the compactor thread, daemons started on first use of the bucket
 env	crates/backend/access/table/tableam/src/objkv_index.rs	1	DST-REVIEW(objkv): PGRUST_OBJKV_TRACE, the scan trace the end-to-end scripts assert on
+fs	crates/_support/objkv_marker/src/lib.rs	1	DST-REVIEW(objkv): the one-line marker in the data directory that says the catalogs live in the bucket, read before the Vfs exists
+fs	crates/backend/access/objkv/objkv_lift/src/lib.rs	4	DST-REVIEW(objkv): writing and fsyncing that marker at the end of the lift (write, sync, rename, dir sync)
+once	crates/_support/objkv_marker/src/lib.rs	1	DST-REVIEW(objkv): the marker's read-once latch — P3 row-19 pure env-read init closure
+rawsync	crates/_support/objkv_marker/src/lib.rs	1	DST-REVIEW(objkv): the marker's read-once latch is a std::sync::OnceLock (the crate has no mutex); same cell as the `once` row above
