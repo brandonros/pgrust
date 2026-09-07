@@ -141,13 +141,12 @@ pub(crate) fn eligibility(
     }
     Ok((info, history))
 }
-fn check_manifest(info: &Value, target: &Path) -> Result<()> {
-    let manifest = crate::verify::inspect(target)?;
+fn check_manifest(info: &Value, manifest: &Value) -> Result<()> {
     let ranges = manifest["WAL-Ranges"]
         .as_array()
         .ok_or("invalid backup ranges")?;
     if ranges.len() != 1
-        || num(&manifest, "System-Identifier")?.to_string() != text(info, "cluster")?
+        || num(manifest, "System-Identifier")?.to_string() != text(info, "cluster")?
         || num(&ranges[0], "Timeline")? != num(info, "timeline")?
         || crate::lsn(text(&ranges[0], "Start-LSN")?)? != num(info, "start")?
         || crate::lsn(text(&ranges[0], "End-LSN")?)? != num(info, "end")?
@@ -162,8 +161,14 @@ fn restore_backup(store: &Store, info: &Value, stage: &Path) -> Result<PathBuf> 
         return Err("snapshot manifest mismatch".into());
     }
     let target = stage.join("snapshot");
+    // The inventory is content-addressed and restore verifies each object's
+    // bytes before writing. Validate native identity/ranges without rereading
+    // and hashing every materialized file a second time.
+    check_manifest(info, &serde_json::from_slice(&image.manifest())?)?;
     image.restore(store, &target)?;
-    check_manifest(info, &target)?;
+    if fs::read_to_string(target.join("backup_label"))?.contains("INCREMENTAL FROM ") {
+        return Err("flat snapshot contains an incremental backup label".into());
+    }
     Ok(target)
 }
 pub struct Restored {

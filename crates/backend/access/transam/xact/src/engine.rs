@@ -175,7 +175,6 @@ fn RecordTransactionCommitGuts(xp: XsPtr, mcx: mcx::Mcx<'_>) -> PgResult<Transac
 
     latest_xid = transam_seams::transaction_id_latest::call(xid, &children);
 
-    // C SyncRepWaitForLSN no-ops without sync standbys; syncrep unported.
     if wrote_xlog && mark_xid_committed && syncrep_seams::sync_rep_wait_for_lsn::is_installed() {
         syncrep_seams::sync_rep_wait_for_lsn::call(xlog_seams::xact_last_rec_end::call(), true)?;
     }

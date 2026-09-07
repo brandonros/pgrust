@@ -8,7 +8,6 @@ mod decode;
 mod http;
 mod image;
 mod renewal;
-mod verify;
 use archive::num;
 use pgsync::Mutex;
 use std::fs::{self, File, OpenOptions};

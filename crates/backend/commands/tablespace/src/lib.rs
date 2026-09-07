@@ -160,11 +160,12 @@ pub fn CreateTableSpace<'mcx>(mcx: Mcx<'mcx>, stmt: &CreateTableSpaceStmt<'mcx>)
 
     let location = pg_path::canonicalize_path(stmt.location.unwrap_or(""));
 
-    // Native S3 recovery materializes only PGDATA, not external tablespaces.
-    if !location.is_empty() && guc_tables::backing::pgrust_s3() {
+    // Native S3 snapshots do not support additional tablespace archives,
+    // including the developer-only in-place tablespaces inside PGDATA.
+    if guc_tables::backing::pgrust_s3() {
         return Err(ereport(ERROR)
             .errcode(types_error::ERRCODE_FEATURE_NOT_SUPPORTED)
-            .errmsg("external tablespaces are not supported by native S3 recovery".to_string())
+            .errmsg("tablespaces are not supported by native S3 recovery".to_string())
             .into_error()
             .into());
     }

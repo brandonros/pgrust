@@ -228,13 +228,15 @@ fn patch(
     for b in 0..length {
         if changed.peek().is_some_and(|(block, _)| *block == b) {
             result.push(changed.next().unwrap().1);
-        } else if b < truncation {
-            let p = previous
-                .get(b)
-                .filter(|p| p.length == PAGE)
-                .ok_or("missing predecessor page")?;
+        } else if b < truncation && b < previous.len() {
+            let p = &previous[b];
+            if p.length != PAGE {
+                return Err("partial predecessor page".into());
+            }
             result.push(p.clone());
         } else {
+            // Extension can add zero pages without WAL, even below truncation.
+            // Match native pg_combinebackup when the prior file ends sooner.
             result.push(zero()?);
         }
     }
@@ -392,7 +394,6 @@ mod tests {
             patch(&previous, &increment(1, &[]), vec![], || panic!()).unwrap(),
             vec![piece(1)]
         );
-        assert!(patch(&previous[..1], &increment(2, &[]), vec![], || panic!()).is_err());
         assert!(
             patch(
                 &previous,
@@ -403,6 +404,24 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn extension_below_truncation_zeroes_pages_absent_from_predecessor() {
+        // Native relation extension can add zero pages without a WAL record.
+        // pg_combinebackup fills these even below the truncation boundary.
+        let previous = vec![piece(1)];
+        assert_eq!(
+            patch(&previous, &increment(3, &[]), vec![], || Ok(piece(0))).unwrap(),
+            vec![piece(1), piece(0), piece(0)]
+        );
+        assert_eq!(
+            patch(&previous, &increment(4, &[2]), vec![piece(2)], || Ok(piece(0))).unwrap(),
+            vec![piece(1), piece(0), piece(2), piece(0)]
+        );
+        let mut partial = piece(1);
+        partial.length = 1;
+        assert!(patch(&[partial], &increment(1, &[]), vec![], || Ok(piece(0))).is_err());
+    }
+
     #[test]
     fn extension_zeroes_holes_without_resurrecting_truncated_pages() {
         let p = vec![piece(1), piece(2), piece(3)];

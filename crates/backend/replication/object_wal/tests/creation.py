@@ -443,12 +443,23 @@ def main():
                 # Let retirement's native checkpoint finish before arming the next fault.
                 time.sleep(2)
         generations = []
+        extended_relation = None
         if args.renewals:
             sql(sock, "CREATE TABLE renewal_data(id int PRIMARY KEY, n int, pad text); INSERT INTO renewal_data SELECT i,0,repeat(md5(i::text),32) FROM generate_series(1,2000) i")
+            sql(sock, 'CREATE TABLE extension_probe(id int); INSERT INTO extension_probe VALUES(1)')
             for cycle in range(args.renewals):
                 previous = json.loads(head())
                 generation = previous.get('generation', 0)
                 before_upload = proxy.backup_bytes
+                if cycle == 1:
+                    # Model native zero-filled relation extension: it can grow a
+                    # file without adding modified blocks to a WAL summary.
+                    name = sql(sock, "SELECT pg_relation_filepath('extension_probe')")
+                    relation = data / name
+                    length = relation.stat().st_size
+                    with relation.open('ab') as output:
+                        output.write(bytes(16 * 8192))
+                    extended_relation = (name, length)
                 if cycle == 0:
                     proxy.pause_snapshot.set()
                     proxy.drop_renewal.set()
@@ -456,6 +467,10 @@ def main():
                 sql(sock, f'CREATE TABLE IF NOT EXISTS renewal_churn(id int); TRUNCATE renewal_churn; INSERT INTO renewal_churn VALUES ({cycle}); CREATE TABLE dropped_during_renewal(id int); DROP TABLE dropped_during_renewal')
                 for _ in range(5):
                     sql(sock, f'UPDATE renewal_data SET n={cycle+1} WHERE id<=10; SELECT pg_switch_wal()')
+                    # Once paused, exercise the concurrent commit immediately;
+                    # extra segment switches only consume the fault deadline.
+                    if cycle == 0 and proxy.snapshot_pending.is_set():
+                        break
                 if cycle == 0:
                     assert proxy.snapshot_pending.wait(30), 'renewal upload never started'
                     # This commit must complete while snapshot upload is paused.
@@ -492,8 +507,7 @@ def main():
                         break
                     assert time.monotonic() < deadline, 'obsolete WAL was not deleted'
                     time.sleep(.2)
-                inventory = json.loads(run(['aws', '--endpoint-url', args.endpoint, 's3api', 'list-objects-v2', '--bucket', args.bucket, '--prefix', prefix]))
-                stored = sum(o['Size'] for o in inventory.get('Contents', []))
+                stored = sum(inventory().values())
                 assert stored < 512 * 1024 * 1024, 'bucket storage grew beyond the bounded workload budget'
                 uploaded = proxy.backup_bytes - before_upload
                 assert uploaded < 10 * 1024 * 1024, 'renewal recopied the full database'
@@ -546,6 +560,21 @@ def main():
         if args.renewals:
             assert sql(restored_sock, 'SELECT sum(n) FROM renewal_data') == str(args.renewals * 10)
             assert sql(restored_sock, 'SELECT count(*) FROM renewal_data') == '2000'
+            if extended_relation:
+                name, length = extended_relation
+                content = (restored_data / name).read_bytes()
+                assert content[length:] == bytes(16 * 8192), 'snapshot lost zero-filled extension'
+                assert sql(restored_sock, 'SELECT id FROM extension_probe') == '1'
+            assert sql(restored_sock, "SELECT count(*) FROM pg_indexes WHERE tablename='renewal_data' AND indexname='renewal_data_pkey'") == '1'
+            plan = sql(restored_sock, 'SET enable_seqscan=off; EXPLAIN SELECT n FROM renewal_data WHERE id=1')
+            assert 'Index Scan' in plan or 'Bitmap' in plan, plan
+            assert sql(restored_sock, 'SET enable_seqscan=off; SELECT n FROM renewal_data WHERE id=1').splitlines()[-1] == str(args.renewals)
+            try:
+                sql(restored_sock, 'INSERT INTO renewal_data(id) VALUES(1)')
+            except subprocess.CalledProcessError as error:
+                assert 'duplicate key' in error.stderr, error.stderr
+            else:
+                raise AssertionError('restored primary key was not enforced')
             assert sql(restored_sock, 'SELECT id FROM renewal_churn') == str(args.renewals-1)
             assert sql(restored_sock, "SELECT to_regclass('dropped_during_renewal') IS NULL") == 't'
         sql(restored_sock, 'INSERT INTO created_here VALUES (44)')

@@ -157,6 +157,11 @@ def main():
         full = root / 'full'
         inc = root / 'increment'
         run([pg / 'pg_basebackup', '-h', sock, '-p', '55439', '-U', 'postgres', '-D', full, '-X', 'none', '--checkpoint=fast'])
+        # A zero-filled extension need not appear in a WAL summary. The stock
+        # combiner independently checks how those absent predecessor pages work.
+        relation = source / source_sql("SELECT pg_relation_filepath('sparse')")
+        with relation.open('ab') as output:
+            output.write(bytes(16 * 8192))
         source_sql("UPDATE sparse SET body='changed' WHERE id=10; INSERT INTO native_s3_ledger VALUES (2,'increment');")
         run([pg / 'pg_basebackup', '-h', sock, '-p', '55439', '-U', 'postgres', '-D', inc, '-X', 'none', '--checkpoint=fast', '--incremental', full / 'backup_manifest'])
         second = root / 'increment-two'
@@ -253,7 +258,7 @@ def main():
         assert head() == before and (not list(root.glob('.data-corrupt.restore-*')))
         proxy.corrupt.clear()
         for n in [1, 2]:
-            (p, data, socket) = start_native(n)
+            (p, data, socket) = start_native(n, extra={'allow_in_place_tablespaces': 'on'})
             deadline = time.monotonic() + 120
             while True:
                 if p.poll() is not None:
@@ -265,14 +270,18 @@ def main():
                     if time.monotonic() > deadline:
                         raise RuntimeError('native startup timed out')
                     time.sleep(0.1)
-            assert got == ('1,2,3' if n == 1 else '1,2,3,5,7'), got
+            assert got == ('1,2,3' if n == 1 else '1,2,3,5,7,8'), got
             assert sql(socket, 55440, "SELECT md5(string_agg(id::text || body,'' ORDER BY id)) FROM sparse") == expected
             if n == 1:
                 external = root / 'external-tablespace'
                 external.mkdir()
                 for query, message in [
-                    (f"CREATE TABLESPACE outside LOCATION '{external}'", 'external tablespaces'),
+                    (f"CREATE TABLESPACE outside LOCATION '{external}'", 'tablespaces are not supported'),
+                    ("CREATE TABLESPACE inside LOCATION ''", 'tablespaces are not supported'),
                     ('SET synchronous_commit=off', 'cannot be changed'),
+                    ('SET fsync=off', 'cannot be changed'),
+                    ('SET restart_after_crash=on', 'cannot be changed'),
+                    ("SET synchronous_standby_names='replacement'", 'cannot be changed'),
                 ]:
                     try:
                         sql(socket, 55440, query)
@@ -300,6 +309,33 @@ def main():
                 (out, err) = client.communicate(timeout=20)
                 assert client.returncode == 0, (out, err)
                 assert head() != before
+                sql(socket, 55440, 'CREATE SEQUENCE cached_sequence CACHE 10')
+                for app, query, terminate in [
+                    ('cached_sequence_wait', "BEGIN; SELECT nextval('cached_sequence'); ROLLBACK; SELECT nextval('cached_sequence')", False),
+                    ('terminated_s3_wait', "INSERT INTO native_s3_ledger VALUES (8,'terminated while waiting')", True),
+                ]:
+                    proxy.pending.clear()
+                    proxy.release.clear()
+                    proxy.block.set()
+                    client = subprocess.Popen([str(pg/'psql'), '-XAt', '-h', str(socket), '-p', '55440', '-U', 'postgres', '-d', 'postgres', '-c', query], env=dict(env, PGAPPNAME=app), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    processes.append(client)
+                    assert proxy.pending.wait(5), 'publisher did not reach blocked PUT'
+                    deadline = time.monotonic() + 2
+                    while sql(socket, 55440, f"SELECT count(*) FROM pg_stat_activity WHERE application_name='{app}' AND wait_event='SyncRep'") != '1':
+                        assert client.poll() is None, 'strict dependency completed before publication'
+                        assert time.monotonic() < deadline, 'strict dependency never waited'
+                        time.sleep(.05)
+                    if terminate:
+                        assert sql(socket, 55440, f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='{app}'") == 't'
+                        time.sleep(.2)
+                        assert client.poll() is None, 'termination bypassed strict completion'
+                    proxy.release.set()
+                    out, err = client.communicate(timeout=20)
+                    if terminate:
+                        assert client.returncode != 0, (out, err)
+                        assert sql(socket, 55440, 'SELECT count(*) FROM native_s3_ledger WHERE id=8') == '1'
+                    else:
+                        assert client.returncode == 0 and out.splitlines()[-1] == '2', (out, err)
                 # Renew an independently encoded snapshot during native writes.
                 for _ in range(5):
                     sql(socket, 55440, 'UPDATE sparse SET body=body WHERE id=1; SELECT pg_switch_wal()')
@@ -310,6 +346,7 @@ def main():
                     time.sleep(.2)
             assert not list(data.glob('pg_wal/' + '?' * 24)), 'memory mode created WAL segment files'
             if n == 2:
+                assert int(sql(socket, 55440, "SELECT nextval('cached_sequence')")) > 2, 'recovery reused an acknowledged sequence value'
                 # Mutate only this fixture's prefix to simulate ownership loss.
                 value = json.loads(head())
                 value['epoch'] = uuid.uuid4().hex
@@ -363,7 +400,7 @@ def main():
                 p.send_signal(signal.SIGINT)
                 assert p.wait(timeout=30) == 0
         shutil.rmtree(plain)
-        print(json.dumps({'result': 'passed', 'prefix': prefix, 'source_removed': True, 'native_full_plus_two_increments': True, 'stock_combine_and_verify': True, 'increment_source_reads': reads, 'independent_snapshot_renewed': True, 'recovery_cycles': 2, 'native_commits': [5, 7, 6], 'lost_head_responses': proxy.dropped, 'ordinary_disk_restart': True, 'ordinary_disk_crash_recovery': True, 'ordinary_syncrep_cancel': True, 'corrupt_restore_rejected': True, 'cancel_wait_checked': True, 'ownership_loss_stopped_server': True, 'fingerprint': expected}), flush=True)
+        print(json.dumps({'result': 'passed', 'prefix': prefix, 'source_removed': True, 'native_full_plus_two_increments': True, 'stock_combine_and_verify': True, 'increment_source_reads': reads, 'independent_snapshot_renewed': True, 'recovery_cycles': 2, 'native_commits': [5, 7, 6], 'lost_head_responses': proxy.dropped, 'ordinary_disk_restart': True, 'ordinary_disk_crash_recovery': True, 'ordinary_syncrep_cancel': True, 'corrupt_restore_rejected': True, 'cancel_wait_checked': True, 'cached_sequence_wait_checked': True, 'termination_wait_checked': True, 'ownership_loss_stopped_server': True, 'fingerprint': expected}), flush=True)
     finally:
         proxy.release.set()
         proxy.shutdown()

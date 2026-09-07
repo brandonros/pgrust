@@ -875,9 +875,8 @@ fs	crates/backend/commands/copy/src/memheadroom.rs	2	DST-REVIEW(night/copyfast):
 
 # Native S3 is explicitly refused by object_wal::prepare under pgrust_sim.
 env	crates/backend/replication/object_wal/src/http.rs	3	DST-REVIEW(native-object-wal): startup-only explicit AWS credentials for the native HTTP client; not GUC-visible and never logged; no credential-helper subprocesses.
-fs	crates/backend/replication/object_wal/src/archive.rs	2	DST-REVIEW(native-object-wal): write verified native timeline history into the exclusively owned cold-restore directory before backend admission. Simulated S3 storage is explicitly rejected.
+fs	crates/backend/replication/object_wal/src/archive.rs	3	DST-REVIEW(native-object-wal): write verified native timeline history into the exclusively owned cold-restore directory before backend admission. Simulated S3 storage is explicitly rejected.
 fs	crates/backend/replication/object_wal/src/lib.rs	13	DST-REVIEW(native-object-wal): native-only cold restore into an exclusively owned new directory; archive extraction/reconstruction and launch locking precede backend admission. Uses ordinary file APIs; simulated storage support is explicitly rejected, not claimed.
-fs	crates/backend/replication/object_wal/src/verify.rs	10	DST-REVIEW(native-object-wal): inspect paths, native metadata and checksums in the exclusively owned materialized snapshot before recovery claims ownership. Simulated S3 storage is explicitly rejected.
 
 fs	crates/backend/replication/object_wal/src/create.rs	5	DST-REVIEW(native-object-create): startup-only read and validation of the clean initial PGDATA under the native postmaster directory lock; S3 mode explicitly rejects simulated I/O. WAL removal uses fd after the non-restartable marker is durable.
 
