@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/backend/replication/object_wal",
     "crates/backend/replication/origin",
     "crates/backend/replication/slotsync",
     "crates/backend/replication/logical/proto",

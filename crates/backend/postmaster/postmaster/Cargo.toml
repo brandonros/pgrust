@@ -9,6 +9,7 @@ name = "postmaster"
 path = "src/lib.rs"
 
 [dependencies]
+object_wal = { path = "../../replication/object_wal" }
 aio_core = { path = "../../storage/aio/aio_core" }
 pg_clock = { path = "../../../port/pg_clock" }
 seam_core = { path = "../../../_support/seam_core" }

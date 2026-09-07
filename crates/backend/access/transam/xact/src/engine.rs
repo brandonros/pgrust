@@ -68,6 +68,10 @@ fn RecordTransactionCommitGuts(xp: XsPtr, mcx: mcx::Mcx<'_>) -> PgResult<Transac
         (mcx::PgVec::new_in(mcx), false)
     };
     let mut wrote_xlog = xlog_seams::xact_last_rec_end::call() != 0;
+    // Strict sequence/cache dependencies assign an xid even without new WAL.
+    // Their commit record orders earlier allocation WAL before confirmation.
+    // Ordinary mode keeps PostgreSQL's optimization for xid-only transactions.
+    wrote_xlog |= mark_xid_committed && guc_tables::backing::pgrust_strict_synchronous_commit();
 
     if !mark_xid_committed {
         if !rels.is_empty() || !dropped_stats.is_empty() {

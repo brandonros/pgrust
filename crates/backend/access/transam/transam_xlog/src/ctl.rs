@@ -81,6 +81,8 @@ pub struct XLogCtlData {
     pub ckptFullXid: AtomicU64,
     pub asyncXactLSN: AtomicU64,
     pub replicationSlotMinLSN: AtomicU64,
+    // Start of WAL generation in this server run; no on-disk format change.
+    pub strictWalStartLSN: AtomicU64,
     pub lastCheckPointRecPtr: AtomicU64,
     pub lastCheckPointEndPtr: AtomicU64,
     pub lastCheckPoint: UnsafeCell<CheckPoint>,
@@ -222,6 +224,7 @@ pub fn XLOGShmemInit() {
         ckptFullXid: AtomicU64::new(0),
         asyncXactLSN: AtomicU64::new(InvalidXLogRecPtr),
         replicationSlotMinLSN: AtomicU64::new(InvalidXLogRecPtr),
+        strictWalStartLSN: AtomicU64::new(InvalidXLogRecPtr),
         lastCheckPointRecPtr: AtomicU64::new(InvalidXLogRecPtr),
         lastCheckPointEndPtr: AtomicU64::new(InvalidXLogRecPtr),
         lastCheckPoint: UnsafeCell::new(CheckPoint::ZEROED),
@@ -286,6 +289,7 @@ pub fn XLOGShmemResetAfterCrash() {
     ctl.ckptFullXid.store(0, Ordering::Relaxed);
     ctl.asyncXactLSN.store(InvalidXLogRecPtr, Ordering::Relaxed);
     ctl.replicationSlotMinLSN.store(InvalidXLogRecPtr, Ordering::Relaxed);
+    ctl.strictWalStartLSN.store(InvalidXLogRecPtr, Ordering::Relaxed);
     ctl.lastCheckPointRecPtr.store(InvalidXLogRecPtr, Ordering::Relaxed);
     ctl.lastCheckPointEndPtr.store(InvalidXLogRecPtr, Ordering::Relaxed);
     // SAFETY: exclusive access as above (C protocol: info_lck).

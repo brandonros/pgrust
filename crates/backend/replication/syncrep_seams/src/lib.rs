@@ -3,6 +3,11 @@ seam_core::seam!(
 );
 
 seam_core::seam!(
+    // Monotonic flush frontier for the configured synchronous standby policy.
+    pub fn sync_rep_confirmed_flush_lsn() -> types_core::XLogRecPtr
+);
+
+seam_core::seam!(
     pub fn sync_rep_wait_for_lsn(lsn: types_core::XLogRecPtr, commit: bool) -> types_error::PgResult<()>
 );
 
@@ -32,3 +37,7 @@ seam_core::seam!(
     // SyncRepConfig->syncrep_method == SYNC_REP_PRIORITY (pg_stat sync_state).
     pub fn sync_rep_method_is_priority() -> bool
 );
+
+seam_core::seam!(pub fn confirm_object_flush(lsn: types_core::XLogRecPtr) -> types_error::PgResult<()>);
+
+seam_core::seam!(pub fn wake_object_publisher());

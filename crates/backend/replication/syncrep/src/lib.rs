@@ -222,15 +222,41 @@ fn queue_is_ordered_by_lsn(mode: i32) -> bool {
 
 /// SyncRepWaitForLSN(lsn, commit) (syncrep.c:148).
 pub fn SyncRepWaitForLSN(lsn: XLogRecPtr, commit: bool) -> PgResult<()> {
+    let strict = guc_tables::backing::pgrust_strict_synchronous_commit();
+    let result = wait_for_lsn(lsn, commit, strict);
+    if strict {
+        if let Err(err) = result {
+            // Local commit/prepare may already be irrevocable. Never hand a
+            // recoverable ERROR to transaction-abort or backend-exit cleanup.
+            return ereport(types_error::PANIC)
+                .errmsg("strict synchronous completion failed")
+                .errdetail(err.to_string())
+                .finish(loc(224, "SyncRepWaitForLSN"));
+        }
+    }
+    result
+}
+
+fn wait_for_lsn(lsn: XLogRecPtr, commit: bool, strict: bool) -> PgResult<()> {
+    let object = guc_tables::backing::pgrust_s3();
     use init_small::globals as g;
+
+    if strict && (!g::IsUnderPostmaster() || (!object && walsender_config::max_wal_senders() <= 0)
+        || sync_rep_wait_mode() < SYNC_REP_WAIT_FLUSH || (!object && !sync_standbys_defined())
+        || my_proc().is_none())
+    {
+        return ereport(types_error::PANIC)
+            .errmsg("strict synchronous completion lost its required configuration")
+            .finish(loc(224, "SyncRepWaitForLSN"));
+    }
 
     // Fast exit: no sync replication requested (SyncRepRequested()), or the
     // checkpointer has initialized the status with no sync standbys defined.
-    if walsender_config::max_wal_senders() <= 0 || sync_rep_wait_mode() == SYNC_REP_NO_WAIT {
+    if !object && (walsender_config::max_wal_senders() <= 0 || sync_rep_wait_mode() == SYNC_REP_NO_WAIT) {
         return Ok(());
     }
     let ctl = walsender::WalSndCtl();
-    if ctl.sync_standbys_status.load(Relaxed) & (SYNC_STANDBY_INIT | SYNC_STANDBY_DEFINED)
+    if !object && ctl.sync_standbys_status.load(Relaxed) & (SYNC_STANDBY_INIT | SYNC_STANDBY_DEFINED)
         == SYNC_STANDBY_INIT
     {
         return Ok(());
@@ -252,7 +278,12 @@ pub fn SyncRepWaitForLSN(lsn: XLogRecPtr, commit: bool) -> PgResult<()> {
     debug_assert_eq!(proc.syncRepState.get(), SYNC_REP_NOT_WAITING);
 
     let status = ctl.sync_standbys_status.load(Relaxed);
-    if status & SYNC_STANDBY_INIT != 0 {
+    if object {
+        if lsn <= OBJECT_FLUSH.load(Relaxed) {
+            unlock_sync_rep()?;
+            return Ok(());
+        }
+    } else if status & SYNC_STANDBY_INIT != 0 {
         if status & SYNC_STANDBY_DEFINED == 0
             || lsn <= ctl.sync_rep_lsn[mode as usize].load(Relaxed)
         {
@@ -295,7 +326,17 @@ pub fn SyncRepWaitForLSN(lsn: XLogRecPtr, commit: bool) -> PgResult<()> {
             break;
         }
 
-        if g::ProcDiePending() {
+        if strict {
+            // Consume cancellation without completing the local-only commit.
+            // Leave ProcDiePending set: normal termination runs after durable
+            // completion. SIGQUIT still exits through the existing raw path.
+            g::SetQueryCancelPending(false);
+            if g::ProcDiePending() {
+                elog::config::set_where_to_send_output(types_dest::CommandDest::None);
+            }
+        }
+
+        if g::ProcDiePending() && !strict {
             // The transaction has already committed locally; we can neither
             // ack the commit nor raise ERROR/FATAL. WARN and shut off output.
             ereport(WARNING)
@@ -314,7 +355,7 @@ pub fn SyncRepWaitForLSN(lsn: XLogRecPtr, commit: bool) -> PgResult<()> {
             break;
         }
 
-        if g::QueryCancelPending() {
+        if g::QueryCancelPending() && !strict {
             g::SetQueryCancelPending(false);
             ereport(WARNING)
                 .errmsg("canceling wait for synchronous replication due to user request")
@@ -335,6 +376,11 @@ pub fn SyncRepWaitForLSN(lsn: XLogRecPtr, commit: bool) -> PgResult<()> {
         )?;
 
         if rc & WL_POSTMASTER_DEATH != 0 {
+            if strict {
+                return ereport(types_error::PANIC)
+                    .errmsg("postmaster died during strict synchronous completion")
+                    .finish(loc(340, "SyncRepWaitForLSN"));
+            }
             // All walsenders exit with the postmaster: no ack will ever come.
             g::SetProcDiePending(true);
             elog::config::set_where_to_send_output(types_dest::CommandDest::None);
@@ -537,6 +583,9 @@ fn SyncRepGetSyncRecPtr() -> (Option<(XLogRecPtr, XLogRecPtr, XLogRecPtr)>, bool
 
 /// SyncRepReleaseWaiters (syncrep.c:474).
 pub fn SyncRepReleaseWaiters() -> PgResult<()> {
+    if guc_tables::backing::pgrust_s3() {
+        return Ok(());
+    }
     let i = walsender::my_walsnd_index();
     debug_assert!(i >= 0);
     let ctl = walsender::WalSndCtl();
@@ -615,7 +664,12 @@ fn SyncRepWakeQueue(all: bool, mode: i32) -> i32 {
         let proc = lmgr_proc::GetPGProcByNumber(cur);
 
         // The queue is ordered by LSN.
-        if !all && ctl.sync_rep_lsn[mode as usize].load(Relaxed) < proc.waitLSN.load(Relaxed) {
+        let confirmed = if guc_tables::backing::pgrust_s3() {
+            OBJECT_FLUSH.load(Relaxed)
+        } else {
+            ctl.sync_rep_lsn[mode as usize].load(Relaxed)
+        };
+        if !all && confirmed < proc.waitLSN.load(Relaxed) {
             return numprocs;
         }
 
@@ -635,6 +689,9 @@ fn SyncRepWakeQueue(all: bool, mode: i32) -> i32 {
 
 /// SyncRepUpdateSyncStandbysDefined (syncrep.c:964); checkpointer-only caller.
 pub fn SyncRepUpdateSyncStandbysDefined() {
+    if guc_tables::backing::pgrust_s3() {
+        return;
+    }
     let ctl = walsender::WalSndCtl();
     let defined = sync_standbys_defined();
     let status = ctl.sync_standbys_status.load(Relaxed);
@@ -721,6 +778,8 @@ fn standby_names_set(v: Option<String>) {
 }
 
 pub fn init_seams() {
+    syncrep_seams::sync_rep_confirmed_flush_lsn::set(confirmed_flush);
+    syncrep_seams::confirm_object_flush::set(confirm_object_flush);
     guc_tables::vars::SyncRepStandbyNames.install_if_absent(guc_tables::GucVarAccessors {
         get: standby_names_get,
         set: standby_names_set,
@@ -748,3 +807,22 @@ pub fn init_seams() {
 
 #[cfg(test)]
 mod tests;
+
+// Only the native publisher advances this position, after authoritative publication.
+static OBJECT_FLUSH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn confirmed_flush() -> XLogRecPtr {
+    if guc_tables::backing::pgrust_s3() {
+        OBJECT_FLUSH.load(Relaxed)
+    } else {
+        walsender::confirmed_sync_flush_lsn()
+    }
+}
+fn confirm_object_flush(lsn: XLogRecPtr) -> PgResult<()> {
+    assert!(guc_tables::backing::pgrust_s3());
+    lock_sync_rep()?;
+    if lsn > OBJECT_FLUSH.load(Relaxed) {
+        OBJECT_FLUSH.store(lsn, Relaxed);
+        SyncRepWakeQueue(false, SYNC_REP_WAIT_FLUSH);
+    }
+    unlock_sync_rep()
+}

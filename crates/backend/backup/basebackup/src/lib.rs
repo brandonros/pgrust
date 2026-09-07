@@ -3,16 +3,15 @@
 // the data directory streaming each file as a tar archive, injects backup_label
 // / tablespace_map / pg_control, and emits the backup manifest.
 //
-// Scope (increment 5, default pg_basebackup -Xstream oracle). Loud contained
-// refusals, tagged increment 5, for surface a default backup never engages:
-// server-side compression, incremental backups, non-client targets, inline WAL
-// inclusion (WAL=true; default pg_basebackup streams WAL on a separate
-// connection). Backup-time page-checksum verification is deferred (it only
-// counts corruption warnings; it does not alter the streamed bytes).
+// Full and native incremental backups share the same sender, checksums and
+// backup/recovery boundaries. Incremental selection uses native WAL summaries.
+// Server-side compression remains explicitly unsupported.
 #![allow(non_snake_case)]
 #![allow(clippy::too_many_arguments)]
 
 use std::cell::Cell;
+mod incremental;
+mod incremental_manifest;
 
 use elog::ereport;
 use mcx::Mcx;
@@ -98,6 +97,7 @@ const EXCLUDE_FILES: &[ExcludeListItem] = &[
     ExcludeListItem { name: TABLESPACE_MAP, match_prefix: false },
     ExcludeListItem { name: "backup_manifest", match_prefix: false },
     ExcludeListItem { name: "postmaster.pid", match_prefix: false },
+    ExcludeListItem { name: "pgrust.memory_wal", match_prefix: false },
     ExcludeListItem { name: "postmaster.opts", match_prefix: false },
 ];
 
@@ -589,8 +589,7 @@ fn parse_basebackup_options(options: &[ReplOption]) -> PgResult<BasebackupOption
             .finish(loc("parse_basebackup_options"))?;
     }
 
-    if opt.incremental {
-        // Incremental requires a prior UPLOAD_MANIFEST (still unported).
+    if opt.incremental && incremental_manifest::current().is_none() {
         ereport(ERROR).errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE)
             .errmsg("must UPLOAD_MANIFEST before performing an incremental BASE_BACKUP")
             .finish(loc("parse_basebackup_options"))?;
@@ -642,10 +641,34 @@ pub fn SendBaseBackup<'mcx>(mcx: Mcx<'mcx>, cmd: &BaseBackupCmd) -> PgResult<()>
     // The DestRemoteSimple bridge needs the command mcx during the synchronous
     // result-set sends inside perform_base_backup.
     bcs_bridge::set_backup_mcx(mcx);
-    let result = perform_base_backup(mcx, &opt, &mut sink, &mut state);
+    let result = perform_base_backup(mcx, &opt, &mut sink, &mut state, incremental_manifest::current());
     bcs_bridge::clear_backup_mcx();
 
     // PG_FINALLY: always clean up the sink; propagate the primary error first.
+    let cleanup = bbsink_cleanup(&mut sink, &mut state);
+    result?;
+    cleanup
+}
+
+/// Export a full or incremental native backup to a caller-owned sink, without a replication
+/// connection. Backup/checkpoint boundaries and error cleanup match BASE_BACKUP.
+pub fn ExportBaseBackup<'mcx>(mcx: Mcx<'mcx>, sink: Box<Bbsink<'mcx>>, previous_manifest: Option<&[u8]>) -> PgResult<()> {
+    if transam_xlog::get_backup_status() == transam_xlog::SessionBackupState::Running {
+        return ereport(ERROR).errmsg("a backup is already in progress")
+            .finish(loc("ExportBaseBackup"));
+    }
+    let previous = previous_manifest.map(|bytes| incremental_manifest::parse(bytes, transam_xlog::GetSystemIdentifier()).map(std::rc::Rc::new)).transpose()?;
+    let opt = BasebackupOptions {
+        incremental: previous.is_some(),
+        label: "native backup".into(),
+        fastcheckpoint: true,
+        nowait: true,
+        manifest: BackupManifestOption::Yes,
+        ..Default::default()
+    };
+    let mut sink = sink_support::bbsink_progress_new(mcx, sink, false);
+    let mut state = BbsinkState::default();
+    let result = perform_base_backup(mcx, &opt, &mut sink, &mut state, previous);
     let cleanup = bbsink_cleanup(&mut sink, &mut state);
     result?;
     cleanup
@@ -668,6 +691,7 @@ fn perform_base_backup<'mcx>(
     opt: &BasebackupOptions,
     sink: &mut Bbsink<'mcx>,
     state: &mut BbsinkState,
+    previous: Option<std::rc::Rc<incremental_manifest::Uploaded>>,
 ) -> PgResult<()> {
     state.tablespaces = Vec::new();
     state.tablespace_num = 0;
@@ -702,6 +726,9 @@ fn perform_base_backup<'mcx>(
     let mut endtli: TimeLineID = 0;
 
     let mut body = || -> PgResult<()> {
+        let prepared = if opt.incremental {
+            Some(incremental::Prepared::new(mcx, previous.clone().ok_or_else(|| incremental_manifest::error("missing previous manifest"))?, &mut backup_state)?)
+        } else { None };
         // Node for the base directory, sent last.
         state.tablespaces.push(TablespaceInfo {
             oid: INVALID_OID,
@@ -735,7 +762,7 @@ fn perform_base_backup<'mcx>(
                     sendtblspclinks = false;
                 }
 
-                sendDir(sink, state, ".", 1, sendtblspclinks, &mut manifest)?;
+                sendDir(sink, state, ".", 1, sendtblspclinks, &mut manifest, prepared.as_ref())?;
 
                 // pg_control last.
                 let statbuf = match lstat_file(XLOG_CONTROL_FILE)? {
@@ -746,11 +773,11 @@ fn perform_base_backup<'mcx>(
                             .finish(loc("perform_base_backup"));
                     }
                 };
-                sendFile(sink, state, XLOG_CONTROL_FILE, XLOG_CONTROL_FILE, &statbuf, false, INVALID_OID, None, &mut manifest)?;
+                sendFile(sink, state, XLOG_CONTROL_FILE, XLOG_CONTROL_FILE, &statbuf, false, INVALID_OID, None, &mut manifest, None)?;
             } else {
                 let archive_name = format!("{oid}.tar");
                 bbsink_begin_archive(sink, state, &archive_name)?;
-                sendTablespace(sink, state, path.as_deref().unwrap(), oid, &mut manifest)?;
+                sendTablespace(sink, state, path.as_deref().unwrap(), oid, &mut manifest, prepared.as_ref())?;
             }
 
             // If we're including WAL, and this is the main data directory,
@@ -942,7 +969,7 @@ fn perform_base_backup<'mcx>(
                         .finish(loc("perform_base_backup"));
                 }
             };
-            sendFile(sink, state, &pathbuf, &pathbuf, &statbuf, false, INVALID_OID, None, &mut manifest)?;
+            sendFile(sink, state, &pathbuf, &pathbuf, &statbuf, false, INVALID_OID, None, &mut manifest, None)?;
 
             // Unconditionally mark file as archived.
             let done_path = transam_xlog::StatusFilePath(fname, ".done");
@@ -1158,6 +1185,7 @@ fn sendTablespace(
     path: &str,
     spcoid: Oid,
     manifest: &mut BackupManifestInfo,
+    incremental: Option<&incremental::Prepared<'_>>,
 ) -> PgResult<i64> {
     let pathbuf = format!("{path}/{TABLESPACE_VERSION_DIRECTORY}");
     let statbuf = match lstat_file(&pathbuf)? {
@@ -1165,7 +1193,7 @@ fn sendTablespace(
         None => return Ok(0), // tablespace went away — not an error
     };
     let mut size = _tarWriteHeader(sink, state, TABLESPACE_VERSION_DIRECTORY, None, &statbuf)?;
-    size += sendDir_spc(sink, state, &pathbuf, path.len() as i32, true, manifest, spcoid)?;
+    size += sendDir_spc(sink, state, &pathbuf, path.len() as i32, true, manifest, spcoid, incremental)?;
     Ok(size)
 }
 
@@ -1176,8 +1204,9 @@ fn sendDir(
     basepathlen: i32,
     sendtblspclinks: bool,
     manifest: &mut BackupManifestInfo,
+    incremental: Option<&incremental::Prepared<'_>>,
 ) -> PgResult<i64> {
-    sendDir_spc(sink, state, path, basepathlen, sendtblspclinks, manifest, INVALID_OID)
+    sendDir_spc(sink, state, path, basepathlen, sendtblspclinks, manifest, INVALID_OID, incremental)
 }
 
 fn sendDir_spc(
@@ -1188,6 +1217,7 @@ fn sendDir_spc(
     sendtblspclinks: bool,
     manifest: &mut BackupManifestInfo,
     spcoid: Oid,
+    incremental: Option<&incremental::Prepared<'_>>,
 ) -> PgResult<i64> {
     let mut size: i64 = 0;
 
@@ -1324,7 +1354,7 @@ fn sendDir_spc(
                 skip = true;
             }
             if !skip {
-                size += sendDir_spc(sink, state, &pathbuf, basepathlen, sendtblspclinks, manifest, spcoid)?;
+                size += sendDir_spc(sink, state, &pathbuf, basepathlen, sendtblspclinks, manifest, spcoid, incremental)?;
             }
         } else if S_ISREG(statbuf.mode) {
             let tarfilename = &pathbuf[basepathlen as usize + 1..];
@@ -1333,10 +1363,26 @@ fn sendDir_spc(
             } else {
                 None
             };
-            let sent = sendFile(sink, state, &pathbuf, tarfilename, &statbuf, true, spcoid, relfile, manifest)?;
+            let plan = if let Some(inc) = incremental.filter(|_| is_relation_file) {
+                let lookup = if spcoid == INVALID_OID { tarfilename.to_owned() }
+                    else { format!("pg_tblspc/{spcoid}/{tarfilename}") };
+                let locator = types_storage::RelFileLocator {
+                    spcOid: if spcoid != INVALID_OID { spcoid } else if dboid == 0 { 1664 } else { 1663 },
+                    dbOid: dboid, relNumber: relfilenumber,
+                };
+                inc.select(&lookup, locator, rel_fork, segno_of, statbuf.size)?
+            } else { None };
+            let incremental_name;
+            let tarfilename = if plan.is_some() {
+                let (dir, name) = tarfilename.rsplit_once('/').unwrap();
+                incremental_name = format!("{dir}/INCREMENTAL.{name}");
+                incremental_name.as_str()
+            } else { tarfilename };
+            let sent = sendFile(sink, state, &pathbuf, tarfilename, &statbuf, true, spcoid, relfile, manifest, plan.as_ref())?;
             if sent {
-                size += statbuf.size;
-                size += tar_padding_bytes_required(statbuf.size as usize) as i64;
+                let sent_size = plan.as_ref().map_or(statbuf.size, |p| p.size());
+                size += sent_size;
+                size += tar_padding_bytes_required(sent_size as usize) as i64;
                 size += TAR_BLOCK_SIZE as i64;
             }
         } else {
@@ -1361,6 +1407,7 @@ fn sendFile(
     // filename in a relation directory (checksum verification surface).
     relfile: Option<(u32, u32)>,
     manifest: &mut BackupManifestInfo,
+    plan: Option<&incremental::FilePlan>,
 ) -> PgResult<bool> {
     let mut ctx = checksum_init(manifest.checksum_type(), readfilename)?;
 
@@ -1376,7 +1423,25 @@ fn sendFile(
         }
     };
 
-    _tarWriteHeader(sink, state, tarfilename, None, statbuf)?;
+    // Always close the source descriptor, including sink/checksum failures.
+    struct SourceFd(i32);
+    impl Drop for SourceFd {
+        fn drop(&mut self) { fd::CloseTransientFile(self.0); }
+    }
+    let _close = SourceFd(fd);
+    let output_size = plan.map_or(statbuf.size, |p| p.size());
+    let output_stat = LstatInfo { size: output_size, ..*statbuf };
+    _tarWriteHeader(sink, state, tarfilename, None, &output_stat)?;
+    if let Some(plan) = plan {
+        let header = plan.header();
+        checksum_update(&mut ctx, &header)?;
+        for part in header.chunks(sink.buffer_length()) {
+            sink.buffer_slice_mut(part.len()).copy_from_slice(part);
+            bbsink_archive_contents(sink, state, part.len())?;
+        }
+    }
+    let payload_size = plan.map_or(statbuf.size, |p| (p.blocks.len() * types_core::BLCKSZ) as i64);
+    let mut actual_read = 0u64;
 
     // If we weren't told not to verify checksums, and checksums are enabled
     // for this cluster, and this is a relation file, verify per-block.
@@ -1391,21 +1456,25 @@ fn sendFile(
 
     let mut bytes_done: i64 = 0;
     loop {
-        if bytes_done >= statbuf.size {
+        if bytes_done >= payload_size {
             break;
         }
-        let want = sink.buffer_length().min((statbuf.size - bytes_done) as usize);
+        let (offset, want) = if let Some(plan) = plan {
+            blkno = plan.blocks[bytes_done as usize / BLCKSZ];
+            (blkno as i64 * BLCKSZ as i64, BLCKSZ)
+        } else { (bytes_done, sink.buffer_length().min((payload_size - bytes_done) as usize)) };
         // buf is a live writable slice; fd is an open regular file.
         let mut cnt = {
             let buf = sink.buffer_slice_mut(want);
-            fd::pg_pread(fd, buf, bytes_done)
+            fd::pg_pread(fd, buf, offset)
         };
         if cnt < 0 {
-            fd::CloseTransientFile(fd);
             return ereport(ERROR).errcode_for_file_access()
                 .errmsg(format!("could not read file \"{readfilename}\""))
                 .finish(loc("sendFile")).map(|()| false);
         }
+
+        actual_read += cnt as u64;
 
         // read_file_data_into_buffer's per-block verification (basebackup.c).
         if verify_checksum && cnt > 0 && (cnt as usize % BLCKSZ) == 0 {
@@ -1431,10 +1500,14 @@ fn sendFile(
                             fd,
                             buf[i * BLCKSZ..].as_mut_ptr().cast(),
                             BLCKSZ,
-                            bytes_done as libc::off_t + (i * BLCKSZ) as libc::off_t,
+                            offset as libc::off_t + (i * BLCKSZ) as libc::off_t,
                         )
                     }
                 };
+                if reread_cnt < 0 || (reread_cnt > 0 && reread_cnt != BLCKSZ as isize) {
+                    return Err(incremental_manifest::error(format!("could not reread complete block in {readfilename}")));
+                }
+                actual_read += reread_cnt as u64;
                 if reread_cnt == 0 {
                     // Concurrent truncation: keep only the processed blocks.
                     cnt = (BLCKSZ * i) as isize;
@@ -1469,6 +1542,9 @@ fn sendFile(
             }
         }
 
+        // A concurrent truncation can expose a partial block. As in native
+        // basebackup, zero-fill this and later blocks; recovery reapplies WAL.
+        if plan.is_some() && cnt < BLCKSZ as isize { break; }
         // Block-level checksums can't be verified on a partial read.
         if verify_checksum && cnt > 0 && (cnt as usize % BLCKSZ) != 0 {
             let _ = ereport(WARNING)
@@ -1490,8 +1566,8 @@ fn sendFile(
     }
 
     // Pad with zeros if truncated during send.
-    while bytes_done < statbuf.size {
-        let nbytes = sink.buffer_length().min((statbuf.size - bytes_done) as usize);
+    while bytes_done < payload_size {
+        let nbytes = sink.buffer_length().min((payload_size - bytes_done) as usize);
         zero_buffer(sink, nbytes);
         let chunk = sink.buffer_slice(nbytes).to_vec();
         checksum_update(&mut ctx, &chunk)?;
@@ -1499,8 +1575,7 @@ fn sendFile(
         bytes_done += nbytes as i64;
     }
 
-    _tarWritePadding(sink, state, bytes_done as usize)?;
-    fd::CloseTransientFile(fd);
+    _tarWritePadding(sink, state, output_size as usize)?;
 
     if checksum_failures > 1 {
         // pgstat checksum-failure reporting is monitoring-only and deferred.
@@ -1518,7 +1593,10 @@ fn sendFile(
     }
     TOTAL_CHECKSUM_FAILURES.with(|c| c.set(c.get() + checksum_failures as i64));
 
-    AddFileToBackupManifest(manifest, spcoid, tarfilename.as_bytes(), statbuf.size, statbuf.mtime, &mut ctx)?;
+    AddFileToBackupManifest(manifest, spcoid, tarfilename.as_bytes(), output_size, statbuf.mtime, &mut ctx)?;
+    let _ = ereport(types_error::DEBUG1)
+        .errmsg(format!("base backup file {tarfilename}: source bytes read {actual_read}, output bytes {output_size}"))
+        .finish(loc("sendFile"));
     Ok(true)
 }
 
@@ -1657,6 +1735,8 @@ fn time_now() -> i64 {
 // ===========================================================================
 
 pub fn init_seams() {
+    walsender_seams::export_base_backup::set(ExportBaseBackup);
+    walsender_seams::upload_manifest::set(incremental_manifest::upload);
     walsender_seams::base_backup::set(send_base_backup_entry);
     // manifest needs C's GetSystemIdentifier; backup_copy needs a flush + the
     // DestRemoteSimple result-set router (SendXlogRecPtrResult/SendTablespaceList).

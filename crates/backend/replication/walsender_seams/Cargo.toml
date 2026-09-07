@@ -12,3 +12,6 @@ path = "src/lib.rs"
 seam_core = { path = "../../../_support/seam_core" }
 types_error = { path = "../../../_support/types/types_error" }
 repl_gram = { path = "../repl_gram" }
+
+mcx = { path = "../../../_support/mcx" }
+sink = { path = "../../backup/sink" }

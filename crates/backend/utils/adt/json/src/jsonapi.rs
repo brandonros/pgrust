@@ -732,11 +732,20 @@ pub struct JsonLexDe<'src, 'mcx> {
     mcx: mcx::Mcx<'mcx>,
     strval: mcx::PgVec<'mcx, u8>,
     need_escapes: bool,
+    utf8_escapes: bool,
 }
 
 impl<'src, 'mcx> JsonLexDe<'src, 'mcx> {
     pub fn new(mcx: mcx::Mcx<'mcx>, input: &'src [u8], encoding: i32) -> Self {
         Self::with_escapes(mcx, input, encoding, true)
+    }
+
+    /// Parse UTF-8 interchange data without converting Unicode escapes to the
+    /// session database encoding (e.g. a physical backup manifest).
+    pub fn new_utf8(mcx: mcx::Mcx<'mcx>, input: &'src [u8]) -> Self {
+        let mut result = Self::new(mcx, input, wchar::PG_UTF8);
+        result.utf8_escapes = true;
+        result
     }
 
     /// C: makeJsonLexContext with an explicit need_escapes (false skips strval
@@ -752,6 +761,7 @@ impl<'src, 'mcx> JsonLexDe<'src, 'mcx> {
             mcx,
             strval: mcx::PgVec::new_in(mcx),
             need_escapes,
+            utf8_escapes: false,
         }
     }
 
@@ -842,7 +852,7 @@ impl<'src, 'mcx> JsonLexDe<'src, 'mcx> {
                     // server-encoding arms inlined to skip the arena round trip.
                     if ch <= 0x7F {
                         self.strval.push(ch as u8);
-                    } else if mbutils::GetDatabaseEncoding() == wchar::PG_UTF8 {
+                    } else if self.utf8_escapes || mbutils::GetDatabaseEncoding() == wchar::PG_UTF8 {
                         let mut buf = [0u8; 4];
                         wchar::unicode_to_utf8(ch, &mut buf);
                         let n = wchar::pg_utf_mblen(&buf) as usize;

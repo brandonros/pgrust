@@ -1,8 +1,8 @@
 // walsender.c — WAL sender (PG 18.3). Increments 1-3 of the replication port:
 // walsender identity flags, exec_replication_command dispatch, IDENTIFY_SYSTEM,
 // SHOW, slot commands, TIMELINE_HISTORY, and physical START_REPLICATION live WAL
-// streaming (CopyBoth + WalSndLoop + XLogSendPhysical). BASE_BACKUP (inc 5),
-// UPLOAD_MANIFEST (inc 5) and logical START_REPLICATION (inc 6) are loud panics.
+// streaming (CopyBoth + WalSndLoop + XLogSendPhysical). BASE_BACKUP and
+// UPLOAD_MANIFEST delegate to native backup handlers.
 #![allow(non_snake_case)]
 
 pub mod replies;
@@ -138,6 +138,13 @@ pub struct WalSndCtlData {
 pub const NUM_SYNC_REP_WAIT_MODE: usize = 3;
 
 static WAL_SND_CTL: OnceLock<WalSndCtlData> = OnceLock::new();
+
+/// Read-only strict-retention frontier, also safe before first sender startup.
+/// WAL reservation calls this under its spinlock: never initialize/allocate here.
+pub fn confirmed_sync_flush_lsn() -> types_core::XLogRecPtr {
+    // syncrep.h: SYNC_REP_WAIT_FLUSH = 1 (slot layout above).
+    WAL_SND_CTL.get().map(|ctl| ctl.sync_rep_lsn[1].load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0)
+}
 
 // C: ShmemInitStruct("Wal Sender Ctl") sized by max_wal_senders; here the
 // publish-before-threads static, first-touch initialized (OnceLock).
@@ -564,17 +571,16 @@ pub fn exec_replication_command(cmd_string: &str) -> PgResult<bool> {
             walsender_seams::base_backup::call(c)?;
             tcop_dest::EndReplicationCommand(cmdtag.as_bytes())?;
         }
-        ReplCommand::UploadManifest => unported("UPLOAD_MANIFEST", 5),
+        ReplCommand::UploadManifest => {
+            xact::PreventInTransactionBlock(true, "UPLOAD_MANIFEST")?;
+            walsender_seams::upload_manifest::call()?;
+            tcop_dest::EndReplicationCommand(b"UPLOAD_MANIFEST")?;
+        }
     }
 
     // ps display / pg_stat_activity reset to "idle" by PostgresMain;
     // debug_query_string is not a raw pointer here, nothing to reset.
     Ok(true)
-}
-
-#[cold]
-fn unported(cmdtag: &str, increment: u32) -> ! {
-    panic!("walsender: {cmdtag} unported (replication-p1 increment {increment})");
 }
 
 // GetStandbyFlushRecPtr (xlog.c:6653): what a cascading standby may send —

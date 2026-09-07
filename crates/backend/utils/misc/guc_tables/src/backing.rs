@@ -285,6 +285,8 @@ int_var!(
     0
 );
 bool_var!(B_EnableSSL, EnableSSL, set_EnableSSL, false);
+bool_var!(B_strict_synchronous_commit, pgrust_strict_synchronous_commit, set_pgrust_strict_synchronous_commit, false);
+int_var!(I_strict_wal_budget_mb, pgrust_strict_wal_budget_mb, set_pgrust_strict_wal_budget_mb, 1024);
 bool_var!(
     B_restart_after_crash,
     restart_after_crash,
@@ -609,3 +611,14 @@ string_var!(
 pub extern "C" fn pgrust_guc_tls_probe() -> i32 {
     log_statement() + Debug_print_plan() as i32 + log_duration() as i32
 }
+
+int_var!(I_memory_wal_mb, pgrust_memory_wal_mb, set_pgrust_memory_wal_mb, 0);
+
+bool_var!(B_s3, pgrust_s3, set_pgrust_s3, false);
+string_var!(S_s3_endpoint, pgrust_s3_endpoint, set_pgrust_s3_endpoint, None);
+string_var!(S_s3_bucket, pgrust_s3_bucket, set_pgrust_s3_bucket, None);
+string_var!(S_s3_prefix, pgrust_s3_prefix, set_pgrust_s3_prefix, None);
+string_var!(S_s3_region, pgrust_s3_region, set_pgrust_s3_region, None);
+string_var!(S_s3_fenced_head, pgrust_s3_fenced_head, set_pgrust_s3_fenced_head, None);
+
+bool_var!(B_s3_create, pgrust_s3_create, set_pgrust_s3_create, false);

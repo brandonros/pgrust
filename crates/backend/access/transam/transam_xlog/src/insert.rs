@@ -160,7 +160,7 @@ const XL_CRC: usize = 20;
 // 128-bit CAS reservation (curr|prev packed) — keep the byte-position
 // representation, it is what makes the reservation O(1).
 #[inline(always)]
-fn ReserveXLogInsertLocation(size: usize) -> (XLogRecPtr, XLogRecPtr, XLogRecPtr) {
+fn ReserveXLogInsertLocation(size: usize) -> PgResult<(XLogRecPtr, XLogRecPtr, XLogRecPtr)> {
     let insert = &XLogCtl().Insert;
     let size = MAXALIGN(size) as u64;
     debug_assert!(size > SizeOfXLogRecord as u64);
@@ -169,6 +169,10 @@ fn ReserveXLogInsertLocation(size: usize) -> (XLogRecPtr, XLogRecPtr, XLogRecPtr
     insert.insertpos_lck.acquire();
     startbytepos = insert.CurrBytePos.load(Relaxed);
     endbytepos = startbytepos + size;
+    if !strict_wal_budget_allows(XLogBytePosToEndRecPtr(endbytepos)) {
+        insert.insertpos_lck.release();
+        return strict_wal_budget_exceeded();
+    }
     prevbytepos = insert.PrevBytePos.load(Relaxed);
     insert.CurrBytePos.store(endbytepos, Relaxed);
     insert.PrevBytePos.store(startbytepos, Relaxed);
@@ -180,10 +184,34 @@ fn ReserveXLogInsertLocation(size: usize) -> (XLogRecPtr, XLogRecPtr, XLogRecPtr
     debug_assert_eq!(XLogRecPtrToBytePos(start_pos), startbytepos);
     debug_assert_eq!(XLogRecPtrToBytePos(end_pos), endbytepos);
     debug_assert_eq!(XLogRecPtrToBytePos(prev_ptr), prevbytepos);
-    (start_pos, end_pos, prev_ptr)
+    Ok((start_pos, end_pos, prev_ptr))
 }
 
-fn ReserveXLogSwitch() -> (bool, XLogRecPtr, XLogRecPtr, XLogRecPtr) {
+// Called under the reservation spinlock: only atomic reads, no waiting/I/O.
+// Checking the proposed end before reservation also covers concurrent writers,
+// large records, aborted work, checkpoints and explicit segment switches.
+fn strict_wal_budget_allows(end: XLogRecPtr) -> bool {
+    if !guc_tables::backing::pgrust_strict_synchronous_commit() {
+        return true;
+    }
+    let start = XLogCtl().strictWalStartLSN.load(Relaxed);
+    let confirmed = syncrep_seams::sync_rep_confirmed_flush_lsn::call();
+    let budget = guc_tables::backing::pgrust_strict_wal_budget_mb() as u64 * 1024 * 1024;
+    start != InvalidXLogRecPtr && end.saturating_sub(start.max(confirmed)) <= budget
+}
+
+fn strict_wal_budget_exceeded<T>() -> PgResult<T> {
+    // XLogInsertRecord is in a critical section. Ordinary ERROR/abort cleanup
+    // cannot safely unwind it. The spinlock has been released; PANIC invokes
+    // the existing whole-compute crash path (strict mode forbids auto restart).
+    ereport(PANIC)
+        .errmsg("strict synchronous WAL generation budget exceeded")
+        .errdetail("Required WAL has not been discarded. Restore from the authoritative history before restarting disposable compute.")
+        .finish(loc("strict_wal_budget_exceeded"))
+        .map(|()| unreachable!("PANIC cannot return successfully"))
+}
+
+fn ReserveXLogSwitch() -> PgResult<(bool, XLogRecPtr, XLogRecPtr, XLogRecPtr)> {
     let insert = &XLogCtl().Insert;
     let size = MAXALIGN(SizeOfXLogRecord) as u64;
     let wal_segsz = wal_segment_size();
@@ -193,7 +221,7 @@ fn ReserveXLogSwitch() -> (bool, XLogRecPtr, XLogRecPtr, XLogRecPtr) {
     let ptr = XLogBytePosToEndRecPtr(startbytepos);
     if XLogSegmentOffset(ptr, wal_segsz) == 0 {
         insert.insertpos_lck.release();
-        return (false, ptr, ptr, 0);
+        return Ok((false, ptr, ptr, 0));
     }
     let mut endbytepos = startbytepos + size;
     let prevbytepos = insert.PrevBytePos.load(Relaxed);
@@ -204,13 +232,17 @@ fn ReserveXLogSwitch() -> (bool, XLogRecPtr, XLogRecPtr, XLogRecPtr) {
         end_pos += segleft;
         endbytepos = XLogRecPtrToBytePos(end_pos);
     }
+    if !strict_wal_budget_allows(end_pos) {
+        insert.insertpos_lck.release();
+        return strict_wal_budget_exceeded();
+    }
     insert.CurrBytePos.store(endbytepos, Relaxed);
     insert.PrevBytePos.store(startbytepos, Relaxed);
     insert.insertpos_lck.release();
 
     let prev_ptr = XLogBytePosToRecPtr(prevbytepos);
     debug_assert_eq!(XLogSegmentOffset(end_pos, wal_segsz), 0);
-    (true, start_pos, end_pos, prev_ptr)
+    Ok((true, start_pos, end_pos, prev_ptr))
 }
 
 pub(crate) fn WaitXLogInsertionsToFinish(upto: XLogRecPtr) -> XLogRecPtr {
@@ -561,14 +593,14 @@ pub fn XLogInsertRecord(
                 return Ok(InvalidXLogRecPtr);
             }
 
-            let (s, e, prev) = ReserveXLogInsertLocation(xl_tot_len);
+            let (s, e, prev) = ReserveXLogInsertLocation(xl_tot_len)?;
             rechdr[XL_PREV..XL_PREV + 8].copy_from_slice(&prev.to_ne_bytes());
             (inserted, start_pos, end_pos) = (true, s, e);
         }
         Class::SpecialSwitch => {
             debug_assert_eq!(fpw_lsn, InvalidXLogRecPtr);
             WALInsertLockAcquireExclusive();
-            let (ok, s, e, prev) = ReserveXLogSwitch();
+            let (ok, s, e, prev) = ReserveXLogSwitch()?;
             if ok {
                 rechdr[XL_PREV..XL_PREV + 8].copy_from_slice(&prev.to_ne_bytes());
             }
@@ -577,7 +609,7 @@ pub fn XLogInsertRecord(
         Class::SpecialCheckpoint => {
             debug_assert_eq!(fpw_lsn, InvalidXLogRecPtr);
             WALInsertLockAcquireExclusive();
-            let (s, e, prev) = ReserveXLogInsertLocation(xl_tot_len);
+            let (s, e, prev) = ReserveXLogInsertLocation(xl_tot_len)?;
             rechdr[XL_PREV..XL_PREV + 8].copy_from_slice(&prev.to_ne_bytes());
             REDO_REC_PTR.set(s);
             insert.RedoRecPtr.store(s, Relaxed);

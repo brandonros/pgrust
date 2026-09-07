@@ -406,6 +406,8 @@ pub static recovery_target_xid_string: GucStringVar = GucSlot::new("recovery_tar
 pub static recursive_worktable_factor: GucRealVar = GucSlot::new("recursive_worktable_factor");
 pub static remove_temp_files_after_crash: GucBoolVar = GucSlot::new("remove_temp_files_after_crash");
 pub static restart_after_crash: GucBoolVar = GucSlot::new("restart_after_crash");
+pub static pgrust_strict_synchronous_commit: GucBoolVar = GucSlot::new("pgrust_strict_synchronous_commit");
+pub static pgrust_strict_wal_budget_mb: GucIntVar = GucSlot::new("pgrust_strict_wal_budget_mb");
 pub static restrict_nonsystem_relation_kind_string: GucStringVar = GucSlot::new("restrict_nonsystem_relation_kind_string");
 pub static role_string: GucStringVar = GucSlot::new("role_string");
 pub static row_security: GucBoolVar = GucSlot::new("row_security");
@@ -493,3 +495,14 @@ pub static work_mem: GucIntVar = GucSlot::new("work_mem");
 pub static xmlbinary: GucEnumVar = GucSlot::new("xmlbinary");
 pub static xmloption: GucEnumVar = GucSlot::new("xmloption");
 pub static zero_damaged_pages: GucBoolVar = GucSlot::new("zero_damaged_pages");
+
+pub static pgrust_memory_wal_mb: GucIntVar = GucSlot::new("pgrust_memory_wal_mb");
+
+pub static pgrust_s3: GucBoolVar = GucSlot::new("pgrust_s3");
+pub static pgrust_s3_endpoint: GucStringVar = GucSlot::new("pgrust_s3_endpoint");
+pub static pgrust_s3_bucket: GucStringVar = GucSlot::new("pgrust_s3_bucket");
+pub static pgrust_s3_prefix: GucStringVar = GucSlot::new("pgrust_s3_prefix");
+pub static pgrust_s3_region: GucStringVar = GucSlot::new("pgrust_s3_region");
+pub static pgrust_s3_fenced_head: GucStringVar = GucSlot::new("pgrust_s3_fenced_head");
+
+pub static pgrust_s3_create: GucBoolVar = GucSlot::new("pgrust_s3_create");

@@ -457,6 +457,25 @@ fn install_guc_tables_owned_vars() {
         get: backing::restart_after_crash,
         set: backing::set_restart_after_crash,
     });
+    vars::pgrust_strict_synchronous_commit.install(GucVarAccessors {
+        get: backing::pgrust_strict_synchronous_commit,
+        set: backing::set_pgrust_strict_synchronous_commit,
+    });
+    vars::pgrust_memory_wal_mb.install(GucVarAccessors {
+        get: backing::pgrust_memory_wal_mb,
+        set: backing::set_pgrust_memory_wal_mb,
+    });
+    vars::pgrust_s3_create.install(GucVarAccessors { get: backing::pgrust_s3_create, set: backing::set_pgrust_s3_create });
+    vars::pgrust_s3.install(GucVarAccessors { get: backing::pgrust_s3, set: backing::set_pgrust_s3 });
+    vars::pgrust_s3_endpoint.install(GucVarAccessors { get: backing::pgrust_s3_endpoint, set: backing::set_pgrust_s3_endpoint });
+    vars::pgrust_s3_bucket.install(GucVarAccessors { get: backing::pgrust_s3_bucket, set: backing::set_pgrust_s3_bucket });
+    vars::pgrust_s3_prefix.install(GucVarAccessors { get: backing::pgrust_s3_prefix, set: backing::set_pgrust_s3_prefix });
+    vars::pgrust_s3_region.install(GucVarAccessors { get: backing::pgrust_s3_region, set: backing::set_pgrust_s3_region });
+    vars::pgrust_s3_fenced_head.install(GucVarAccessors { get: backing::pgrust_s3_fenced_head, set: backing::set_pgrust_s3_fenced_head });
+    vars::pgrust_strict_wal_budget_mb.install(GucVarAccessors {
+        get: backing::pgrust_strict_wal_budget_mb,
+        set: backing::set_pgrust_strict_wal_budget_mb,
+    });
     vars::remove_temp_files_after_crash.install(GucVarAccessors {
         get: backing::remove_temp_files_after_crash,
         set: backing::set_remove_temp_files_after_crash,

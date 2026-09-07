@@ -74,7 +74,7 @@ fn build_variable(setting: GucSetting) -> Option<GucVariable> {
     let gen = |vartype: config_type| {
         config_generic::boot(
             name,
-            setting.context(),
+            crate::strict_sync::context(name, setting.context()),
             setting.group(),
             setting.short_desc(),
             setting.long_desc(),

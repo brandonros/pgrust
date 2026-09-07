@@ -7,6 +7,8 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 
+pub mod memory_wal;
+
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 

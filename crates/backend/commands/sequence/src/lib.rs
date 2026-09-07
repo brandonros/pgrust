@@ -1279,6 +1279,13 @@ pub fn nextval_internal(mcx: Mcx<'_>, relid: Oid, check_permissions: bool) -> Pg
     }
     xact::PreventCommandIfParallelMode("nextval()")?;
 
+    // Cached/prelogged values depend on earlier allocation WAL, possibly from
+    // an aborted transaction. A native commit record orders that dependency
+    // before strict confirmation even when this call emits no sequence WAL.
+    if guc_tables::backing::pgrust_strict_synchronous_commit() && relation_needs_wal(&seqrel) {
+        xact::GetTopTransactionId()?;
+    }
+
     let (last0, cached0) = with_elm(relid, |e| (e.last, e.cached));
     if last0 != cached0 {
         let v = with_elm(relid, |e| {

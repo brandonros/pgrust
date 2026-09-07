@@ -144,6 +144,11 @@ pub fn StartupProcessMain(startup_data: &StartupData) -> ! {
         fatal_exit(&e);
     }
 
+    #[cfg(unix)]
+    if let Err(e) = object_wal::finish_startup(ProcessStartupProcInterrupts) {
+        fatal_exit(&e);
+    }
+
     // Exit code 0 tells the postmaster recovery completed successfully.
     ipc::proc_exit(0, g::MyProcPid())
 }

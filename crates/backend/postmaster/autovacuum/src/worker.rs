@@ -146,7 +146,11 @@ fn worker_body() -> PgResult<()> {
         PGC_SUSET,
         PGC_S_OVERRIDE,
     )?;
-    if guc_tables::vars::synchronous_commit.read()
+    // Strict completion fixes the durability level for every backend in this
+    // run. Keep it for automatic upkeep too; attempting the ordinary local-only
+    // override is rejected by GUC and prevents the worker from starting.
+    if !guc_tables::backing::pgrust_strict_synchronous_commit()
+        && guc_tables::vars::synchronous_commit.read()
         > guc_tables::consts::SYNCHRONOUS_COMMIT_LOCAL_FLUSH
     {
         guc::SetConfigOption("synchronous_commit", Some("local"), PGC_SUSET, PGC_S_OVERRIDE)?;

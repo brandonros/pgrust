@@ -47,12 +47,13 @@ fn table_counts_match_compiled_backend_shape() {
     //   -> 135), Int +4 (pgrust.memory_watchdog_interval / _threshold /
     //   _limit, plus the hidden developer hog pgrust.memory_watchdog_test_hog
     //   -> 166) = 453.
-    assert_eq!(ConfigureNamesBool.len(), 135);
-    assert_eq!(ConfigureNamesInt.len(), 166);
+    // Strict completion + S3 mode; WAL budgets; five S3 configuration strings.
+    assert_eq!(ConfigureNamesBool.len(), 138);
+    assert_eq!(ConfigureNamesInt.len(), 168);
     assert_eq!(ConfigureNamesReal.len(), 28);
-    assert_eq!(ConfigureNamesString.len(), 77);
+    assert_eq!(ConfigureNamesString.len(), 82);
     assert_eq!(ConfigureNamesEnum.len(), 47);
-    assert_eq!(all_settings().count(), 453);
+    assert_eq!(all_settings().count(), 463);
     assert_eq!(GucContext_Names.len(), PGC_USERSET as usize + 1);
     assert_eq!(GucSource_Names.len(), PGC_S_SESSION as usize + 1);
     assert_eq!(config_group_names.len(), DEVELOPER_OPTIONS as usize + 1);

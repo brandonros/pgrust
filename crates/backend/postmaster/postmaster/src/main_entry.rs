@@ -345,6 +345,15 @@ pub fn PostmasterMain(argv: &[String]) -> PgResult<()> {
         ExitPostmaster(0);
     }
 
+    #[cfg(not(unix))]
+    if guc_tables::backing::pgrust_s3() || guc_tables::backing::pgrust_s3_create() {
+        return elog::ereport(FATAL)
+            .errmsg("native S3 storage is unavailable on this platform")
+            .finish(loc(0, "PostmasterMain"));
+    }
+    #[cfg(unix)]
+    object_wal::prepare()?;
+
     miscinit_seams::check_data_dir::call()?;
     checkControlFile();
     miscinit::ChangeToDataDir()?;
@@ -376,18 +385,25 @@ pub fn PostmasterMain(argv: &[String]) -> PgResult<()> {
             .finish(loc(857, "PostmasterMain"));
     }
 
+    guc::strict_sync::configure()?;
+    #[cfg(unix)]
+    object_wal::register_worker()?;
+
     // CheckDateTokenTables: a static-order assertion over datetime.c tables;
     // that unit (and its tables) is unported — nothing to check yet.
 
     if elog::message_level_is_interesting(DEBUG3) {
         let mut si = String::from("initial environment dump:");
         for (k, v) in std::env::vars() {
+            if matches!(k.as_str(), "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY" | "AWS_SESSION_TOKEN") { continue; }
             si.push_str(&format!("\n{k}={v}"));
         }
         crate::report_internal(DEBUG3, si, 891, "PostmasterMain");
     }
 
     miscinit::CreateDataDirLockFile(true)?;
+    #[cfg(unix)]
+    object_wal::prepare_creation()?;
 
     transam_xlog::LocalProcessControlFile(false)?;
 
