@@ -25,12 +25,15 @@ def main():
     parser.add_argument('--startup-faults', action='store_true')
     parser.add_argument('--crashes', type=int, default=0)
     parser.add_argument('--renewals', type=int, default=0)
+    parser.add_argument('--upload-faults', action='store_true')
     parser.add_argument('--server', default='target/debug/postgres')
     parser.add_argument('--pg-bin', required=True)
     parser.add_argument('--sharedir', required=True)
     parser.add_argument('--endpoint', default='http://127.0.0.1:9000')
     parser.add_argument('--bucket', default='pgrust-wal-experiments')
     args = parser.parse_args()
+    if args.upload_faults and args.renewals < 2:
+        parser.error("--upload-faults requires --renewals at least 2")
     root = Path(tempfile.mkdtemp(prefix='native-create-', dir='/tmp'))
     print(root, flush=True)
     prefix = 'create-' + uuid.uuid4().hex + '/'
@@ -116,6 +119,12 @@ def main():
         def exchange(self):
             body = self.rfile.read(int(self.headers.get('Content-Length', '0')))
             path = self.path.split('?', 1)[0]
+            if self.command == 'PUT' and '/backup-chunks/' in path and (proxy.fail.is_set() or proxy.pause_snapshot.is_set()):
+                with proxy.condition:
+                    proxy.snapshot_attempts += 1
+                    previous = proxy.snapshot_bodies.setdefault(path, hashlib.sha256(body).digest())
+                    assert previous == hashlib.sha256(body).digest(), 'retry changed an immutable object'
+                proxy.snapshot_pending.set()
             if self.command == 'PUT' and '/backup-chunks/' in path and proxy.fail.is_set():
                 proxy.failed_uploads += 1
                 self.send_response(503)
@@ -209,6 +218,8 @@ def main():
     proxy.delete_release = threading.Event()
     proxy.pause_snapshot = threading.Event()
     proxy.snapshot_pending = threading.Event()
+    proxy.snapshot_attempts = 0
+    proxy.snapshot_bodies = {}
     proxy.snapshot_release = threading.Event()
     proxy.drop_renewal = threading.Event()
     proxy.fail = threading.Event()
@@ -444,6 +455,8 @@ def main():
                 time.sleep(2)
         generations = []
         extended_relation = None
+        fault_commits = 0
+        next_fault_id = 1000
         if args.renewals:
             sql(sock, "CREATE TABLE renewal_data(id int PRIMARY KEY, n int, pad text); INSERT INTO renewal_data SELECT i,0,repeat(md5(i::text),32) FROM generate_series(1,2000) i")
             sql(sock, 'CREATE TABLE extension_probe(id int); INSERT INTO extension_probe VALUES(1)')
@@ -460,6 +473,12 @@ def main():
                     with relation.open('ab') as output:
                         output.write(bytes(16 * 8192))
                     extended_relation = (name, length)
+                if args.upload_faults and cycle < 2:
+                    proxy.snapshot_pending.clear()
+                    proxy.snapshot_attempts = 0
+                    proxy.snapshot_bodies.clear()
+                if args.upload_faults and cycle == 1:
+                    proxy.fail.set()
                 if cycle == 0:
                     proxy.pause_snapshot.set()
                     proxy.drop_renewal.set()
@@ -469,8 +488,24 @@ def main():
                     sql(sock, f'UPDATE renewal_data SET n={cycle+1} WHERE id<=10; SELECT pg_switch_wal()')
                     # Once paused, exercise the concurrent commit immediately;
                     # extra segment switches only consume the fault deadline.
-                    if cycle == 0 and proxy.snapshot_pending.is_set():
+                    if (cycle == 0 or (args.upload_faults and cycle == 1)) and proxy.snapshot_pending.is_set():
                         break
+                if args.upload_faults and cycle < 2:
+                    assert proxy.snapshot_pending.wait(30), 'fault did not reach a snapshot upload'
+                    until = time.monotonic() + (20 if cycle == 0 else 8)
+                    while time.monotonic() < until:
+                        sql(sock, f'INSERT INTO created_here VALUES ({next_fault_id})')
+                        expected_ids.add(next_fault_id)
+                        next_fault_id += 1
+                        fault_commits += 1
+                        time.sleep(.2)
+                    assert proxy.snapshot_attempts > 3, 'longer snapshot retry allowance was not exercised'
+                    assert len(proxy.snapshot_bodies) == 1, 'retry started new snapshot objects'
+                    assert json.loads(head()).get('generation', 0) == generation, 'incomplete snapshot selected'
+                    if cycle == 1:
+                        # Recover the upload without restarting compute. The
+                        # original capture must finish and retire old WAL.
+                        proxy.fail.clear()
                 if cycle == 0:
                     assert proxy.snapshot_pending.wait(30), 'renewal upload never started'
                     # This commit must complete while snapshot upload is paused.
@@ -600,7 +635,7 @@ def main():
             ready(again, again_sock)
             assert sql(again_sock, "SELECT string_agg(id::text,',' ORDER BY id) FROM created_here") == ','.join(map(str,sorted(expected_ids)))
             assert sql(again_sock, 'SELECT sum(n) FROM renewal_data') == str((args.renewals+1)*10)
-        print(json.dumps(dict(result='passed', prefix=prefix, partial_creation_refused=True, crashes=crash_results, startup_faults=args.startup_faults, failed_upload_no_head=True,
+        print(json.dumps(dict(result='passed', prefix=prefix, partial_creation_refused=True, upload_fault_commits=fault_commits, crashes=crash_results, startup_faults=args.startup_faults, failed_upload_no_head=True,
                               concurrent_creators_one_winner=True, lost_initial_response=True,
                               sql_closed_before_publication=True, recovered_committed_row=42,
                               rollback_absent=True, recovery_continued=True, renewal_generations=generations, interrupted_export_recovered=bool(args.renewals), interrupted_retirement_recovered=bool(args.renewals))), flush=True)

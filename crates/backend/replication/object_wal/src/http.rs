@@ -4,6 +4,50 @@ use std::io::Read;
 use std::time::Duration;
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
+
+// Keep transport failures distinguishable from ownership, permission and
+// integrity errors without retaining HTTP errors containing signed URLs.
+#[derive(Debug, PartialEq, Eq)]
+enum RequestFailure {
+    Transient,
+    Refused,
+}
+impl std::fmt::Display for RequestFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Transient => "S3 request temporarily failed or its result is unknown",
+            Self::Refused => "S3 request was refused",
+        })
+    }
+}
+impl std::error::Error for RequestFailure {}
+
+fn retry_snapshot<T>(
+    mut operation: impl FnMut() -> Result<T>,
+    mut pause: impl FnMut(i64) -> Result<()>,
+    mut now: impl FnMut() -> i64,
+) -> Result<T> {
+    let started = now();
+    let mut delay = 250;
+    loop {
+        match operation() {
+            Err(error)
+                if error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::Transient) =>
+            {
+                let remaining = 60_000 - (now() - started);
+                if remaining <= 0 {
+                    return Err(error);
+                }
+                pause(delay.min(remaining))?;
+                if now() - started >= 60_000 {
+                    return Err(error);
+                }
+                delay = (delay * 2).min(4_000);
+            }
+            result => return result,
+        }
+    }
+}
 #[derive(Clone, PartialEq, Eq)]
 pub struct Object {
     pub body: Vec<u8>,
@@ -15,6 +59,7 @@ pub struct Store {
     credentials: Credentials,
     agent: ureq::Agent,
     prefix: String,
+    snapshot_retries: bool,
 }
 impl Store {
     pub fn new(endpoint: &str, bucket: String, region: String, prefix: String) -> Result<Self> {
@@ -53,7 +98,12 @@ impl Store {
                 .timeout(deadline)
                 .build(),
             prefix,
+            snapshot_retries: false,
         })
+    }
+    pub fn retry_snapshot_uploads(mut self) -> Self {
+        self.snapshot_retries = true;
+        self
     }
     fn request(
         &self,
@@ -90,7 +140,7 @@ impl Store {
                 r.into_reader()
                     .take(65537)
                     .read_to_end(&mut bytes)
-                    .map_err(|_| "S3 response interrupted")?;
+                    .map_err(|_| RequestFailure::Transient)?;
                 if bytes.len() <= 65536
                     && String::from_utf8_lossy(&bytes).contains("<Code>NoSuchKey</Code>")
                 {
@@ -98,8 +148,13 @@ impl Store {
                 }
                 return Err("S3 bucket missing or inaccessible".into());
             }
+            Err(ureq::Error::Transport(_))
+            | Err(ureq::Error::Status(408 | 409 | 429 | 500..=599, _)) => {
+                return Err(RequestFailure::Transient.into());
+            }
+            Err(ureq::Error::Status(412, _)) => return Err("S3 precondition failed".into()),
             // Do not expose HTTP errors: signed URLs carry credentials.
-            Err(_) => return Err("S3 request failed or its result is unknown".into()),
+            Err(_) => return Err(RequestFailure::Refused.into()),
         };
         if response.status() != 200 {
             return Err("unexpected S3 status".into());
@@ -113,7 +168,7 @@ impl Store {
             .into_reader()
             .take((MAX_BODY + 1) as u64)
             .read_to_end(&mut bytes)
-            .map_err(|_| "S3 response interrupted")?;
+            .map_err(|_| RequestFailure::Transient)?;
         if bytes.len() > MAX_BODY {
             return Err("oversized S3 response".into());
         }
@@ -135,9 +190,17 @@ impl Store {
             .ok_or_else(|| "required S3 object is missing".into())
     }
     pub fn conditional(&self, key: &str, body: &[u8], prior: Option<&Object>) -> Result<Object> {
+        let mut last_error = None;
         for _ in 0..3 {
-            if let Ok(Some(o)) = self.request(key, Some(body), prior.map(|o| o.etag.as_str())) {
-                return Ok(o);
+            match self.request(key, Some(body), prior.map(|o| o.etag.as_str())) {
+                Ok(Some(o)) => return Ok(o),
+                Ok(None) => return Err("S3 PUT returned no object".into()),
+                Err(error)
+                    if error.downcast_ref::<RequestFailure>() == Some(&RequestFailure::Refused) =>
+                {
+                    return Err(error);
+                }
+                Err(error) => last_error = Some(error),
             }
             let current = self.get(key)?;
             if let Some(o) = &current {
@@ -149,11 +212,41 @@ impl Store {
                 return Err("S3 ownership conflict; refusing to rebase publication".into());
             }
         }
-        Err("S3 conditional publication remains unresolved".into())
+        Err(last_error.expect("publication attempted three times"))
     }
     pub fn immutable(&self, kind: &str, body: &[u8]) -> Result<String> {
         let key = digest(body);
-        self.conditional(&format!("{kind}/{key}"), body, None)?;
+        let name = format!("{kind}/{key}");
+        if self.snapshot_retries {
+            let mut warned = false;
+            // Retry the identical object, not the export: its capture, salt and
+            // content address survive an outage, so retries create no new names.
+            retry_snapshot(
+                || {
+                    postgres_seams::check_for_interrupts::call()?;
+                    self.conditional(&name, body, None)
+                },
+                |ms| {
+                    if !warned {
+                        elog::elog(
+                            types_error::WARNING,
+                            "retrying transient S3 snapshot upload failure",
+                        )?;
+                        warned = true;
+                    }
+                    latch::ResetLatch(
+                        init_small::globals::MyLatch().ok_or("snapshot worker has no latch")?,
+                    );
+                    postgres_seams::check_for_interrupts::call()?;
+                    crate::wait(ms)?;
+                    postgres_seams::check_for_interrupts::call()?;
+                    Ok(())
+                },
+                pg_clock::mono_ms,
+            )?;
+        } else {
+            self.conditional(&name, body, None)?;
+        }
         Ok(key)
     }
     pub fn delete(&self, key: &str) -> Result<()> {
@@ -321,6 +414,7 @@ mod tests {
                 .timeout(Duration::from_secs(2))
                 .build(),
             prefix: "test/".into(),
+            snapshot_retries: false,
         };
         (store, thread)
     }
@@ -424,5 +518,101 @@ mod tests {
         assert_eq!(calls[0].1, calls[2].1);
         assert!(calls[0].0.to_lowercase().contains("if-match: old-tag"));
         assert!(calls[2].0.to_lowercase().contains("if-match: old-tag"));
+    }
+    #[test]
+    fn snapshot_retry_reuses_object_after_throttling_and_lost_response() {
+        let absent = Some((404, "unused", "<Code>NoSuchKey</Code>"));
+        let mut replies = Vec::new();
+        for status in [503, 429, 503, 409] {
+            replies.extend([Some((status, "unused", "")), absent]);
+        }
+        replies.extend([None, Some((200, "landed", "payload"))]);
+        let (s, t) = fixture(replies);
+        let clock = std::cell::Cell::new(0);
+        let result = retry_snapshot(
+            || s.conditional("backup-chunks/fixed", b"payload", None),
+            |ms| {
+                clock.set(clock.get() + ms);
+                Ok(())
+            },
+            || clock.get(),
+        )
+        .unwrap();
+        assert_eq!(result.body, b"payload");
+        assert!(clock.get() > 0);
+        let requests = t.join().unwrap();
+        let puts = requests
+            .iter()
+            .filter(|(h, _)| h.starts_with("PUT "))
+            .collect::<Vec<_>>();
+        assert_eq!(puts.len(), 5);
+        for (headers, body) in puts {
+            assert!(headers.starts_with("PUT /test/test/backup-chunks/fixed?"));
+            assert!(headers.to_lowercase().contains("if-none-match: *"));
+            assert_eq!(body, b"payload");
+        }
+    }
+    #[test]
+    fn snapshot_retry_is_bounded_and_interruptible() {
+        let clock = std::cell::Cell::new(0);
+        let attempts = std::cell::Cell::new(0);
+        let result: Result<()> = retry_snapshot(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(RequestFailure::Transient.into())
+            },
+            |ms| {
+                assert!((1..=4000).contains(&ms));
+                clock.set(clock.get() + ms);
+                Ok(())
+            },
+            || clock.get(),
+        );
+        assert_eq!(
+            result.unwrap_err().downcast_ref::<RequestFailure>(),
+            Some(&RequestFailure::Transient)
+        );
+        assert_eq!(clock.get(), 60_000);
+        assert!(attempts.get() > 3 && attempts.get() < 30);
+        let mut attempts = 0;
+        let result: Result<()> = retry_snapshot(
+            || {
+                attempts += 1;
+                Err(RequestFailure::Transient.into())
+            },
+            |_| Err("shutdown requested".into()),
+            || 0,
+        );
+        assert_eq!(result.unwrap_err().to_string(), "shutdown requested");
+        assert_eq!(attempts, 1);
+    }
+    #[test]
+    fn permission_errors_do_not_get_snapshot_grace_period() {
+        let (s, t) = fixture(vec![Some((403, "unused", ""))]);
+        let result = retry_snapshot(
+            || s.conditional("backup-chunks/fixed", b"payload", None),
+            |_| panic!("permission failure must not get extended retries"),
+            || 0,
+        );
+        assert!(result.is_err());
+        assert_eq!(t.join().unwrap().len(), 1);
+    }
+    #[test]
+    fn snapshot_policy_does_not_extend_head_publication() {
+        let (mut s, t) =
+            fixture([Some((503, "unused", "")), Some((200, "old", "prior"))].repeat(3));
+        s.snapshot_retries = true;
+        assert!(
+            s.conditional(
+                "head",
+                b"new",
+                Some(&Object {
+                    body: b"prior".to_vec(),
+                    etag: "old".into()
+                })
+            )
+            .is_err()
+        );
+        assert_eq!(t.join().unwrap().len(), 6);
     }
 }

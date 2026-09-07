@@ -33,6 +33,7 @@ def main():
     pg = P(a.pg_bin)
     server = P(a.server).resolve()
     prefix = 'native-' + uuid.uuid4().hex + '/'
+    (root / 'prefix').write_text(prefix)
     env = os.environ.copy()
     env.update(AWS_ACCESS_KEY_ID='minioadmin', AWS_SECRET_ACCESS_KEY='minioadmin', AWS_DEFAULT_REGION='us-east-1', PGRUST_PGSHAREDIR=a.sharedir, PGRUST_TZDIR='/usr/share/zoneinfo', RUST_MIN_STACK='33554432', PGCONNECT_TIMEOUT='2')
     env.pop('AWS_SESSION_TOKEN', None)
@@ -55,13 +56,12 @@ def main():
         aws('put-object', '--bucket', a.bucket, '--key', prefix + key, '--body', path, '--if-none-match', '*')
         path.unlink()
 
+    seed = root / 'seed'
     def imm(kind, b):
         key = digest(b)
-        try:
-            put(kind + '/' + key, b)
-        except subprocess.CalledProcessError as e:
-            if 'PreconditionFailed' not in e.stderr:
-                raise
+        path = seed / kind / key
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b)
         return key
 
     def head():
@@ -217,6 +217,11 @@ def main():
         mbytes = mbody+b'"Manifest-Checksum":"'+digest(mbody).encode()+b'"}\n'
         info = dict(version=2, cluster=system, timeline=1, start=start, end=lsn(ranges[0]['End-LSN']), manifest=digest(mbytes), anchor=tail, archive_start=base, seed_end=end, seed_record_start=record, root_history=None, image=imm('snapshot-index', encode(image)))
         backup = imm('backups', encode(info))
+        # Independent fixture data goes into a fresh, private prefix in one
+        # CLI invocation. Publish the conditional head only after every object.
+        run(['aws', '--endpoint-url', a.endpoint, 's3', 'cp', seed,
+             f's3://{a.bucket}/{prefix}', '--recursive', '--only-show-errors'])
+        shutil.rmtree(seed)
         put('head', encode(dict(version=2, cluster=system, timeline=1, start=base, end=end, record_start=record, tail=tail, backup=backup, epoch=uuid.uuid4().hex, revision=uuid.uuid4().hex)))
         relation = source_sql("SELECT pg_relation_filepath('sparse')")
         reads = re.findall(r'base backup file '+re.escape(str(P(relation).parent / ('INCREMENTAL.'+P(relation).name)))+r': source bytes read (\d+), output bytes (\d+)', (root/'source.log').read_text())

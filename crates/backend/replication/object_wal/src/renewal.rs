@@ -72,11 +72,14 @@ fn export(store: &Store, head: &Value) -> Result<Prepared> {
     let parent = Image::load(store, text(&old, "image")?)?;
     let manifest = parent.manifest();
     let capture = create::capture(Some(&manifest))?;
-    let image = crate::image::export(store, &capture, Some(&parent))?;
+    // Only immutable payload/index uploads get the longer retry allowance.
+    // Capture and selection are not restarted, and WAL keeps its own worker.
+    let uploads = store.clone().retry_snapshot_uploads();
+    let image = crate::image::export(&uploads, &capture, Some(&parent))?;
     Ok(Prepared {
         old_objects,
         new_objects: image.objects(),
-        image: image.save(store)?,
+        image: image.save(&uploads)?,
         manifest: digest(&image.manifest()),
         start: capture.start,
         end: capture.end,
