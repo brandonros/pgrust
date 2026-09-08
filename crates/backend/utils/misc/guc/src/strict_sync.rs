@@ -1,5 +1,6 @@
 //! Startup-only policy for the existing synchronous completion barrier.
 //! Reuse GUC's POSTMASTER checks, including RESET, reload and child stores.
+//! synchronous_commit also permits validation and unchanged runtime assignments.
 
 use types_error::{PgResult, FATAL};
 use types_guc::{GucContext, PGC_POSTMASTER};

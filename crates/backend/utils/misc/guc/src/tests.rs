@@ -157,6 +157,93 @@ fn postmaster_param_cannot_change_at_runtime() {
 }
 
 #[test]
+fn strict_commit_allows_only_unchanged_runtime_assignments() {
+    setup();
+    with_store_mut(|reg| {
+        reg.find_option_mut("synchronous_commit").unwrap().gen_mut().context = PGC_POSTMASTER;
+    }).unwrap();
+    for value in [Some("on"), Some("ON"), None] {
+        for action in [GUC_ACTION_SET, GUC_ACTION_LOCAL, GUC_ACTION_SAVE] {
+            assert_eq!(set_config_option_ext(
+                "SYNCHRONOUS_COMMIT", value, PGC_USERSET, PGC_S_SESSION,
+                BOOTSTRAP_SUPERUSERID, action, true, ErrorLevel(0), false,
+            ).unwrap(), -1);
+        }
+    }
+    for value in ["off", "local", "remote_write", "remote_apply"] {
+        assert!(set_session("synchronous_commit", Some(value)).unwrap_err()
+            .message().contains("cannot be changed"));
+    }
+    with_store_mut(|reg| {
+        let record = reg.find_option_mut("synchronous_commit").unwrap();
+        assert!(record.gen().stack.is_none());
+        assert_eq!(record.gen().source, PGC_S_DEFAULT);
+        assert_eq!(record.gen().status & crate::model::GUC_PENDING_RESTART, 0);
+        // RESET must not weaken a remote_apply startup policy to the boot default.
+        let GucVariable::Enum(record) = record else { unreachable!() };
+        record.value = Some(types_core::xact::SYNCHRONOUS_COMMIT_REMOTE_APPLY);
+    }).unwrap();
+    assert!(set_session("synchronous_commit", None).unwrap_err()
+        .message().contains("cannot be changed"));
+    assert_eq!(show("synchronous_commit").as_deref(), Some("remote_apply"));
+}
+
+#[test]
+fn strict_commit_validation_does_not_assign() {
+    setup();
+    with_store_mut(|reg| {
+        reg.find_option_mut("synchronous_commit").unwrap().gen_mut().context = PGC_POSTMASTER;
+    }).unwrap();
+    for value in ["on", "off", "local", "remote_write", "remote_apply", "foobar"] {
+        let result = set_config_option_ext(
+            "synchronous_commit", Some(value), PGC_BACKEND, PGC_S_TEST,
+            BOOTSTRAP_SUPERUSERID, GUC_ACTION_SET, false, ErrorLevel(0), false,
+        );
+        if value == "foobar" {
+            assert!(result.unwrap_err().message().contains("invalid value for parameter"));
+        } else {
+            assert_eq!(result.unwrap(), -1);
+        }
+        assert_eq!(show("synchronous_commit").as_deref(), Some("on"));
+    }
+}
+
+#[test]
+fn strict_commit_rejects_reload_and_captured_changes() {
+    setup();
+    set_session("synchronous_commit", Some("off")).unwrap();
+    let captured = crate::store::capture_session_gucs();
+    set_session("synchronous_commit", Some("on")).unwrap();
+    with_store_mut(|reg| {
+        reg.find_option_mut("synchronous_commit").unwrap().gen_mut().context = PGC_POSTMASTER;
+        for exact in [false, true] {
+            let mut hooks = Vec::new();
+            let cap = captured.iter().find(|c| c.name() == "synchronous_commit").unwrap();
+            assert!(crate::registry::bind_captured_guc(reg, cap, &mut hooks, exact)
+                .unwrap_err().message().contains("cannot be changed"));
+            assert!(hooks.is_empty());
+        }
+    }).unwrap();
+    assert!(set_config_option_ext(
+        "synchronous_commit", Some("off"), PGC_BACKEND, PGC_S_DATABASE,
+        BOOTSTRAP_SUPERUSERID, GUC_ACTION_SET, true, types_error::ERROR, false,
+    ).unwrap_err().message().contains("cannot be changed"));
+    assert_eq!(GetConfigOptionResetString("synchronous_commit").as_deref(), Some("on"));
+    for value in ["on", "off"] {
+        let result = set_config_option_ext(
+            "synchronous_commit", Some(value), PGC_SIGHUP, PGC_S_FILE,
+            BOOTSTRAP_SUPERUSERID, GUC_ACTION_SET, true, types_error::ERROR, true,
+        );
+        if value == "on" {
+            assert_eq!(result.unwrap(), -1);
+        } else {
+            assert!(result.unwrap_err().message().contains("cannot be changed"));
+        }
+        assert_eq!(show("synchronous_commit").as_deref(), Some("on"));
+    }
+}
+
+#[test]
 fn sighup_reread_of_postmaster_param() {
     setup();
     let same = set_config_option_ext(

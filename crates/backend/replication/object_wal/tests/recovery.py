@@ -278,12 +278,16 @@ def main():
             assert got == ('1,2,3' if n == 1 else '1,2,3,5,7,8'), got
             assert sql(socket, 55440, "SELECT md5(string_agg(id::text || body,'' ORDER BY id)) FROM sparse") == expected
             if n == 1:
+                assert sql(socket, 55440, 'SET synchronous_commit=on; RESET synchronous_commit; '
+                           'BEGIN; SET LOCAL synchronous_commit=on; COMMIT; '
+                           'SHOW synchronous_commit').splitlines()[-1] == 'on'
                 external = root / 'external-tablespace'
                 external.mkdir()
                 for query, message in [
                     (f"CREATE TABLESPACE outside LOCATION '{external}'", 'tablespaces are not supported'),
                     ("CREATE TABLESPACE inside LOCATION ''", 'tablespaces are not supported'),
                     ('SET synchronous_commit=off', 'cannot be changed'),
+                    ("SELECT set_config('synchronous_commit','local',false)", 'cannot be changed'),
                     ('SET fsync=off', 'cannot be changed'),
                     ('SET restart_after_crash=on', 'cannot be changed'),
                     ("SET synchronous_standby_names='replacement'", 'cannot be changed'),

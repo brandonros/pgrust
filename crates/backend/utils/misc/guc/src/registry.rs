@@ -358,7 +358,7 @@ fn check_can_set(
         PGC_POSTMASTER => {
             if context == PGC_SIGHUP {
                 // prohibitValueChange: handled after canonicalizing the value.
-            } else if context != PGC_POSTMASTER {
+            } else if context != PGC_POSTMASTER && name != "synchronous_commit" {
                 return Ok(AccessCheck::Reject(err(
                     ERRCODE_CANT_CHANGE_RUNTIME_PARAM,
                     format!("parameter \"{name}\" cannot be changed without restarting the server"),
@@ -1054,12 +1054,18 @@ pub fn set_config_option(
         }
     };
 
-    // Re-reading a PGC_POSTMASTER variable from postgresql.conf under SIGHUP.
+    // Strict completion freezes synchronous_commit's value, but still permits
+    // validation-only calls and assignments of its current, parsed value.
     let prohibit_value_change =
-        reg.vars[idx].gen().context == PGC_POSTMASTER && orig_context == PGC_SIGHUP;
+        reg.vars[idx].gen().context == PGC_POSTMASTER
+            && (orig_context == PGC_SIGHUP
+                || (name.eq_ignore_ascii_case("synchronous_commit")
+                    && orig_context != PGC_POSTMASTER && (change_val || make_default)));
     if prohibit_value_change {
         if current_value_differs(&reg.vars[idx], &newval) {
-            reg.vars[idx].gen_mut().status |= GUC_PENDING_RESTART;
+            if orig_context == PGC_SIGHUP {
+                reg.vars[idx].gen_mut().status |= GUC_PENDING_RESTART;
+            }
             return reject(
                 elevel,
                 err(
@@ -1068,7 +1074,9 @@ pub fn set_config_option(
                 ),
             );
         }
-        reg.vars[idx].gen_mut().status &= !GUC_PENDING_RESTART;
+        if orig_context == PGC_SIGHUP {
+            reg.vars[idx].gen_mut().status &= !GUC_PENDING_RESTART;
+        }
         return Ok(-1);
     }
 
@@ -1336,9 +1344,15 @@ pub(crate) fn bind_captured_guc(
         change_val = false;
     }
 
-    if reg.vars[idx].gen().context == PGC_POSTMASTER && cap.scontext == PGC_SIGHUP {
+    if reg.vars[idx].gen().context == PGC_POSTMASTER
+        && (cap.scontext == PGC_SIGHUP
+            || (cap.name.eq_ignore_ascii_case("synchronous_commit")
+                && cap.scontext != PGC_POSTMASTER))
+    {
         if current_value_differs(&reg.vars[idx], &cap.val) {
-            reg.vars[idx].gen_mut().status |= GUC_PENDING_RESTART;
+            if cap.scontext == PGC_SIGHUP {
+                reg.vars[idx].gen_mut().status |= GUC_PENDING_RESTART;
+            }
             return reject(
                 elevel,
                 err(
@@ -1351,7 +1365,9 @@ pub(crate) fn bind_captured_guc(
             )
             .map(drop);
         }
-        reg.vars[idx].gen_mut().status &= !GUC_PENDING_RESTART;
+        if cap.scontext == PGC_SIGHUP {
+            reg.vars[idx].gen_mut().status &= !GUC_PENDING_RESTART;
+        }
         return Ok(());
     }
 
