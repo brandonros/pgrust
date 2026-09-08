@@ -70,6 +70,14 @@ pub(crate) fn KeepLogSeg(recptr: XLogRecPtr, log_seg_no: &mut XLogSegNo) -> PgRe
     let keep = ctl.info_lck.with(|| ctl.replicationSlotMinLSN.load(Relaxed));
     let slot_horizon_capped = keep_log_seg_with(recptr, log_seg_no, keep);
 
+    // Strict durability cannot be revoked by dropping/invalidating a slot or
+    // by max_slot_wal_keep_size. Keep the confirmed segment too: a receiver
+    // must be able to reconnect at the exact confirmed byte offset.
+    if guc_tables::backing::pgrust_strict_synchronous_commit() {
+        let confirmed = syncrep_seams::sync_rep_confirmed_flush_lsn::call();
+        *log_seg_no = (*log_seg_no).min(XLByteToSeg(confirmed, wal_segment_size()).max(1));
+    }
+
     // C applies this clamp between the slot cap and wal_keep_size; all three
     // only lower segno, so applying it after keep_log_seg_with is equivalent.
     let unsummarized = walsummarizer_seams::get_oldest_unsummarized_lsn::call()?;
@@ -137,6 +145,9 @@ pub(crate) fn XLogFromFileName(fname: &str, wal_segsz: i32) -> (TimeLineID, XLog
 }
 
 pub fn XLogGetOldestSegno(tli: TimeLineID) -> PgResult<XLogSegNo> {
+    if xlogutils::memory_wal::enabled() {
+        return Ok(xlogutils::memory_wal::oldest_segment(tli));
+    }
     let mut oldest_segno: XLogSegNo = 0;
     let xldir = fd::AllocateDir(XLOGDIR)?;
     while let Some(xlde) = fd::ReadDir(xldir, XLOGDIR)? {
@@ -189,6 +200,12 @@ pub(crate) fn RemoveOldXlogFiles(
     endptr: XLogRecPtr,
     insert_tli: TimeLineID,
 ) -> PgResult<()> {
+    if xlogutils::memory_wal::enabled() {
+        if let Some(removed) = xlogutils::memory_wal::retire_through(segno) {
+            UpdateLastRemovedPtr(&XLogFileName(insert_tli, removed, wal_segment_size()));
+        }
+        return Ok(());
+    }
     let wal_segsz = wal_segment_size();
     let mut endlog_seg_no = XLByteToSeg(endptr, wal_segsz);
     let recycle_seg_no = XLOGfileslop(lastredoptr);

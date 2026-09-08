@@ -2227,6 +2227,24 @@ pub fn WALRead<R: XLogSegmentRoutine>(
     mut tli: TimeLineID,
 ) -> PgResult<Result<(), WALReadError>> {
     debug_assert!(buf.len() >= count);
+    if xlogutils::memory_wal::enabled() {
+        if !xlogutils::memory_wal::read(tli, startptr, &mut buf[..count]) {
+            // A streaming reader can request a segment that checkpoint cleanup
+            // has retired. Preserve WALRead's ordinary I/O error contract.
+            let mut segment = v.seg;
+            segment.ws_tli = tli;
+            segment.ws_segno = startptr / v.segcxt.ws_segsize as u64;
+            return Ok(Err(WALReadError {
+                wre_errno: libc::ENOENT,
+                wre_off: (startptr % v.segcxt.ws_segsize as u64) as i32,
+                wre_req: count.min(i32::MAX as usize) as i32,
+                wre_read: -1,
+                wre_seg: segment,
+            }));
+        }
+        v.seg.ws_tli = tli;
+        return Ok(Ok(()));
+    }
     let mut recptr = startptr;
     let mut nbytes = count;
     let mut p: usize = 0;

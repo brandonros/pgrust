@@ -16,6 +16,7 @@ pub mod registry;
 pub mod report;
 pub mod select;
 pub mod store;
+pub mod strict_sync;
 pub mod units;
 
 #[cfg(test)]

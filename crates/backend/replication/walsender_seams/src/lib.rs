@@ -58,6 +58,11 @@ seam_core::seam!(
     pub fn base_backup(cmd: repl_gram::BaseBackupCmd) -> types_error::PgResult<()>
 );
 
+seam_core::seam!(
+    // Native manifest upload; session state is owned by basebackup.
+    pub fn upload_manifest() -> types_error::PgResult<()>
+);
+
 /// Marshal shape for pg_stat_get_wal_senders (walsender.c:3914): one live
 /// WalSnd slot's spinlock-guarded fields plus its sync-standby classification.
 /// LSNs are XLogRecPtr (u64), lags are TimeOffset (µs, -1 = unknown/null),
@@ -103,4 +108,9 @@ seam_core::seam!(
     // lives in the walsender crate, so slot.c's caller reaches it through
     // this seam. Installed by walsender.
     pub fn wait_for_standby_confirmation(wait_for_lsn: u64) -> types_error::PgResult<()>
+);
+
+seam_core::seam!(
+    // Native backup exporter to a caller-owned sink; no replication connection.
+    pub fn export_base_backup<'mcx>(mcx: mcx::Mcx<'mcx>, sink: Box<sink::Bbsink<'mcx>>, previous_manifest: Option<&[u8]>) -> types_error::PgResult<()>
 );

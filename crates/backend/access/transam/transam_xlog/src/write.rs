@@ -279,6 +279,11 @@ fn XLogFileInitInternal(
 }
 
 pub fn XLogFileInit(logsegno: XLogSegNo, logtli: TimeLineID) -> PgResult<i32> {
+    if xlogutils::memory_wal::enabled() {
+        ereport(PANIC).errmsg("file WAL requested in memory WAL mode")
+            .finish(loc("memory_wal_file_guard"))?;
+        unreachable!("memory WAL file guard is a native PANIC");
+    }
     let mut ignore_added = false;
     let mut path = String::new();
     let f = XLogFileInitInternal(logsegno, logtli, &mut ignore_added, &mut path)?;
@@ -402,6 +407,11 @@ pub(crate) fn XLogFileCopy(
 }
 
 pub fn XLogFileOpen(segno: XLogSegNo, tli: TimeLineID) -> PgResult<i32> {
+    if xlogutils::memory_wal::enabled() {
+        ereport(PANIC).errmsg("file WAL requested in memory WAL mode")
+            .finish(loc("memory_wal_file_guard"))?;
+        unreachable!("memory WAL file guard is a native PANIC");
+    }
     let path = XLogFilePath(tli, segno, wal_segment_size());
     match fd::BasicOpenFile(&path, libc::O_RDWR | libc::O_CLOEXEC | get_sync_bit(wal_sync_method()))
     {
@@ -429,7 +439,7 @@ fn XLogFileClose() -> PgResult<()> {
 }
 
 pub(crate) fn PreallocXlogFiles(endptr: XLogRecPtr, tli: TimeLineID) -> PgResult<()> {
-    if !XLogCtl().InstallXLogFileSegmentActive.load(Relaxed) {
+    if xlogutils::memory_wal::enabled() || !XLogCtl().InstallXLogFileSegmentActive.load(Relaxed) {
         return Ok(());
     }
     let wal_segsz = wal_segment_size();
@@ -482,21 +492,25 @@ pub(crate) fn XLogWrite(write_rqst: (XLogRecPtr, XLogRecPtr), tli: TimeLineID, f
         ispartialpage = rqst_write < lw_write;
 
         let wal_segsz = wal_segment_size();
-        if !XLByteInPrevSeg(lw_write, OPEN_LOG_SEG_NO.get(), wal_segsz) {
-            debug_assert_eq!(npages, 0);
-            if OPEN_LOG_FILE.get() >= 0 {
-                XLogFileClose()?;
+        if xlogutils::memory_wal::enabled() {
+            OPEN_LOG_SEG_NO.set(XLByteToPrevSeg(lw_write, wal_segsz));
+        } else {
+            if !XLByteInPrevSeg(lw_write, OPEN_LOG_SEG_NO.get(), wal_segsz) {
+                debug_assert_eq!(npages, 0);
+                if OPEN_LOG_FILE.get() >= 0 {
+                    XLogFileClose()?;
+                }
+                OPEN_LOG_SEG_NO.set(XLByteToPrevSeg(lw_write, wal_segsz));
+                OPEN_LOG_TLI.set(tli);
+                OPEN_LOG_FILE.set(XLogFileInit(OPEN_LOG_SEG_NO.get(), tli)?);
+                fd::ReserveExternalFD()?;
             }
-            OPEN_LOG_SEG_NO.set(XLByteToPrevSeg(lw_write, wal_segsz));
-            OPEN_LOG_TLI.set(tli);
-            OPEN_LOG_FILE.set(XLogFileInit(OPEN_LOG_SEG_NO.get(), tli)?);
-            fd::ReserveExternalFD()?;
-        }
-        if OPEN_LOG_FILE.get() < 0 {
-            OPEN_LOG_SEG_NO.set(XLByteToPrevSeg(lw_write, wal_segsz));
-            OPEN_LOG_TLI.set(tli);
-            OPEN_LOG_FILE.set(XLogFileOpen(OPEN_LOG_SEG_NO.get(), tli)?);
-            fd::ReserveExternalFD()?;
+            if OPEN_LOG_FILE.get() < 0 {
+                OPEN_LOG_SEG_NO.set(XLByteToPrevSeg(lw_write, wal_segsz));
+                OPEN_LOG_TLI.set(tli);
+                OPEN_LOG_FILE.set(XLogFileOpen(OPEN_LOG_SEG_NO.get(), tli)?);
+                fd::ReserveExternalFD()?;
+            }
         }
 
         if npages == 0 {
@@ -520,17 +534,28 @@ pub(crate) fn XLogWrite(write_rqst: (XLogRecPtr, XLogRecPtr), tli: TimeLineID, f
                 // THE WAL write hot path — fd::pg_pwrite is an #[inline]
                 // shim chain down to the same libc::pwrite (zero-cost gate:
                 // /asm-diff FileWriteV-class letters).
-                let written = fd::pg_pwrite(
-                    OPEN_LOG_FILE.get(),
-                    unsafe { std::slice::from_raw_parts(from.cast::<u8>(), nleft) },
-                    startoffset as i64,
-                );
-                count_wal_io(
-                    pgstat::io::IOContext::IOCONTEXT_NORMAL,
-                    pgstat::io::IOOp::Write,
-                    io_start,
-                    written.max(0) as u64,
-                );
+                let written = if xlogutils::memory_wal::enabled() {
+                    let position = OPEN_LOG_SEG_NO.get() * wal_segsz as u64 + startoffset as u64;
+                    // Unlike the native full-page file write, copy only bytes
+                    // covered by the insertion wait. Another inserter may be
+                    // changing the unrequested tail of the last partial page.
+                    let valid = nleft.min((rqst_write - position) as usize);
+                    xlogutils::memory_wal::write(tli, position,
+                        unsafe { std::slice::from_raw_parts(from.cast::<u8>(), valid) })?;
+                    nleft as isize
+                } else {
+                    fd::pg_pwrite(OPEN_LOG_FILE.get(),
+                        unsafe { std::slice::from_raw_parts(from.cast::<u8>(), nleft) },
+                        startoffset as i64)
+                };
+                if !xlogutils::memory_wal::enabled() {
+                    count_wal_io(
+                        pgstat::io::IOContext::IOCONTEXT_NORMAL,
+                        pgstat::io::IOOp::Write,
+                        io_start,
+                        written.max(0) as u64,
+                    );
+                }
                 if written <= 0 {
                     let e = std::io::Error::last_os_error();
                     if e.kind() == std::io::ErrorKind::Interrupted {
@@ -554,7 +579,9 @@ pub(crate) fn XLogWrite(write_rqst: (XLogRecPtr, XLogRecPtr), tli: TimeLineID, f
             npages = 0;
 
             if finishing_seg {
-                issue_xlog_fsync(OPEN_LOG_FILE.get(), OPEN_LOG_SEG_NO.get(), tli)?;
+                if !xlogutils::memory_wal::enabled() {
+                    issue_xlog_fsync(OPEN_LOG_FILE.get(), OPEN_LOG_SEG_NO.get(), tli)?;
+                }
                 WalSndWakeupRequest();
                 LOGWRT_RESULT.set((lw_write, lw_write));
 
@@ -597,7 +624,7 @@ pub(crate) fn XLogWrite(write_rqst: (XLogRecPtr, XLogRecPtr), tli: TimeLineID, f
     let (lw_write, lw_flush) = LOGWRT_RESULT.get();
     if lw_flush < rqst_flush && lw_flush < lw_write {
         let method = wal_sync_method();
-        if method != WAL_SYNC_METHOD_OPEN && method != WAL_SYNC_METHOD_OPEN_DSYNC {
+        if !xlogutils::memory_wal::enabled() && method != WAL_SYNC_METHOD_OPEN && method != WAL_SYNC_METHOD_OPEN_DSYNC {
             let wal_segsz = wal_segment_size();
             if OPEN_LOG_FILE.get() >= 0
                 && !XLByteInPrevSeg(lw_write, OPEN_LOG_SEG_NO.get(), wal_segsz)
@@ -630,9 +657,14 @@ pub(crate) fn XLogWrite(write_rqst: (XLogRecPtr, XLogRecPtr), tli: TimeLineID, f
         }
     });
 
+    // In memory mode these native progress positions mean retained/readable,
+    // not durable. Strict SQL completion separately waits for S3 publication.
     // Write published before Flush (readers see Flush trailing Write).
     ctl.logWriteResult.store(lw_write, Release);
     ctl.logFlushResult.store(lw_flush, Release);
+    if guc_tables::backing::pgrust_s3() && syncrep_seams::wake_object_publisher::is_installed() {
+        syncrep_seams::wake_object_publisher::call();
+    }
 
     // Wake up walsenders once the new flush position is published so a woken
     // sender reads the advanced LSN (C wakes after END_CRIT_SECTION).
@@ -977,4 +1009,3 @@ pub(crate) fn open_log_file_close_if_open() -> PgResult<()> {
     }
     Ok(())
 }
-

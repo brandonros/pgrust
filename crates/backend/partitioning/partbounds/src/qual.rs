@@ -1088,6 +1088,9 @@ pub fn fc_satisfies_hash_partition(
                 partcollid,
                 partsupfunc,
             }
+        } else if fcinfo.args[3].isnull {
+            parent.close(NoLock)?;
+            return Ok(Datum::from_bool(false));
         } else {
             let variadic_type = variadic_array_elemtype(fcinfo)?;
             let (typlen, typbyval, typalign) = lsyscache::get_typlenbyvalalign(variadic_type)?;
@@ -1139,6 +1142,9 @@ pub fn fc_satisfies_hash_partition(
             row_hash = hash_combine64(row_hash, hash);
         }
     } else {
+        if fcinfo.args[3].isnull {
+            return Ok(Datum::from_bool(false));
+        }
         let (datums, isnull) = deconstruct_variadic_array(
             fcinfo,
             my.variadic_typlen,
@@ -1238,3 +1244,39 @@ const fn b(foid: Oid, name: &'static str, nargs: i16, func: PGFunction) -> FmgrB
 
 pub const PARTBOUNDS_BUILTINS: &[FmgrBuiltin] =
     &[b(F_SATISFIES_HASH_PARTITION, "satisfies_hash_partition", 4, fc_satisfies_hash_partition)];
+
+#[cfg(test)]
+mod hash_null_tests {
+    use super::*;
+
+    #[test]
+    fn cached_null_array_is_false_but_null_partition_key_still_hashes() {
+        let context = Box::leak(Box::new(mcx::MemoryContext::new("hash null inputs")));
+        for variadic in [true, false] {
+            let mut expr = Node::build::<FuncExpr>(context.mcx()).unwrap();
+            expr.funcvariadic = variadic;
+            let expr = expr.seal();
+            let mut info = FmgrInfo::new(fc_satisfies_hash_partition,
+                                       F_SATISFIES_HASH_PARTITION, 4, false, false);
+            // SAFETY: the expression's context outlives this function info.
+            info.fn_expr = Some(unsafe { types_core::fmgr::FnExprErased::from_node_ref(&expr) });
+            info.set_fn_extra(ColumnsHashData {
+                relid: 42,
+                nkeys: 1,
+                variadic_type: if variadic { INT4OID } else { InvalidOid },
+                variadic_typlen: 4,
+                variadic_typbyval: true,
+                variadic_typalign: b'i' as i8,
+                partcollid: vec![InvalidOid],
+                partsupfunc: vec![FmgrInfo::unresolved()],
+            });
+            let mut call = LocalFcinfo::<4>::new(InvalidOid);
+            call.set_arg(0, Datum::from_oid(42));
+            call.set_arg(1, Datum::from_i32(4));
+            call.set_arg(2, Datum::from_i32(0));
+            call.set_arg_null(3);
+            assert_eq!(info.invoke(&mut call).unwrap().as_bool(), !variadic);
+            assert!(!call.isnull);
+        }
+    }
+}

@@ -46,4 +46,12 @@ tupdesc = { path = "../../access/common/tupdesc" }
 exectuples_output = { path = "../../executor/exectuples_output" }
 varlena = { path = "../../utils/adt/varlena" }
 pqcomm_seams = { path = "../../libpq/pqcomm_seams" }
+pqcomm = { path = "../../libpq/pqcomm" }
+stringinfo = { path = "../../../_support/types/stringinfo" }
+adt_json = { path = "../../utils/adt/json" }
+pg_sha2 = { path = "../../../common/sha2" }
+blkreftable = { path = "../../../common/blkreftable" }
+walsummarizer = { path = "../../postmaster/walsummarizer" }
+timeline = { path = "../../access/transam/timeline" }
+postgres_seams = { path = "../../tcop/postgres_seams" }
 basebackup_target = { path = "../basebackup_target" }

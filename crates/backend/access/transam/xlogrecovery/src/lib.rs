@@ -278,7 +278,7 @@ impl PageSource {
     fn close_read_file(&mut self) {
         if self.read_file >= 0 {
             // read_file is an fd this module opened.
-            fd::pg_close(self.read_file);
+            if !xlogutils::memory_wal::enabled() { fd::pg_close(self.read_file); }
             self.read_file = -1;
         }
     }
@@ -311,6 +311,14 @@ impl PageSource {
     ) -> PgResult<i32> {
         let wal_segsz = transam_xlog::wal_segment_size();
         let fname = transam_xlog::XLogFileName(tli, segno, wal_segsz);
+        if xlogutils::memory_wal::enabled() {
+            if !xlogutils::memory_wal::contains(tli, segno) { return Ok(-1); }
+            self.cur_file_tli = tli;
+            self.read_source = source;
+            RECEIPT_SOURCE.with(|c| c.set(source));
+            // Logical open marker only; close/read bypass OS descriptors in this mode.
+            return Ok(0);
+        }
         let path;
         match source {
             XLogSource::Archive => {
@@ -804,11 +812,15 @@ impl XLogReaderRoutine for PageSource {
             let io_start =
                 pgstat::io::pgstat_prepare_io_time(guc_tables::vars::track_wal_io_timing.read());
             // cur_page is the reader's XLOG_BLCKSZ read buffer.
-            let r = fd::pg_pread(
-                self.read_file,
-                &mut cur_page[..XLOG_BLCKSZ],
-                self.read_off as i64,
-            );
+            let r = if xlogutils::memory_wal::enabled() {
+                if !xlogutils::memory_wal::read(self.cur_file_tli, target_page_ptr, &mut cur_page[..XLOG_BLCKSZ]) {
+                    xlogutils::memory_wal::missing_bytes()?;
+                    unreachable!("missing retained WAL is a native PANIC");
+                }
+                XLOG_BLCKSZ as isize
+            } else {
+                fd::pg_pread(self.read_file, &mut cur_page[..XLOG_BLCKSZ], self.read_off as i64)
+            };
             pgstat::io::pgstat_count_io_op_time(
                 pgstat::io::IOObject::Wal,
                 pgstat::io::IOContext::IOCONTEXT_NORMAL,
@@ -1091,7 +1103,7 @@ fn validate_recovery_parameters() -> PgResult<()> {
                 )
                 .finish(loc("validateRecoveryParameters"));
         }
-    } else if restore_command.is_empty() {
+    } else if restore_command.is_empty() && !xlogutils::memory_wal::enabled() {
         ereport(FATAL)
             .errmsg("must specify \"restore_command\" when standby mode is not enabled")
             .finish(loc("validateRecoveryParameters"))?;

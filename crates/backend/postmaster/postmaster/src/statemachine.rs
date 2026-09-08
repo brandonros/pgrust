@@ -103,8 +103,10 @@ pub(crate) fn HandleFatalError(
     with_pm(|pm| pm.fatal_error = true);
 
     match with_pm(|pm| pm.pm_state) {
-        PMState::PM_INIT | PMState::PM_STARTUP => debug_assert!(false),
-        PMState::PM_RECOVERY
+        PMState::PM_INIT => debug_assert!(false),
+        // Static background workers may fail before startup permits SQL.
+        PMState::PM_STARTUP
+        | PMState::PM_RECOVERY
         | PMState::PM_HOT_STANDBY
         | PMState::PM_RUN
         | PMState::PM_STOP_BACKENDS => UpdatePMState(PMState::PM_WAIT_BACKENDS),
@@ -143,6 +145,15 @@ pub fn process_pm_shutdown_request() -> PgResult<()> {
         FastShutdown
     } else {
         SmartShutdown
+    };
+
+    // A strict waiter has already committed locally and cannot be aborted by
+    // SIGTERM. A fast stop must not depend on an unavailable receiver returning:
+    // use the existing immediate, callback-free crash shutdown for the instance.
+    let mode = if mode == FastShutdown && guc_tables::backing::pgrust_strict_synchronous_commit() {
+        ImmediateShutdown
+    } else {
+        mode
     };
 
     match mode {

@@ -165,8 +165,56 @@ fn require_empty_or_seam(rel: &str, installed: bool, what: &str) {
     }
 }
 
+fn configure_memory_wal() -> PgResult<()> {
+    let marker = data_path("pgrust.memory_wal");
+    let mut info = fd::FileInfo::zeroed();
+    if fd::pg_stat(&marker, &mut info) == 0 {
+        return ereport(FATAL)
+            .errmsg("this directory used memory WAL; discard it and restore from the bucket")
+            .finish(loc("configure_memory_wal"));
+    }
+    if !xlogutils::memory_wal::enabled() { return Ok(()); }
+    if !guc_tables::backing::pgrust_strict_synchronous_commit()
+        || !guc_tables::backing::pgrust_s3() || !xlogutils::memory_wal::initialized()
+        || guc_tables::backing::restart_after_crash()
+        || guc_tables::vars::EnableHotStandby.read()
+        || wal_level() != WAL_LEVEL_REPLICA
+        || XLogArchivingActive()
+        || (!guc_tables::backing::pgrust_s3_create() && fd::pg_stat(&data_path(RECOVERY_SIGNAL_FILE), &mut info) != 0)
+    {
+        return ereport(FATAL)
+            .errmsg("memory WAL requires S3 strict-mode fresh archive recovery, replica WAL, no standby or archiver")
+            .finish(loc("configure_memory_wal"));
+    }
+    // Mark the directory before recovery changes it. Even a clean shutdown does
+    // not make this local image independently recoverable. Native base backup
+    // excludes this run-local marker, so a fresh verified restore can start.
+    let f = fd::BasicOpenFile(&marker, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,)?;
+    if f < 0 { return Err(Box::new(PgError::new(FATAL, "cannot mark memory WAL directory"))); }
+    let sync_result = fd::pg_fsync(f);
+    fd::pg_close(f);
+    if sync_result != 0 {
+        return Err(Box::new(PgError::new(FATAL, "cannot sync memory WAL directory marker")));
+    }
+    fd::fsync_fname(init_small::globals::DataDir().unwrap_or("."), true)?;
+    if guc_tables::backing::pgrust_s3_create() {
+        // The clean checkpoint is already verified and seeded in RAM. Mark the
+        // directory non-restartable before removing initdb's local WAL files.
+        let directory = data_path(XLOGDIR);
+        fd::with_allocated_dir(&directory, &mut |name| {
+            if crate::removal::IsXLogFileName(name) && fd::pg_unlink(&format!("{directory}/{name}")) != 0 {
+                return Err(Box::new(PgError::new(FATAL, "cannot remove seeded local WAL")));
+            }
+            Ok(false)
+        })?;
+    }
+    Ok(())
+}
+
 pub fn StartupXLOG() -> PgResult<()> {
     let ctl = XLogCtl();
+
+    configure_memory_wal()?;
 
     if !XRecOffIsValid(control_file().checkPoint) {
         return ereport(FATAL)
@@ -490,6 +538,7 @@ pub fn StartupXLOG() -> PgResult<()> {
     let insert = &ctl.Insert;
     insert.PrevBytePos.store(XLogRecPtrToBytePos(end_of_recovery_info.lastRec), Relaxed);
     insert.CurrBytePos.store(XLogRecPtrToBytePos(end_of_log), Relaxed);
+    ctl.strictWalStartLSN.store(end_of_log, Relaxed);
 
     if end_of_log % XLOG_BLCKSZ as u64 != 0 {
         let first_idx = XLogRecPtrToBufIdx(end_of_log) as usize;
@@ -760,6 +809,9 @@ fn XLogInitNewTimeline(
     crate::write::UpdateMinRecoveryPoint(InvalidXLogRecPtr, true)?;
 
     let wal_segsz = wal_segment_size();
+    if xlogutils::memory_wal::enabled() {
+        return xlogutils::memory_wal::fork(end_tli, new_tli, end_of_log);
+    }
     let end_log_seg_no = XLByteToPrevSeg(end_of_log, wal_segsz);
     let start_log_seg_no = XLByteToSeg(end_of_log, wal_segsz);
 

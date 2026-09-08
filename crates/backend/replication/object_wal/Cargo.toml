@@ -1,0 +1,44 @@
+[package]
+name = "object_wal"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(pgrust_sim)'] }
+
+[target.'cfg(unix)'.dependencies]
+guc = { path = "../../utils/misc/guc" }
+guc_tables = { path = "../../utils/misc/guc_tables" }
+types_guc = { path = "../../../_support/types/types_guc" }
+init_small = { path = "../../utils/init/init_small" }
+transam_xlog = { path = "../../access/transam/transam_xlog" }
+xlogutils = { path = "../../access/transam/xlogutils" }
+xlogreader = { path = "../../access/transam/xlogreader" }
+xlogreader_seams = { path = "../../access/transam/xlogreader_seams" }
+types_core = { path = "../../../_support/types/types_core" }
+types_error = { path = "../../../_support/types/types_error" }
+types_storage = { path = "../../../_support/types/types_storage" }
+pgsync = { path = "../../../_support/pgsync" }
+mcx = { path = "../../../_support/mcx" }
+pg_sha2 = { path = "../../../common/sha2" }
+pg_strong_random = { path = "../../../port/pg_strong_random" }
+manifest = { path = "../../backup/manifest" }
+controldata_utils = { path = "../../../common/controldata_utils" }
+bgworker = { path = "../../postmaster/bgworker" }
+syncrep_seams = { path = "../syncrep_seams" }
+latch = { path = "../../storage/ipc/latch" }
+elog = { path = "../../utils/error/elog" }
+pg_clock = { path = "../../../port/pg_clock" }
+postgres_seams = { path = "../../tcop/postgres_seams" }
+ureq = { version = "=2.12.1", default-features = false, features = ["tls", "native-certs"] }
+rusty-s3 = "=0.10.2"
+serde_json = "1"
+url = "2"
+libc = "0.2"
+tar = "=0.4.44"
+
+walsender_seams = { path = "../walsender_seams" }
+sink = { path = "../../backup/sink" }
+serde = { version = "1", features = ["derive"] }
+checkpointer_seams = { path = "../../postmaster/checkpointer_seams" }

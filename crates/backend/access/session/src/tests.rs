@@ -806,14 +806,12 @@ fn tls_source_census_and_session_surface_are_pinned() {
     //   The new row touches no file on the `session_sources` tripwire below,
     //   which is correct: that list covers SESSION TLS files and
     //   miscinit/src/tests.rs is not one.
-    // NOTE for whoever merges this to main: the same one declaration lands on a
-    // DIFFERENT absolute total there (562 -> 563 at t56). Re-derive the pin at
-    // the tip it will be enforced against; do not carry this number across.
-    // Re-derived at main's tip, as the NOTE above asks: the pin carried the
-    // donor branch's total and lagged this tree by one (544 -> 545). No
-    // thread_local! declaration has changed since bcda79e; the count there
-    // was already 545.
-    assert_eq!(count_tree(crates), 545, "TLS census changed; classify the delta in SESSION_ENVELOPE_MANIFEST or document it as non-session TLS");
+    // Recounted base tree: 545 blocks. Native incremental manifest input adds
+    // one: basebackup/incremental_manifest.rs UPLOADED/CLEANUP, owned by the
+    // dedicated walsender connection and released by its cleanup callback.
+    // Like the replication slots above, it is not SQL session-envelope state;
+    // the in-process backup exporter accepts its manifest directly instead.
+    assert_eq!(count_tree(crates), 546, "TLS census changed; classify the delta in SESSION_ENVELOPE_MANIFEST or document it as non-session TLS");
     let session_sources = [
         ("backend/access/session/src/lib.rs", 1),
         ("backend/utils/init/init_small/src/globals.rs", 4),

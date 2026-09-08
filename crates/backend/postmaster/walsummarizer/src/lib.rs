@@ -275,6 +275,7 @@ fn run_summarizer(context: &mut MemoryContext) -> PgResult<()> {
         if switch_lsn != InvalidXLogRecPtr && current_lsn >= switch_lsn {
             current_tli = switch_tli;
             current_lsn = switch_lsn;
+            exact = true; // a native timeline fork is a known record/segment boundary
             switch_lsn = InvalidXLogRecPtr;
             switch_tli = 0;
 
@@ -697,6 +698,7 @@ fn SummarizeWAL(
     let summary_start_lsn;
     let mut summary_end_lsn = switch_lsn;
     let mut fast_forward = true;
+    let mut first_record = true;
 
     if exact {
         xlogreader.XLogBeginRead(start_lsn);
@@ -778,7 +780,10 @@ fn SummarizeWAL(
             let rmid = xlogreader.XLogRecGetRmid();
             if rmid == RM_XLOG_ID {
                 if let Some(new_fast_forward) = SummarizeXlogRecord(&xlogreader)? {
-                    if xlogreader.v.ReadRecPtr > summary_start_lsn {
+                    // An exact start may be a segment boundary before its
+                    // page header. ReadRecPtr then advances to the first
+                    // validated record; the header span is not missing WAL.
+                    if !first_record {
                         summary_end_lsn = xlogreader.v.ReadRecPtr;
                         break;
                     } else {
@@ -810,6 +815,7 @@ fn SummarizeWAL(
                 }
             }
 
+            first_record = false;
             summary_end_lsn = xlogreader.v.EndRecPtr;
 
             lock(LW_EXCLUSIVE)?;
