@@ -15,7 +15,7 @@
         assert postgres.version == "18.3";
         {
           inherit pkgs postgres;
-          shell = pkgs.mkShell {
+          shell = pkgs.mkShell ({
             packages = [ postgres postgres.dev pkgs.python3 pkgs.awscli2 pkgs.pkg-config ];
             PG_VERSION = postgres.version;
             PG_BIN = "${postgres}/bin";
@@ -24,7 +24,12 @@
             PG_TEST_SOURCE = "${postgres.src}/src/test";
             PGRUST_PGSHAREDIR = "${postgres}/share/postgresql";
             PGRUST_TZDIR = "${pkgs.tzdata}/share/zoneinfo";
-          };
+          } // pkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
+            # pgrust loads ICU at runtime; match initdb's collation library.
+            DYLD_LIBRARY_PATH = "${pkgs.icu}/lib";
+          } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            LD_LIBRARY_PATH = "${pkgs.icu}/lib";
+          });
         };
     in
     {
