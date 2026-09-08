@@ -47,13 +47,16 @@ pub fn run() -> Result<()> {
             let done = match job {
                 Job::Export { store, head } => Done::Export(export(&store, &head)?),
                 Job::Cleanup { store, head } => {
-                    cleanup(&store, &head)?;
-                    // Recompute native retention now, after the archive floor moved.
+                    // The selected snapshot permits local retirement already.
+                    // Do not pin bounded memory behind paced writes or S3 deletion.
                     if !head["garbage"].is_null() {
                         checkpointer_seams::request_checkpoint::call(
-                            transam_xlog::CHECKPOINT_FORCE | transam_xlog::CHECKPOINT_WAIT,
+                            transam_xlog::CHECKPOINT_FORCE
+                                | transam_xlog::CHECKPOINT_WAIT
+                                | transam_xlog::CHECKPOINT_IMMEDIATE,
                         )?;
                     }
+                    cleanup(&store, &head)?;
                     Done::Cleanup
                 }
             };

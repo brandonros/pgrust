@@ -26,6 +26,7 @@ def main():
     parser.add_argument('--crashes', type=int, default=0)
     parser.add_argument('--renewals', type=int, default=0)
     parser.add_argument('--upload-faults', action='store_true')
+    parser.add_argument('--wal-pressure', action='store_true')
     parser.add_argument('--server', default='target/debug/postgres')
     parser.add_argument('--pg-bin', required=True)
     parser.add_argument('--sharedir', required=True)
@@ -353,6 +354,22 @@ def main():
         assert 'S3 archive already exists' in (root / 'native-existing-head.log').read_text()
         assert list(refused_data.glob('pg_wal/' + '?' * 24))
         expected_ids = {42}
+        if args.wal_pressure:
+            # Dirty enough pages to expose checkpoint pacing, while advancing
+            # well beyond the 256 MiB retained-WAL budget. No manual checkpoints
+            # during churn: renewal must release its own retention pins.
+            sql(sock, 'CREATE TABLE wal_pressure(id int PRIMARY KEY, n int, payload text); '
+                      'ALTER TABLE wal_pressure ALTER COLUMN payload SET STORAGE PLAIN; '
+                      "INSERT INTO wal_pressure SELECT g,0,repeat(md5(g::text),128) FROM generate_series(1,512) g; "
+                      'CHECKPOINT')
+            pressure_generation = json.loads(head()).get('generation', 0)
+            for value in range(1, 33):
+                sql(sock, f'UPDATE wal_pressure SET n={value}; SELECT pg_switch_wal()')
+                assert process.poll() is None, 'compute stopped under WAL pressure'
+                assert not list(data.glob('pg_wal/' + '?' * 24))
+                time.sleep(.5)
+            assert json.loads(head()).get('generation', 0) >= pressure_generation + 2
+            print('WAL pressure: 32 updates and segment switches completed at 256 MiB', flush=True)
         crash_results = []
         if args.crashes:
             sql(sock, 'CREATE TABLE crash_churn(id int PRIMARY KEY, n int); INSERT INTO crash_churn VALUES (1,0)')
@@ -473,7 +490,7 @@ def main():
                     with relation.open('ab') as output:
                         output.write(bytes(16 * 8192))
                     extended_relation = (name, length)
-                if args.upload_faults and cycle < 2:
+                if cycle == 0 or (args.upload_faults and cycle == 1):
                     proxy.snapshot_pending.clear()
                     proxy.snapshot_attempts = 0
                     proxy.snapshot_bodies.clear()
@@ -613,6 +630,8 @@ def main():
             assert sql(restored_sock, 'SELECT id FROM renewal_churn') == str(args.renewals-1)
             assert sql(restored_sock, "SELECT to_regclass('dropped_during_renewal') IS NULL") == 't'
         sql(restored_sock, 'INSERT INTO created_here VALUES (44)')
+        if args.wal_pressure:
+            assert sql(restored_sock, 'SELECT count(*),min(n),max(n) FROM wal_pressure') == '512|32|32'
         expected_ids.add(44)
         assert not list(restored_data.glob('pg_wal/' + '?' * 24))
         if args.renewals:
@@ -635,7 +654,7 @@ def main():
             ready(again, again_sock)
             assert sql(again_sock, "SELECT string_agg(id::text,',' ORDER BY id) FROM created_here") == ','.join(map(str,sorted(expected_ids)))
             assert sql(again_sock, 'SELECT sum(n) FROM renewal_data') == str((args.renewals+1)*10)
-        print(json.dumps(dict(result='passed', prefix=prefix, partial_creation_refused=True, upload_fault_commits=fault_commits, crashes=crash_results, startup_faults=args.startup_faults, failed_upload_no_head=True,
+        print(json.dumps(dict(result='passed', prefix=prefix, wal_pressure=args.wal_pressure, partial_creation_refused=True, upload_fault_commits=fault_commits, crashes=crash_results, startup_faults=args.startup_faults, failed_upload_no_head=True,
                               concurrent_creators_one_winner=True, lost_initial_response=True,
                               sql_closed_before_publication=True, recovered_committed_row=42,
                               rollback_absent=True, recovery_continued=True, renewal_generations=generations, interrupted_export_recovered=bool(args.renewals), interrupted_retirement_recovered=bool(args.renewals))), flush=True)
