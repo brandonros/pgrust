@@ -1,0 +1,511 @@
+// barrier.c (storage/ipc): dynamic-party phase barrier. Thread-native: the
+// spinlock+ConditionVariable pair is a std Mutex over the state plus Waiter
+// parks (M0 lane C — the raw 10ms Condvar poll moved onto the structured
+// wait primitive). Phase-advancers unpark every registered waiter promptly;
+// the 10ms timed park is retained as the InterruptPending poll (C's
+// ConditionVariableSleep checks interrupts per wakeup), so a dead peer
+// surfaces as an error instead of a hang, and cancels keep their latency.
+#![allow(non_snake_case)]
+
+use ::types_error::PgResult;
+
+// PERMIT-S2 absorb (permit-s1 compose §1.3 recipe): the loom-breadth
+// branch's private cfg(loom) shim became an unconditional pgsync import —
+// pgsync is THE single world-cfg point (native arm = the identical std
+// re-export, zero cost; `--cfg loom` = loom's checked Mutex), so the loom
+// models in tests/loom.rs drive the real pgsync types.
+use pgsync::{Mutex, MutexGuard};
+
+// Park route: how a non-releasing arrival blocks and how a phase advance
+// wakes it. Production rides the global waiter slab (10ms timed park = the
+// InterruptPending poll cadence C's ConditionVariableSleep had); the loom
+// build routes through model-owned waiter Slots (the waiter crate's slot
+// core IS loom-modeled), with untimed parks — a lost phase-advance wake is
+// then a deadlock loom's detector reports instead of something the 10ms
+// cadence would paper over. The interrupt drain is production-only (seams
+// are not installed in models; a model never has InterruptPending).
+#[cfg(not(loom))]
+mod route {
+    use ::types_error::PgResult;
+
+    #[inline]
+    pub(crate) fn current_word() -> u64 {
+        waiter::current_handle().as_u64()
+    }
+
+    #[inline]
+    pub(crate) fn park_wait(wait_event_info: u32) -> PgResult<()> {
+        // 10ms timed park = the InterruptPending poll cadence the old
+        // Condvar wait had; a phase advance unparks promptly. The park is
+        // bracketed by the caller's wait_event_info like C's
+        // ConditionVariableSleep -> WaitLatch (pgstat_report_wait_start/end
+        // around every wait); guarded like latch::WaitLatch — unit tests run
+        // without the activity seams installed.
+        let report = waitevent_seams::pgstat_report_wait_start::is_installed();
+        if report {
+            waitevent_seams::pgstat_report_wait_start::call(wait_event_info);
+        }
+        let _ = waiter::park_timeout(core::time::Duration::from_millis(10));
+        if report {
+            waitevent_seams::pgstat_report_wait_end::call();
+        }
+        if init_small::globals::InterruptPending() {
+            postgres_seams::check_for_interrupts::call()?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn unpark_word(word: u64) {
+        waiter::unpark_word(word);
+    }
+}
+
+#[cfg(loom)]
+mod route {
+    use std::cell::Cell;
+    use std::sync::Arc;
+
+    use ::types_error::PgResult;
+    use waiter::clock::WaiterClock;
+    use waiter::{Slot, SlotInner};
+
+    /// Untimed model clock (the waiter loom models' LoomClock shape): parks
+    /// block on the slot condvar until a real unpark — no cadence, no time.
+    struct ModelClock;
+
+    impl WaiterClock for ModelClock {
+        fn now_ms(&self) -> i64 {
+            0
+        }
+        fn wait<'a>(
+            &self,
+            slot: &'a Slot,
+            guard: pgsync::MutexGuard<'a, SlotInner>,
+            _timeout_ms: Option<i64>,
+        ) -> (pgsync::MutexGuard<'a, SlotInner>, bool) {
+            (slot.wait_for_model(guard), false)
+        }
+    }
+
+    static CLOCK: ModelClock = ModelClock;
+
+    // Per-execution slot registry (loom::lazy_static resets between model
+    // iterations, loom::thread_local between model threads). Word layout
+    // mirrors WakerHandle: (index+1) << 32 | token, never zero.
+    loom::lazy_static! {
+        static ref SLOTS: loom::sync::Mutex<Vec<Arc<Slot>>> =
+            loom::sync::Mutex::new(Vec::new());
+    }
+    loom::thread_local! {
+        static MY_WORD: Cell<u64> = Cell::new(0);
+    }
+
+    pub(crate) fn current_word() -> u64 {
+        MY_WORD.with(|w| {
+            if w.get() == 0 {
+                let slot = Arc::new(Slot::new_for_model());
+                let token = slot.issue_token();
+                let mut v = SLOTS.lock().unwrap();
+                v.push(slot);
+                w.set(((v.len() as u64) << 32) | token as u64);
+            }
+            w.get()
+        })
+    }
+
+    pub(crate) fn park_wait(_wait_event_info: u32) -> PgResult<()> {
+        let word = current_word();
+        let slot = {
+            let v = SLOTS.lock().unwrap();
+            Arc::clone(&v[((word >> 32) - 1) as usize])
+        };
+        // Notified is the only outcome (untimed, no cadence); the caller's
+        // loop re-tests the phase either way.
+        let _ = slot.park_core(None, None, &CLOCK);
+        Ok(())
+    }
+
+    pub(crate) fn unpark_word(word: u64) {
+        if word == 0 {
+            return;
+        }
+        let slot = {
+            let v = SLOTS.lock().unwrap();
+            v.get(((word >> 32) - 1) as usize).map(Arc::clone)
+        };
+        if let Some(s) = slot {
+            let _ = s.unpark_token(word as u32);
+        }
+    }
+}
+
+pub fn init_seams() {}
+
+struct BarrierInner {
+    phase: i32,
+    participants: i32,
+    arrived: i32,
+    elected: i32,
+    static_party: bool,
+    /// Packed waiter handles of parked arrive_and_wait callers.
+    waiters: Vec<u64>,
+}
+
+pub struct Barrier {
+    inner: Mutex<BarrierInner>,
+}
+
+impl Barrier {
+    /// `BarrierInit`.
+    pub fn new(participants: i32) -> Barrier {
+        Barrier {
+            inner: Mutex::new(BarrierInner {
+                phase: 0,
+                participants,
+                arrived: 0,
+                elected: 0,
+                static_party: participants > 0,
+                waiters: Vec::new(),
+            }),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BarrierInner> {
+        // Poison-tolerant (loom's Mutex never poisons in models but keeps
+        // the same Result API, so this line is cfg-free).
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `BarrierArriveAndWait` (barrier.c:125): true in the one elected
+    /// participant. While parked, pg_stat_activity shows `wait_event_info`
+    /// (a WAIT_EVENT_* IPC value, 0 for none).
+    pub fn arrive_and_wait(&self, wait_event_info: u32) -> PgResult<bool> {
+        let (start_phase, next_phase);
+        {
+            let mut b = self.lock();
+            start_phase = b.phase;
+            next_phase = start_phase + 1;
+            b.arrived += 1;
+            if b.arrived == b.participants {
+                b.arrived = 0;
+                b.phase = next_phase;
+                b.elected = next_phase;
+                let woken = std::mem::take(&mut b.waiters);
+                drop(b);
+                Self::unpark_all(woken);
+                return Ok(true);
+            }
+        }
+        let mut elected = false;
+        let handle = route::current_word();
+        let mut b = self.lock();
+        loop {
+            debug_assert!(b.phase == start_phase || b.phase == next_phase);
+            if b.phase == next_phase {
+                if b.elected != next_phase {
+                    // The releasing arrival is normally elected; if the phase
+                    // advanced because someone detached, elect a woken waiter.
+                    b.elected = next_phase;
+                    elected = true;
+                }
+                break;
+            }
+            if !b.waiters.contains(&handle) {
+                b.waiters.push(handle);
+            }
+            drop(b);
+            if let Err(e) = route::park_wait(wait_event_info) {
+                // A cancel/die interrupt raised inside the wait unwinds this
+                // arrival. C leaves `arrived` counted (CHECK_FOR_INTERRUPTS
+                // throws out of ConditionVariableSleep) and survives anyway:
+                // every participant is a separate process and the erroring
+                // gang dies with its DSM. In the thread model a phantom
+                // arrival is lethal — the erroring participant's later
+                // BarrierDetach observes arrived == participants and releases
+                // the phase while a still-attached participant has yet to
+                // arrive, so the released elected worker frees shared
+                // hash-join state (chunks, bucket arrays) under that live
+                // participant: a process-fatal use-after-free (Antithesis
+                // RB-5, wpool standby SIGSEGV after an injected worker
+                // error). Roll the arrival back under the lock so the
+                // barrier keeps the contract BarrierDetachImpl assumes: a
+                // detaching participant is never counted in `arrived`.
+                let mut b = self.lock();
+                if b.phase == start_phase {
+                    debug_assert!(b.arrived > 0);
+                    b.arrived -= 1;
+                }
+                // else: the phase already advanced — the release consumed our
+                // arrival and reset `arrived`; nothing to roll back.
+                if let Some(pos) = b.waiters.iter().position(|w| *w == handle) {
+                    b.waiters.swap_remove(pos);
+                }
+                return Err(e);
+            }
+            b = self.lock();
+        }
+        if let Some(pos) = b.waiters.iter().position(|w| *w == handle) {
+            b.waiters.swap_remove(pos);
+        }
+        Ok(elected)
+    }
+
+    fn unpark_all(handles: Vec<u64>) {
+        for h in handles {
+            route::unpark_word(h);
+        }
+    }
+
+    /// `BarrierArriveAndDetach`: true if the caller was the last to detach.
+    pub fn arrive_and_detach(&self) -> bool {
+        self.detach_impl(true)
+    }
+
+    /// `BarrierArriveAndDetachExceptLast`: true if the caller was the last to
+    /// arrive and is therefore still attached.
+    pub fn arrive_and_detach_except_last(&self) -> bool {
+        let mut b = self.lock();
+        if b.participants > 1 {
+            b.participants -= 1;
+            return false;
+        }
+        debug_assert!(b.participants == 1);
+        b.phase += 1;
+        true
+    }
+
+    /// `BarrierAttach`: returns the current phase.
+    pub fn attach(&self) -> i32 {
+        let mut b = self.lock();
+        debug_assert!(!b.static_party);
+        b.participants += 1;
+        b.phase
+    }
+
+    /// `BarrierDetach`: true if this participant was the last to detach.
+    pub fn detach(&self) -> bool {
+        self.detach_impl(false)
+    }
+
+    /// `BarrierPhase`. The caller must be attached (the phase cannot advance
+    /// without it, so an unlocked read is C's contract; we take the lock —
+    /// uncontended — rather than replicate the fence argument).
+    pub fn phase(&self) -> i32 {
+        self.lock().phase
+    }
+
+    /// `BarrierParticipants` (debugging only in C).
+    pub fn participants(&self) -> i32 {
+        self.lock().participants
+    }
+
+    /// Re-run `BarrierInit` in place (C reinitializes barriers embedded in
+    /// reused shared memory, e.g. `ExecHashJoinReInitializeDSM`).
+    ///
+    /// **Clearing leftover state is the job, not a precondition.** C's
+    /// `BarrierInit` asserts nothing here and unconditionally zeroes
+    /// `participants`/`arrived`/`phase`/`elected` plus the condition variable —
+    /// and C's own rescan path reaches it with a non-zero `participants`
+    /// whenever `ExecHashJoinReInitializeDSM` takes the
+    /// `hj_HashTable == NULL` branch and so skips the detach in
+    /// `ExecHashTableDetach`. A pair of asserts demanding a zero count here was
+    /// therefore a constraint this port invented, not one C imposes; measured
+    /// on a shipped profile it fired on stale bookkeeping only — a leftover
+    /// count at the terminal build phase with **no** parked waiter
+    /// (GL-ASSERTMASK-1 §4). They are gone rather than re-graded.
+    pub fn reset(&self) {
+        let mut b = self.lock();
+        b.phase = 0;
+        b.participants = 0;
+        b.arrived = 0;
+        b.elected = 0;
+        b.static_party = false;
+        b.waiters.clear();
+    }
+
+    fn detach_impl(&self, arrive: bool) -> bool {
+        let mut b = self.lock();
+        debug_assert!(!b.static_party);
+        debug_assert!(b.participants > 0);
+        b.participants -= 1;
+        let release = (arrive || b.participants > 0) && b.arrived == b.participants;
+        let mut woken = Vec::new();
+        if release {
+            b.arrived = 0;
+            b.phase += 1;
+            woken = std::mem::take(&mut b.waiters);
+        }
+        let last = b.participants == 0;
+        drop(b);
+        Self::unpark_all(woken);
+        last
+    }
+}
+
+// Unit tests drive real std threads over the global waiter slab — production
+// surface only (the loom models live in tests/loom.rs).
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::Barrier;
+
+    #[test]
+    fn static_party_phases() {
+        let b = std::sync::Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let b = std::sync::Arc::clone(&b);
+            handles.push(std::thread::spawn(move || {
+                let mut elected = 0;
+                for _ in 0..5 {
+                    if b.arrive_and_wait(0).unwrap() {
+                        elected += 1;
+                    }
+                }
+                elected
+            }));
+        }
+        let total: i32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        // Exactly one election per phase.
+        assert_eq!(total, 5);
+        assert_eq!(b.lock().phase, 5);
+    }
+
+    #[test]
+    fn dynamic_attach_detach() {
+        let b = Barrier::new(0);
+        assert_eq!(b.attach(), 0);
+        assert_eq!(b.attach(), 0);
+        // Two attached; one arrives-and-detaches: the other hasn't arrived,
+        // so the phase holds; the final detach leaves the phase alone too.
+        assert!(!b.arrive_and_detach());
+        assert_eq!(b.phase(), 0);
+        assert!(b.detach());
+        assert_eq!(b.lock().phase, 0);
+        // A sole participant arriving-and-detaching advances the phase.
+        b.attach();
+        assert!(b.arrive_and_detach());
+        assert_eq!(b.lock().phase, 1);
+    }
+
+    /// RB-5 (Antithesis b627b97fb4ea57851b123676de30f2ab-59-13): an arrival
+    /// unwound by an interrupt must be rolled back, or the participant's
+    /// error-path detach releases the phase while another attached
+    /// participant has yet to arrive (phantom-arrival over-release) — in the
+    /// thread model that lets an elected worker free shared hash-join state
+    /// under a live participant (SIGSEGV).
+    #[test]
+    fn interrupted_arrival_rolls_back() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        fn test_cfi() -> ::types_error::PgResult<()> {
+            // ProcessInterrupts shape: consume the (thread-local) flag and
+            // raise; uninterrupted threads never reach here (route gates on
+            // InterruptPending()).
+            init_small::globals::SetInterruptPending(false);
+            Err(::types_error::PgError::new(::types_error::ERROR, "test interrupt").into())
+        }
+        INSTALL.call_once(|| postgres_seams::check_for_interrupts::set(test_cfi));
+
+        let b = std::sync::Arc::new(Barrier::new(0));
+        // Three attached participants: A (thread), B (this thread, will be
+        // interrupted), C (arrives last, from this thread after B detaches).
+        assert_eq!(b.attach(), 0);
+        assert_eq!(b.attach(), 0);
+        assert_eq!(b.attach(), 0);
+        let a = {
+            let b = std::sync::Arc::clone(&b);
+            std::thread::spawn(move || b.arrive_and_wait(0).unwrap())
+        };
+        // A has arrived and is parked.
+        while b.lock().arrived < 1 {
+            std::thread::yield_now();
+        }
+        // B arrives with a pending interrupt: the wait unwinds with the
+        // raised error and the arrival must be rolled back.
+        init_small::globals::SetInterruptPending(true);
+        assert!(b.arrive_and_wait(0).is_err());
+        assert_eq!(
+            b.lock().arrived,
+            1,
+            "interrupt-unwound arrival left a phantom arrived count"
+        );
+        // B's error cleanup detaches. With the phantom arrival this released
+        // the phase (arrived == participants) although C never arrived.
+        assert!(!b.detach());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            b.lock().phase,
+            0,
+            "phase advanced without attached participant C arriving"
+        );
+        // C arrives: NOW the phase advances and A is released.
+        assert!(b.arrive_and_wait(0).unwrap());
+        assert!(!a.join().unwrap());
+        assert_eq!(b.lock().phase, 1);
+    }
+
+    // audit-18.6 w2-013 (barrier.c:125 BarrierArriveAndWait): a parked
+    // arrival sleeps under the caller's wait_event_info (C:
+    // ConditionVariableSleep -> pgstat_report_wait_start/end around every
+    // WaitLatch), so pg_stat_activity shows the Hash* IPC events while
+    // parallel-hash participants wait on a barrier.
+    #[test]
+    fn arrive_and_wait_reports_wait_event() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        static STARTS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        static ENDS: AtomicUsize = AtomicUsize::new(0);
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            waitevent_seams::pgstat_report_wait_start::set(|info| {
+                STARTS.lock().unwrap_or_else(|e| e.into_inner()).push(info);
+            });
+            waitevent_seams::pgstat_report_wait_end::set(|| {
+                ENDS.fetch_add(1, Ordering::SeqCst);
+            });
+        });
+        // PG_WAIT_IPC | HashBuildElect (wait_event_names.txt IPC row 18).
+        const WAIT_EVENT_HASH_BUILD_ELECT: u32 = 0x0800_0000 | 18;
+
+        let b = std::sync::Arc::new(Barrier::new(2));
+        let parked = {
+            let b = std::sync::Arc::clone(&b);
+            std::thread::spawn(move || b.arrive_and_wait(WAIT_EVENT_HASH_BUILD_ELECT).unwrap())
+        };
+        while b.lock().arrived < 1 {
+            std::thread::yield_now();
+        }
+        // The parked participant has issued at least one timed park by now.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // The recorder is process-global: sibling tests park with event 0 in
+        // parallel, so only this barrier's event is asserted on.
+        let seen: Vec<u32> = STARTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .filter(|&i| i != 0)
+            .collect();
+        assert!(b.arrive_and_wait(WAIT_EVENT_HASH_BUILD_ELECT).unwrap());
+        assert!(!parked.join().unwrap());
+        assert!(!seen.is_empty(), "no wait event reported while parked on the barrier");
+        assert!(
+            seen.iter().all(|&i| i == WAIT_EVENT_HASH_BUILD_ELECT),
+            "wait events reported: {seen:x?}"
+        );
+        // Every park is bracketed: the parked participant has returned, so
+        // its wait_end reports have landed.
+        assert!(ENDS.load(Ordering::SeqCst) >= seen.len(), "wait_end brackets missing");
+    }
+
+    #[test]
+    fn detach_except_last() {
+        let b = Barrier::new(0);
+        b.attach();
+        b.attach();
+        assert!(!b.arrive_and_detach_except_last());
+        assert!(b.arrive_and_detach_except_last());
+        assert_eq!(b.phase(), 1);
+        assert_eq!(b.participants(), 1);
+    }
+}

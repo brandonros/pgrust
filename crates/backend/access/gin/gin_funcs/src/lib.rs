@@ -1,0 +1,197 @@
+//! ginfast.c: gin_clean_pending_list, the SQL-callable pending-list cleanup
+//! entry point. Split into its own crate (mirrors brin/brin_funcs) so the
+//! `gin` AM crate — depended on by indexam for the ambulkdelete/amvacuumcleanup
+//! dispatch — never depends back on indexam/aclchk.
+#![allow(non_snake_case)]
+
+use ::datum::Datum;
+use ::types_core::{GIN_AM_OID, RELATION_RELATION_ID};
+use ::types_error::{
+    PgError, PgResult, DEBUG1, ERRCODE_FEATURE_NOT_SUPPORTED,
+    ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE, ERRCODE_WRONG_OBJECT_TYPE,
+};
+use ::types_fmgr::{FmgrBuiltin, FmgrInfo, FunctionCallInfoBaseData as Fcinfo, PGFunction};
+use ::types_nodes::parsenodes::ObjectType;
+use ::types_rel::{Relation, RowExclusiveLock, RELKIND_INDEX};
+
+#[track_caller]
+#[cold]
+#[inline(never)]
+fn recovery_in_progress_error() -> Box<PgError> {
+    Box::new(
+        PgError::error("recovery is in progress")
+            .with_sqlstate(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE)
+            .with_hint("GIN pending list cannot be cleaned up during recovery."),
+    )
+}
+
+#[track_caller]
+#[cold]
+#[inline(never)]
+fn not_a_gin_index(indexRel: &Relation<'_>) -> Box<PgError> {
+    Box::new(
+        PgError::error(format!("\"{}\" is not a GIN index", indexRel.name()))
+            .with_sqlstate(ERRCODE_WRONG_OBJECT_TYPE),
+    )
+}
+
+#[track_caller]
+#[cold]
+#[inline(never)]
+fn other_temp_index() -> Box<PgError> {
+    Box::new(
+        PgError::error("cannot access temporary indexes of other sessions")
+            .with_sqlstate(ERRCODE_FEATURE_NOT_SUPPORTED),
+    )
+}
+
+fn is_gin_index(indexRel: &Relation<'_>) -> bool {
+    indexRel.rd_rel.relkind == RELKIND_INDEX && indexRel.rd_rel.relam == GIN_AM_OID
+}
+
+/// gin_clean_pending_list (ginfast.c:1030).
+pub fn fc_gin_clean_pending_list(
+    _flinfo: Option<&mut FmgrInfo>,
+    fcinfo: &mut Fcinfo,
+) -> PgResult<Datum> {
+    let indexoid = fcinfo.arg(0).as_oid();
+    let mcx = fcinfo.result_mcx();
+
+    // ginfast.c:1034: index_open runs first (its "relation with OID %u does
+    // not exist" wins over the recovery check on a standby).
+    let indexRel = indexam_seams::index_open::call(mcx, indexoid, RowExclusiveLock)?;
+
+    if transam_xlog_seams::recovery_in_progress::call() {
+        return Err(recovery_in_progress_error());
+    }
+
+    if !is_gin_index(&indexRel) {
+        return Err(not_a_gin_index(&indexRel));
+    }
+
+    // ginfast.c:1056 — we have no visibility into the owning session's local
+    // buffers, so reading its pending list would return wrong data.
+    if indexRel.is_other_temp() {
+        return Err(other_temp_index());
+    }
+
+    if !aclchk::object_ownercheck(RELATION_RELATION_ID, indexoid, miscinit::GetUserId())? {
+        aclchk::aclcheck_error(
+            aclchk::ACLCHECK_NOT_OWNER,
+            ObjectType::OBJECT_INDEX,
+            indexRel.name(),
+        )?;
+    }
+
+    let is_valid = indexRel.rd_index.as_ref().map_or(false, |i| i.indisvalid);
+
+    let pages_deleted: i64 = if is_valid {
+        let mut stats = ::types_nbtree::IndexBulkDeleteResult::default();
+        let state = gin::build::initGinState(&indexRel)?;
+        gin::ginInsertCleanup(mcx, &indexRel, &state, true, true, true, Some(&mut stats))?;
+        stats.pages_deleted as i64
+    } else {
+        let _ = elog::elog(
+            DEBUG1,
+            format!("index \"{}\" is not valid", indexRel.name()),
+        );
+        0
+    };
+
+    indexRel.close(RowExclusiveLock)?;
+
+    Ok(Datum::from_i64(pages_deleted))
+}
+
+// ginhandler (ginutil.c) + the ginarrayproc.c opclass support procs: GIN
+// index build/scan resolves these natively; rows exist for fmgr-lookup parity.
+const fn gin_internal(foid: ::types_core::Oid, name: &'static str, nargs: i16) -> FmgrBuiltin {
+    FmgrBuiltin {
+        foid,
+        name,
+        nargs,
+        strict: true,
+        retset: false,
+        func: ::types_fmgr::fc_internal_dispatch_only,
+    }
+}
+
+pub static GIN_FUNCS_BUILTINS: &[FmgrBuiltin] = &[
+    FmgrBuiltin {
+        foid: 3789,
+        name: "gin_clean_pending_list",
+        nargs: 1,
+        strict: true,
+        retset: false,
+        func: fc_gin_clean_pending_list as PGFunction,
+    },
+    gin_internal(333, "ginhandler", 1),
+    gin_internal(2743, "ginarrayextract", 3),
+    gin_internal(2744, "ginarrayconsistent", 8),
+    gin_internal(2774, "ginqueryarrayextract", 7),
+    gin_internal(3076, "ginarrayextract_2args", 2),
+    gin_internal(3920, "ginarraytriconsistent", 7),
+];
+
+pub fn init_seams() {
+    ::fmgr_core::register_late_builtins(GIN_FUNCS_BUILTINS);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GIN_FUNCS_BUILTINS;
+
+    #[test]
+    fn builtins_match_pg_proc_dat() {
+        let expect = [
+            (3789u32, "gin_clean_pending_list", 1i16),
+            (333, "ginhandler", 1),
+            (2743, "ginarrayextract", 3),
+            (2744, "ginarrayconsistent", 8),
+            (2774, "ginqueryarrayextract", 7),
+            (3076, "ginarrayextract_2args", 2),
+            (3920, "ginarraytriconsistent", 7),
+        ];
+        assert_eq!(GIN_FUNCS_BUILTINS.len(), expect.len());
+        for (b, (foid, name, nargs)) in GIN_FUNCS_BUILTINS.iter().zip(expect) {
+            assert_eq!(b.foid, foid);
+            assert_eq!(b.name, name);
+            assert_eq!(b.nargs, nargs);
+            assert!(b.strict);
+            assert!(!b.retset);
+        }
+    }
+}
+
+#[cfg(test)]
+mod rem_b084_tests {
+    use super::*;
+    use ::types_error::ERRCODE_UNDEFINED_TABLE;
+    use ::types_fmgr::LocalFcinfo;
+
+    // ginfast.c:1032-1037: index_open(indexoid) runs before the
+    // RecoveryInProgress() check, so on a standby an unknown OID reports
+    // 42P01 "relation with OID %u does not exist", not 55000.
+    #[test]
+    fn clean_pending_list_opens_index_before_recovery_check() {
+        transam_xlog_seams::recovery_in_progress::set(|| true);
+        indexam_seams::index_open::set(|_mcx, relation_id, _lockmode| {
+            Err(Box::new(
+                PgError::error(format!("relation with OID {relation_id} does not exist"))
+                    .with_sqlstate(ERRCODE_UNDEFINED_TABLE),
+            ))
+        });
+
+        let cx = ::mcx::MemoryContext::new("b084");
+        let mut fcinfo = LocalFcinfo::<1>::new(0);
+        // SAFETY: the context outlives the call.
+        unsafe { fcinfo.set_result_mcx(cx.mcx()) };
+        fcinfo.set_arg(0, Datum::from_oid(9999999));
+
+        let err = fc_gin_clean_pending_list(None, &mut fcinfo)
+            .err()
+            .expect("unknown index OID is an error");
+        assert_eq!(err.sqlstate(), ERRCODE_UNDEFINED_TABLE);
+        assert_eq!(err.message(), "relation with OID 9999999 does not exist");
+    }
+}

@@ -1,0 +1,42 @@
+[package]
+name = "pg_upgrade_support"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pg_upgrade_support"
+path = "src/lib.rs"
+
+[dependencies]
+datum = { path = "../../../../_support/types/datum" }
+mcx = { path = "../../../../_support/mcx" }
+types_core = { path = "../../../../_support/types/types_core" }
+types_error = { path = "../../../../_support/types/types_error" }
+types_fmgr = { path = "../../../../_support/types/fmgr" }
+types_tuple = { path = "../../../../_support/types/types_tuple" }
+types_rel = { path = "../../../../_support/types/rel" }
+elog = { path = "../../error/elog" }
+init_small = { path = "../../init/init_small" }
+miscinit = { path = "../../init/miscinit" }
+table = { path = "../../../access/table/table" }
+relation = { path = "../../../access/common/relation" }
+extension = { path = "../../../commands/extension" }
+catalog_namespace = { path = "../../../catalog/catalog_namespace" }
+arrayfuncs = { path = "../arrayfuncs" }
+detoast = { path = "../../../access/common/detoast" }
+pg_type = { path = "../../../catalog/pg_type" }
+pg_enum = { path = "../../../catalog/pg_enum" }
+commands_tablespace = { path = "../../../commands/tablespace" }
+pg_subscription = { path = "../../../catalog/pg_subscription" }
+catalog_heap = { path = "../../../catalog/catalog_heap" }
+catalog_index = { path = "../../../catalog/catalog_index" }
+aclchk = { path = "../../../catalog/aclchk" }
+user = { path = "../../../commands/user" }
+lsyscache = { path = "../../cache/lsyscache" }
+catalog = { path = "../../../catalog/catalog" }
+lmgr = { path = "../../../storage/lmgr/lmgr" }
+origin = { path = "../../../replication/origin" }
+slot = { path = "../../../replication/slot" }
+slotfuncs = { path = "../../../replication/slotfuncs" }
+transam_xlog = { path = "../../../access/transam/transam_xlog" }

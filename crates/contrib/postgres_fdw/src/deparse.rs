@@ -1,0 +1,2709 @@
+use core::fmt::Write as _;
+
+use adt_quote::quote_identifier;
+use format_type::{format_type_extended, FORMAT_TYPE_FORCE_QUALIFY, FORMAT_TYPE_TYPEMOD_GIVEN};
+use mcx::{Mcx, PgString, PgVec};
+use nodes_core::{expr_type, expr_typmod, strip_implicit_coercions};
+use types_core::{
+    catalog::{
+        BITOID, BOOLOID, FLOAT4OID, FLOAT8OID, INT2OID, INT4OID, INT8OID, NUMERICOID,
+        OIDOID, OPERATOR_FAMILY_RELATION_ID, PG_CATALOG_NAMESPACE, UNKNOWNOID, VARBITOID,
+    },
+    Oid,
+};
+use types_error::{PgError, PgResult};
+use types_nodes::equal::equal;
+use types_nodes::list::NodeList;
+use types_nodes::{
+    BoolExprType, CoercionForm, Const, JoinType, Node, NodeTag, NullTestType,
+};
+use types_pathnodes::run::PlannerRun;
+use types_pathnodes::RelId;
+
+use crate::relinfo::fpinfo;
+use crate::shippable;
+
+// reg* type OIDs (pg_type.dat) and the catalogs their contents live in,
+// needed by foreign_expr_walker's regproc/regoper/... shippability checks.
+const REGPROCOID: Oid = 24;
+const REGPROCEDUREOID: Oid = 2202;
+const REGOPEROID: Oid = 2203;
+const REGOPERATOROID: Oid = 2204;
+const REGCLASSOID: Oid = 2205;
+const REGTYPEOID: Oid = 2206;
+const REGCOLLATIONOID: Oid = 4191;
+const REGCONFIGOID: Oid = 3734;
+const REGDICTIONARYOID: Oid = 3769;
+const REGNAMESPACEOID: Oid = 4089;
+const REGROLEOID: Oid = 4096;
+
+const FIRST_NORMAL_OBJECT_ID: Oid = types_core::catalog::FirstNormalObjectId;
+const DEFAULT_COLLATION_OID: Oid = types_core::catalog::DEFAULT_COLLATION_OID;
+
+const PROCEDURE_RELATION_ID: Oid = types_core::catalog::PROCEDURE_RELATION_ID;
+const OPERATOR_RELATION_ID: Oid = types_core::catalog::OPERATOR_RELATION_ID;
+const RELATION_RELATION_ID: Oid = types_core::catalog::RELATION_RELATION_ID;
+const TYPE_RELATION_ID: Oid = types_core::catalog::TYPE_RELATION_ID;
+const COLLATION_RELATION_ID: Oid = types_core::catalog::COLLATION_RELATION_ID;
+const NAMESPACE_RELATION_ID: Oid = types_core::catalog::NAMESPACE_RELATION_ID;
+const AUTH_ID_RELATION_ID: Oid = types_core::catalog::AUTH_ID_RELATION_ID;
+const TS_CONFIG_RELATION_ID: Oid = 3602;
+const TS_DICT_RELATION_ID: Oid = 3600;
+
+const SELF_ITEM_POINTER_ATTNUM: i16 = -1;
+const TABLE_OID_ATTNUM: i16 = types_tuple::htup::TableOidAttributeNumber as i16;
+const FIRST_LOW_INVALID_HEAP_ATTNUM: i32 =
+    types_tuple::htup::FirstLowInvalidHeapAttributeNumber;
+
+const REL_ALIAS_PREFIX: &str = "r";
+const SUBQUERY_REL_ALIAS_PREFIX: &str = "s";
+const SUBQUERY_COL_ALIAS_PREFIX: &str = "c";
+
+// StringInfo-shaped append over PgString. Divergence: OOM on these cold
+// deparse appends is dropped (buffer truncates) rather than raised, matching
+// the `write!`-discards pattern used elsewhere on cold formatting paths; the
+// deparse buffer is small and per-plan.
+pub(crate) trait Push {
+    fn push_str(&mut self, s: &str);
+    fn push(&mut self, c: char);
+}
+impl Push for PgString<'_> {
+    #[inline]
+    fn push_str(&mut self, s: &str) {
+        let _ = self.try_push_str(s);
+    }
+    #[inline]
+    fn push(&mut self, c: char) {
+        let _ = self.try_push(c);
+    }
+}
+
+// ---------- shippability walker (is_foreign_expr / foreign_expr_walker) ----------
+
+#[derive(Clone, Copy, PartialEq)]
+enum FdwCollateState {
+    None,
+    Safe,
+    Unsafe,
+}
+
+#[derive(Clone, Copy)]
+struct LocCxt {
+    collation: Oid,
+    state: FdwCollateState,
+}
+
+impl LocCxt {
+    fn empty() -> Self {
+        LocCxt { collation: types_core::InvalidOid, state: FdwCollateState::None }
+    }
+}
+
+struct GlobCxt<'a, 'mcx> {
+    run: &'a PlannerRun<'mcx>,
+    foreignrel: RelId,
+    relids_rel: RelId,
+    serverid: Oid,
+    shippable_extensions: &'a [Oid],
+    mcx: Mcx<'mcx>,
+}
+
+impl<'mcx> GlobCxt<'_, 'mcx> {
+    fn relids(&self) -> &types_pathnodes::Relids<'mcx> {
+        &self.run.root.rel(self.relids_rel).relids
+    }
+}
+
+fn is_shippable_obj(glob: &GlobCxt<'_, '_>, oid: Oid, class_id: Oid) -> PgResult<bool> {
+    shippable::is_shippable(glob.mcx, oid, class_id, glob.serverid, glob.shippable_extensions)
+}
+
+/// classifyConditions: split RestrictInfos into remote-safe and local subsets.
+pub fn classify_conditions<'mcx>(
+    run: &PlannerRun<'mcx>,
+    baserel: RelId,
+    input_conds: &[types_pathnodes::RinfoId],
+    remote_conds: &mut PgVec<'mcx, types_pathnodes::RinfoId>,
+    local_conds: &mut PgVec<'mcx, types_pathnodes::RinfoId>,
+) -> PgResult<()> {
+    for &ri in input_conds {
+        let clause = run.root.rinfo(ri).clause;
+        if is_foreign_expr(run, baserel, *run.root.expr_node(clause))? {
+            remote_conds.push(ri);
+        } else {
+            local_conds.push(ri);
+        }
+    }
+    Ok(())
+}
+
+/// is_foreign_expr: true if expr is safe to evaluate on the foreign server.
+pub fn is_foreign_expr<'mcx>(
+    run: &PlannerRun<'mcx>,
+    baserel: RelId,
+    expr: Node<'mcx>,
+) -> PgResult<bool> {
+    let fp = fpinfo(run.root.rel(baserel)).borrow();
+    let relids_rel = if is_upper_rel(run, baserel) {
+        fp.outerrel.expect("upperrel has outerrel")
+    } else {
+        baserel
+    };
+    let glob = GlobCxt {
+        run,
+        foreignrel: baserel,
+        relids_rel,
+        serverid: fp.serverid(),
+        shippable_extensions: &fp.shippable_extensions,
+        mcx: run.mcx,
+    };
+    let mut loc = LocCxt::empty();
+    if !foreign_expr_walker(&glob, expr, &mut loc, None)? {
+        return Ok(false);
+    }
+    if loc.state == FdwCollateState::Unsafe {
+        return Ok(false);
+    }
+    // Mutable functions can't be shipped (results not stable).
+    if clauses::classify::contain_mutable_functions(expr)? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+// IS_UPPER_REL (pathnodes.h:873): a grouped rel, or a partitionwise child
+// grouped rel (RELOPT_OTHER_UPPER_REL).
+fn is_upper_rel(run: &PlannerRun<'_>, rel: RelId) -> bool {
+    matches!(
+        run.root.rel(rel).reloptkind,
+        types_pathnodes::RELOPT_UPPER_REL | types_pathnodes::RELOPT_OTHER_UPPER_REL
+    )
+}
+
+fn collation_result(inner: &LocCxt, collation: Oid) -> FdwCollateState {
+    if collation == types_core::InvalidOid {
+        FdwCollateState::None
+    } else if inner.state == FdwCollateState::Safe && collation == inner.collation {
+        FdwCollateState::Safe
+    } else if collation == DEFAULT_COLLATION_OID {
+        FdwCollateState::None
+    } else {
+        FdwCollateState::Unsafe
+    }
+}
+
+fn merge_collation(outer: &mut LocCxt, collation: Oid, state: FdwCollateState) {
+    use FdwCollateState::*;
+    if (state as u8) > (outer.state as u8) {
+        outer.collation = collation;
+        outer.state = state;
+    } else if state == outer.state {
+        match state {
+            None | Unsafe => {}
+            Safe => {
+                if collation != outer.collation {
+                    if outer.collation == DEFAULT_COLLATION_OID {
+                        outer.collation = collation;
+                    } else if collation != DEFAULT_COLLATION_OID {
+                        outer.state = Unsafe;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn foreign_expr_walker<'mcx>(
+    glob: &GlobCxt<'_, 'mcx>,
+    node: Node<'mcx>,
+    outer_cxt: &mut LocCxt,
+    case_arg_cxt: Option<&LocCxt>,
+) -> PgResult<bool> {
+    let mut check_type = true;
+    let mut inner = LocCxt::empty();
+    let collation: Oid;
+    let state: FdwCollateState;
+
+    match node.node_tag() {
+        NodeTag::T_Var => {
+            let var = node.as_var().unwrap();
+            if types_pathnodes::relids::relids_is_member(var.varno, glob.relids())
+                && var.varlevelsup == 0
+            {
+                if var.varattno < 0 && var.varattno as i16 != SELF_ITEM_POINTER_ATTNUM {
+                    return Ok(false);
+                }
+                collation = var.varcollid;
+                state = if collation != types_core::InvalidOid {
+                    FdwCollateState::Safe
+                } else {
+                    FdwCollateState::None
+                };
+            } else {
+                collation = var.varcollid;
+                state = if collation == types_core::InvalidOid
+                    || collation == DEFAULT_COLLATION_OID
+                {
+                    FdwCollateState::None
+                } else {
+                    FdwCollateState::Unsafe
+                };
+            }
+        }
+        NodeTag::T_Const => {
+            let c = node.as_const().unwrap();
+            if !c.constisnull {
+                let class_id = match c.consttype {
+                    REGPROCOID | REGPROCEDUREOID => Some((PROCEDURE_RELATION_ID, false)),
+                    REGOPEROID | REGOPERATOROID => Some((OPERATOR_RELATION_ID, false)),
+                    REGCLASSOID => Some((RELATION_RELATION_ID, false)),
+                    REGTYPEOID => Some((TYPE_RELATION_ID, false)),
+                    REGCOLLATIONOID => Some((COLLATION_RELATION_ID, false)),
+                    REGCONFIGOID => Some((TS_CONFIG_RELATION_ID, true)),
+                    REGDICTIONARYOID => Some((TS_DICT_RELATION_ID, true)),
+                    REGNAMESPACEOID => Some((NAMESPACE_RELATION_ID, false)),
+                    REGROLEOID => Some((AUTH_ID_RELATION_ID, false)),
+                    _ => None,
+                };
+                if let Some((class, ts_weakened)) = class_id {
+                    let objid = c.constvalue.as_oid();
+                    // TS objects below FirstNormalObjectId are always shippable.
+                    if !(ts_weakened && objid < FIRST_NORMAL_OBJECT_ID)
+                        && !is_shippable_obj(glob, objid, class)?
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+            collation = c.constcollid;
+            state = if collation == types_core::InvalidOid || collation == DEFAULT_COLLATION_OID {
+                FdwCollateState::None
+            } else {
+                FdwCollateState::Unsafe
+            };
+        }
+        NodeTag::T_Param => {
+            let p = node.as_param().unwrap();
+            if p.paramkind == types_nodes::ParamKind::PARAM_MULTIEXPR {
+                return Ok(false);
+            }
+            collation = p.paramcollid;
+            state = if collation == types_core::InvalidOid || collation == DEFAULT_COLLATION_OID {
+                FdwCollateState::None
+            } else {
+                FdwCollateState::Unsafe
+            };
+        }
+        NodeTag::T_SubscriptingRef => {
+            let sr = node.as_subscripting_ref().unwrap();
+            if sr.refassgnexpr.is_some() {
+                return Ok(false);
+            }
+            if !walk_opt_list(glob, &sr.refupperindexpr, &mut inner, case_arg_cxt)? {
+                return Ok(false);
+            }
+            inner = LocCxt::empty();
+            if !walk_opt_list(glob, &sr.reflowerindexpr, &mut inner, case_arg_cxt)? {
+                return Ok(false);
+            }
+            inner = LocCxt::empty();
+            if let Some(refexpr) = sr.refexpr {
+                if !foreign_expr_walker(glob, refexpr, &mut inner, case_arg_cxt)? {
+                    return Ok(false);
+                }
+            }
+            collation = sr.refcollid;
+            state = collation_result(&inner, collation);
+        }
+        NodeTag::T_FuncExpr => {
+            let fe = node.as_func_expr().unwrap();
+            if !is_shippable_obj(glob, fe.funcid, PROCEDURE_RELATION_ID)? {
+                return Ok(false);
+            }
+            if !walk_list(glob, &fe.args, &mut inner, case_arg_cxt)? {
+                return Ok(false);
+            }
+            if fe.inputcollid != types_core::InvalidOid
+                && (inner.state != FdwCollateState::Safe || fe.inputcollid != inner.collation)
+            {
+                return Ok(false);
+            }
+            collation = fe.funccollid;
+            state = collation_result(&inner, collation);
+        }
+        NodeTag::T_OpExpr => {
+            let oe = node.as_op_expr().unwrap();
+            if !is_shippable_obj(glob, oe.opno, OPERATOR_RELATION_ID)? {
+                return Ok(false);
+            }
+            if !walk_list(glob, &oe.args, &mut inner, case_arg_cxt)? {
+                return Ok(false);
+            }
+            if oe.inputcollid != types_core::InvalidOid
+                && (inner.state != FdwCollateState::Safe || oe.inputcollid != inner.collation)
+            {
+                return Ok(false);
+            }
+            collation = oe.opcollid;
+            state = collation_result(&inner, collation);
+        }
+        NodeTag::T_DistinctExpr => {
+            let oe = node.as_distinct_expr().unwrap();
+            if !is_shippable_obj(glob, oe.opno, OPERATOR_RELATION_ID)? {
+                return Ok(false);
+            }
+            if !walk_list(glob, &oe.args, &mut inner, case_arg_cxt)? {
+                return Ok(false);
+            }
+            if oe.inputcollid != types_core::InvalidOid
+                && (inner.state != FdwCollateState::Safe || oe.inputcollid != inner.collation)
+            {
+                return Ok(false);
+            }
+            collation = oe.opcollid;
+            state = collation_result(&inner, collation);
+        }
+        NodeTag::T_ScalarArrayOpExpr => {
+            let oe = node.as_scalar_array_op_expr().unwrap();
+            if !is_shippable_obj(glob, oe.opno, OPERATOR_RELATION_ID)? {
+                return Ok(false);
+            }
+            if !walk_list(glob, &oe.args, &mut inner, case_arg_cxt)? {
+                return Ok(false);
+            }
+            if oe.inputcollid != types_core::InvalidOid
+                && (inner.state != FdwCollateState::Safe || oe.inputcollid != inner.collation)
+            {
+                return Ok(false);
+            }
+            collation = types_core::InvalidOid;
+            state = FdwCollateState::None;
+        }
+        NodeTag::T_RelabelType => {
+            let r = node.as_relabel_type().unwrap();
+            if !foreign_expr_walker(glob, r.arg, &mut inner, case_arg_cxt)? {
+                return Ok(false);
+            }
+            collation = r.resultcollid;
+            state = collation_result(&inner, collation);
+        }
+        NodeTag::T_BoolExpr => {
+            let b = node.as_bool_expr().unwrap();
+            if !walk_list(glob, &b.args, &mut inner, case_arg_cxt)? {
+                return Ok(false);
+            }
+            collation = types_core::InvalidOid;
+            state = FdwCollateState::None;
+        }
+        NodeTag::T_NullTest => {
+            let nt = node.as_null_test().unwrap();
+            if let Some(arg) = nt.arg {
+                if !foreign_expr_walker(glob, arg, &mut inner, case_arg_cxt)? {
+                    return Ok(false);
+                }
+            }
+            collation = types_core::InvalidOid;
+            state = FdwCollateState::None;
+        }
+        NodeTag::T_CaseExpr => {
+            let ce = node.as_case_expr().unwrap();
+            let mut arg_cxt = LocCxt::empty();
+            if let Some(arg) = ce.arg {
+                if !foreign_expr_walker(glob, arg, &mut arg_cxt, case_arg_cxt)? {
+                    return Ok(false);
+                }
+            }
+            for whennode in ce.args.iter() {
+                let cw = whennode.as_case_when().unwrap();
+                if ce.arg.is_some() {
+                    // Optimizer may have rewritten the WHEN; only an OpExpr of
+                    // "CaseTestExpr = RHS" shape is deparsable.
+                    let when_expr = cw.expr.expect("CaseWhen has expr");
+                    let Some(op) = when_expr.as_op_expr() else {
+                        return Ok(false);
+                    };
+                    if op.args.len() != 2
+                        || strip_implicit_coercions(op.args.nth(0)).node_tag()
+                            != NodeTag::T_CaseTestExpr
+                    {
+                        return Ok(false);
+                    }
+                }
+                let mut tmp = LocCxt::empty();
+                if let Some(expr) = cw.expr {
+                    if !foreign_expr_walker(glob, expr, &mut tmp, Some(&arg_cxt))? {
+                        return Ok(false);
+                    }
+                }
+                if let Some(result) = cw.result {
+                    if !foreign_expr_walker(glob, result, &mut inner, case_arg_cxt)? {
+                        return Ok(false);
+                    }
+                }
+            }
+            if let Some(defresult) = ce.defresult {
+                if !foreign_expr_walker(glob, defresult, &mut inner, case_arg_cxt)? {
+                    return Ok(false);
+                }
+            }
+            collation = ce.casecollid;
+            state = collation_result(&inner, collation);
+        }
+        NodeTag::T_CaseTestExpr => {
+            let c = node.as_case_test_expr().unwrap();
+            let Some(arg) = case_arg_cxt else {
+                return Ok(false);
+            };
+            collation = c.collation;
+            state = if collation == types_core::InvalidOid {
+                FdwCollateState::None
+            } else if arg.state == FdwCollateState::Safe && collation == arg.collation {
+                FdwCollateState::Safe
+            } else if collation == DEFAULT_COLLATION_OID {
+                FdwCollateState::None
+            } else {
+                FdwCollateState::Unsafe
+            };
+        }
+        NodeTag::T_ArrayExpr => {
+            let a = node.as_array_expr().unwrap();
+            if !walk_list(glob, &a.elements, &mut inner, case_arg_cxt)? {
+                return Ok(false);
+            }
+            collation = a.array_collid;
+            state = collation_result(&inner, collation);
+        }
+        NodeTag::T_Aggref => {
+            let agg = node.as_aggref().unwrap();
+            if !is_upper_rel(glob.run, glob.foreignrel) {
+                return Ok(false);
+            }
+            if agg.aggsplit != types_nodes::primnodes::AGGSPLIT_SIMPLE {
+                return Ok(false);
+            }
+            if !is_shippable_obj(glob, agg.aggfnoid, PROCEDURE_RELATION_ID)? {
+                return Ok(false);
+            }
+            for n in agg.args.iter() {
+                let arg = match n.as_target_entry() {
+                    Some(tle) => tle.expr,
+                    None => n,
+                };
+                if !foreign_expr_walker(glob, arg, &mut inner, case_arg_cxt)? {
+                    return Ok(false);
+                }
+            }
+            for srt_node in agg.aggorder.iter() {
+                let srt = srt_node
+                    .as_variant::<types_nodes::parsenodes::SortGroupClause>()
+                    .expect("aggorder holds SortGroupClause");
+                let tle = get_sortgroupref_tle(srt.tleSortGroupRef, &agg.args)?;
+                let sortcoltype = expr_type(tle.expr);
+                let typentry = typcache::lookup_type_cache(
+                    sortcoltype,
+                    typcache::TYPECACHE_LT_OPR | typcache::TYPECACHE_GT_OPR,
+                )?;
+                if srt.sortop != typentry.lt_opr()
+                    && srt.sortop != typentry.gt_opr()
+                    && !is_shippable_obj(glob, srt.sortop, OPERATOR_RELATION_ID)?
+                {
+                    return Ok(false);
+                }
+            }
+            if let Some(aggfilter) = agg.aggfilter {
+                if !foreign_expr_walker(glob, aggfilter, &mut inner, case_arg_cxt)? {
+                    return Ok(false);
+                }
+            }
+            if agg.inputcollid != types_core::InvalidOid
+                && (inner.state != FdwCollateState::Safe || agg.inputcollid != inner.collation)
+            {
+                return Ok(false);
+            }
+            collation = agg.aggcollid;
+            state = collation_result(&inner, collation);
+        }
+        NodeTag::T_List => {
+            let l = node.as_list().unwrap();
+            if !walk_list(glob, l, &mut inner, case_arg_cxt)? {
+                return Ok(false);
+            }
+            collation = inner.collation;
+            state = inner.state;
+            check_type = false;
+        }
+        _ => return Ok(false),
+    }
+
+    if check_type && !is_shippable_obj(glob, expr_type(node), TYPE_RELATION_ID)? {
+        return Ok(false);
+    }
+    merge_collation(outer_cxt, collation, state);
+    Ok(true)
+}
+
+fn walk_list<'mcx>(
+    glob: &GlobCxt<'_, 'mcx>,
+    list: &types_nodes::list::NodeList<'mcx>,
+    inner: &mut LocCxt,
+    case_arg_cxt: Option<&LocCxt>,
+) -> PgResult<bool> {
+    for n in list.iter() {
+        if !foreign_expr_walker(glob, n, inner, case_arg_cxt)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn walk_opt_list<'mcx>(
+    glob: &GlobCxt<'_, 'mcx>,
+    list: &types_nodes::list::OptNodeList<'mcx>,
+    inner: &mut LocCxt,
+    case_arg_cxt: Option<&LocCxt>,
+) -> PgResult<bool> {
+    for cell in list.iter() {
+        if let Some(n) = cell {
+            if !foreign_expr_walker(glob, n, inner, case_arg_cxt)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn get_sortgroupref_tle<'mcx>(
+    sortref: u32,
+    target_list: &types_nodes::list::NodeList<'mcx>,
+) -> PgResult<&'mcx types_nodes::TargetEntry<'mcx>> {
+    for n in target_list.iter() {
+        let tle = n.as_target_entry().expect("targetList entry");
+        if tle.ressortgroupref == sortref {
+            return Ok(tle);
+        }
+    }
+    Err(Box::new(PgError::error(
+        "ORDER/GROUP BY expression not found in targetlist",
+    )))
+}
+
+/// is_foreign_pathkey (deparse.c:1121): is the sort expression described by
+/// `pathkey` safe to push to the foreign server?
+pub(crate) fn is_foreign_pathkey<'mcx>(
+    run: &PlannerRun<'mcx>,
+    baserel: RelId,
+    pathkey: &types_pathnodes::PathKey,
+) -> PgResult<bool> {
+    let pathkey_ec = pathkey.pk_eclass.expect("canonical pathkey has an eclass");
+    // is_foreign_expr would detect volatile expressions as well, but checking
+    // ec_has_volatile here saves some cycles.
+    if run.root.ec(pathkey_ec).ec_has_volatile {
+        return Ok(false);
+    }
+    // Can't push down the sort if the pathkey's opfamily is not shippable.
+    {
+        let fp = fpinfo(run.root.rel(baserel)).borrow();
+        if !shippable::is_shippable(
+            run.mcx,
+            pathkey.pk_opfamily,
+            OPERATOR_FAMILY_RELATION_ID,
+            fp.serverid(),
+            &fp.shippable_extensions,
+        )? {
+            return Ok(false);
+        }
+    }
+    // Can push if a suitable EC member exists.
+    Ok(crate::plan::find_em_for_rel(run, pathkey_ec, baserel)?.is_some())
+}
+
+/// is_foreign_param: does this top-level expr have to be sent as a Param?
+pub fn is_foreign_param<'mcx>(run: &PlannerRun<'mcx>, baserel: RelId, expr: Node<'mcx>) -> bool {
+    match expr.node_tag() {
+        NodeTag::T_Var => {
+            let var = expr.as_var().unwrap();
+            let relids_rel = {
+                let fp = fpinfo(run.root.rel(baserel)).borrow();
+                if is_upper_rel(run, baserel) {
+                    fp.outerrel.expect("upperrel outerrel")
+                } else {
+                    baserel
+                }
+            };
+            let relids = &run.root.rel(relids_rel).relids;
+            !(types_pathnodes::relids::relids_is_member(var.varno, relids)
+                && var.varlevelsup == 0)
+        }
+        NodeTag::T_Param => true,
+        _ => false,
+    }
+}
+
+// ---------- name / literal helpers ----------
+
+pub fn get_jointype_name(jointype: JoinType) -> PgResult<&'static str> {
+    match jointype {
+        JoinType::JOIN_INNER => Ok("INNER"),
+        JoinType::JOIN_LEFT => Ok("LEFT"),
+        JoinType::JOIN_RIGHT => Ok("RIGHT"),
+        JoinType::JOIN_FULL => Ok("FULL"),
+        JoinType::JOIN_SEMI => Ok("SEMI"),
+        // Shouldn't come here, but protect from buggy code (deparse.c:1660,
+        // elog(ERROR)).
+        other => Err(unsupported_join_type(other as u32)),
+    }
+}
+
+#[track_caller]
+#[cold]
+fn unsupported_join_type(jointype: u32) -> Box<PgError> {
+    Box::new(PgError::error(format!("unsupported join type {jointype}")))
+}
+
+fn deparse_type_name(type_oid: Oid, typemod: i32) -> PgResult<String> {
+    let mut flags = FORMAT_TYPE_TYPEMOD_GIVEN;
+    if !shippable::is_builtin(type_oid) {
+        flags |= FORMAT_TYPE_FORCE_QUALIFY;
+    }
+    Ok(format_type_extended(type_oid, typemod, flags)?.expect("format_type non-null"))
+}
+
+/// deparseStringLiteral: single-quoted, with E'' when backslashes appear.
+pub fn deparse_string_literal(buf: &mut PgString<'_>, val: &str) {
+    const ESCAPE_STRING_SYNTAX: char = 'E';
+    if val.contains('\\') {
+        buf.push(ESCAPE_STRING_SYNTAX);
+    }
+    buf.push('\'');
+    for ch in val.chars() {
+        if ch == '\'' || ch == '\\' {
+            buf.push(ch);
+        }
+        buf.push(ch);
+    }
+    buf.push('\'');
+}
+
+pub(crate) fn append_quoted_identifier(
+    buf: &mut PgString<'_>,
+    mcx: Mcx<'_>,
+    ident: &str,
+) -> PgResult<()> {
+    let q = quote_identifier(mcx, ident.as_bytes())?;
+    // SAFETY: quote_identifier preserves the (UTF-8) ident bytes, only adding
+    // ASCII `"` quoting.
+    buf.push_str(unsafe { core::str::from_utf8_unchecked(q.as_bytes()) });
+    Ok(())
+}
+
+// ---------- deparse context ----------
+
+pub struct DeparseCtx<'a, 'mcx> {
+    pub run: &'a PlannerRun<'mcx>,
+    pub foreignrel: RelId,
+    pub scanrel: RelId,
+    pub buf: PgString<'mcx>,
+    /// None = EXPLAIN (params become placeholders); Some = real params_list.
+    pub params_list: Option<PgVec<'mcx, Node<'mcx>>>,
+    pub mcx: Mcx<'mcx>,
+}
+
+impl<'a, 'mcx> DeparseCtx<'a, 'mcx> {
+    fn scanrel_relids(&self) -> &types_pathnodes::Relids<'mcx> {
+        &self.run.root.rel(self.scanrel).relids
+    }
+}
+
+fn deparse_expr<'mcx>(ctx: &mut DeparseCtx<'_, 'mcx>, node: Node<'mcx>) -> PgResult<()> {
+    match node.node_tag() {
+        NodeTag::T_Var => deparse_var(ctx, node),
+        NodeTag::T_Const => deparse_const(ctx, node.as_const().unwrap(), 0),
+        NodeTag::T_Param => deparse_param(ctx, node),
+        NodeTag::T_SubscriptingRef => deparse_subscripting_ref(ctx, node),
+        NodeTag::T_FuncExpr => deparse_func_expr(ctx, node),
+        NodeTag::T_OpExpr => deparse_op_expr(ctx, node),
+        NodeTag::T_DistinctExpr => deparse_distinct_expr(ctx, node),
+        NodeTag::T_ScalarArrayOpExpr => deparse_scalar_array_op_expr(ctx, node),
+        NodeTag::T_RelabelType => deparse_relabel_type(ctx, node.as_relabel_type().unwrap()),
+        NodeTag::T_BoolExpr => deparse_bool_expr(ctx, node.as_bool_expr().unwrap()),
+        NodeTag::T_NullTest => deparse_null_test(ctx, node.as_null_test().unwrap()),
+        NodeTag::T_CaseExpr => deparse_case_expr(ctx, node.as_case_expr().unwrap()),
+        NodeTag::T_ArrayExpr => deparse_array_expr(ctx, node.as_array_expr().unwrap()),
+        NodeTag::T_Aggref => deparse_aggref(ctx, node.as_aggref().unwrap()),
+        other => Err(unsupported_deparse_expr(other)),
+    }
+}
+
+// deparseExpr's default arm (deparse.c:2932): elog(ERROR) over the node tag.
+#[track_caller]
+#[cold]
+fn unsupported_deparse_expr(tag: NodeTag) -> Box<PgError> {
+    // C prints (int) nodeTag(node); the tag values are C's (tags.rs).
+    Box::new(PgError::error(format!(
+        "unsupported expression type for deparse: {}",
+        tag as u16
+    )))
+}
+
+fn deparse_var<'mcx>(ctx: &mut DeparseCtx<'_, 'mcx>, node: Node<'mcx>) -> PgResult<()> {
+    let var = node.as_var().unwrap();
+    let (qualify_col, is_foreign) = {
+        let relids = ctx.scanrel_relids();
+        (
+            types_pathnodes::relids::relids_num_members(relids) > 1,
+            types_pathnodes::relids::relids_is_member(var.varno, relids) && var.varlevelsup == 0,
+        )
+    };
+
+    if is_foreign {
+        if let Some((relno, colno)) = is_subquery_var(ctx.run, ctx.scanrel, var)? {
+            let _ = write!(
+                ctx.buf,
+                "{SUBQUERY_REL_ALIAS_PREFIX}{relno}.{SUBQUERY_COL_ALIAS_PREFIX}{colno}"
+            );
+            return Ok(());
+        }
+        let rte = ctx.run.rte(var.varno as usize);
+        deparse_column_ref(ctx, var.varno, var.varattno, rte, qualify_col)?;
+    } else if ctx.params_list.is_some() {
+        let pindex = param_index(ctx, node)?;
+        print_remote_param(ctx, pindex, var.vartype, var.vartypmod)?;
+    } else {
+        print_remote_placeholder(ctx, var.vartype, var.vartypmod)?;
+    }
+    Ok(())
+}
+
+// is_subquery_var (deparse.c): a Var of a lower relation that got deparsed as
+// a subquery reads as "sN.cM". Returns the alias ids, or None for a direct
+// column reference.
+fn is_subquery_var(
+    run: &PlannerRun<'_>,
+    foreignrel: RelId,
+    var: &types_nodes::primnodes::Var,
+) -> PgResult<Option<(i32, i32)>> {
+    if !is_join_rel(run, foreignrel) {
+        return Ok(None);
+    }
+    let (outerrel, innerrel, in_lower) = {
+        let fp = fpinfo(run.root.rel(foreignrel)).borrow();
+        (
+            fp.outerrel.expect("join fpinfo outerrel"),
+            fp.innerrel.expect("join fpinfo innerrel"),
+            types_pathnodes::relids::relids_is_member(var.varno, &fp.lower_subquery_rels),
+        )
+    };
+    if !in_lower {
+        return Ok(None);
+    }
+    let (side, make_subquery) = if types_pathnodes::relids::relids_is_member(
+        var.varno,
+        &run.root.rel(outerrel).relids,
+    ) {
+        (outerrel, fpinfo(run.root.rel(foreignrel)).borrow().make_outerrel_subquery)
+    } else {
+        debug_assert!(types_pathnodes::relids::relids_is_member(
+            var.varno,
+            &run.root.rel(innerrel).relids
+        ));
+        (innerrel, fpinfo(run.root.rel(foreignrel)).borrow().make_innerrel_subquery)
+    };
+    if make_subquery {
+        Ok(Some(get_relation_column_alias_ids(run, side, var)?))
+    } else {
+        is_subquery_var(run, side, var)
+    }
+}
+
+fn get_relation_column_alias_ids(
+    run: &PlannerRun<'_>,
+    foreignrel: RelId,
+    var: &types_nodes::primnodes::Var,
+) -> PgResult<(i32, i32)> {
+    let relno = fpinfo(run.root.rel(foreignrel)).borrow().relation_index;
+    let rel = run.root.rel(foreignrel);
+    let exprs = &run.pathtarget(rel.pathtarget_id.expect("rel has reltarget")).exprs;
+    for (i, &id) in exprs.iter().enumerate() {
+        let node = *run.root.expr_node(id);
+        if let Some(tlvar) = node.as_var() {
+            if tlvar.varno == var.varno && tlvar.varattno == var.varattno {
+                return Ok((relno, (i + 1) as i32));
+            }
+        }
+    }
+    // Shouldn't get here (deparse.c:4205).
+    Err(Box::new(PgError::error("unexpected expression in subquery output")))
+}
+
+fn param_index<'mcx>(ctx: &mut DeparseCtx<'_, 'mcx>, node: Node<'mcx>) -> PgResult<usize> {
+    let list = ctx.params_list.as_mut().expect("param_index only with params_list");
+    for (i, existing) in list.iter().enumerate() {
+        if equal(node, *existing) {
+            return Ok(i + 1);
+        }
+    }
+    list.push(node);
+    Ok(list.len())
+}
+
+fn deparse_const(ctx: &mut DeparseCtx<'_, '_>, node: &Const, showtype: i32) -> PgResult<()> {
+    if node.constisnull {
+        ctx.buf.push_str("NULL");
+        if showtype >= 0 {
+            let ty = deparse_type_name(node.consttype, node.consttypmod)?;
+            let _ = write!(ctx.buf, "::{ty}");
+        }
+        return Ok(());
+    }
+
+    let (typoutput, _) = lsyscache::getTypeOutputInfo(node.consttype)?;
+    let extval = output_function_call(ctx.mcx, typoutput, node.constvalue)?;
+    let extval = extval.as_str();
+
+    let mut isfloat = false;
+    let mut isstring = false;
+
+    match node.consttype {
+        INT2OID | INT4OID | INT8OID | OIDOID | FLOAT4OID | FLOAT8OID | NUMERICOID => {
+            if extval.bytes().all(|b| b"0123456789+-eE.".contains(&b)) {
+                if extval.starts_with('+') || extval.starts_with('-') {
+                    let _ = write!(ctx.buf, "({extval})");
+                } else {
+                    ctx.buf.push_str(extval);
+                }
+                if extval.bytes().any(|b| b"eE.".contains(&b)) {
+                    isfloat = true;
+                }
+            } else {
+                let _ = write!(ctx.buf, "'{extval}'");
+            }
+        }
+        BITOID | VARBITOID => {
+            let _ = write!(ctx.buf, "B'{extval}'");
+        }
+        BOOLOID => {
+            ctx.buf.push_str(if extval == "t" { "true" } else { "false" });
+        }
+        _ => {
+            deparse_string_literal(&mut ctx.buf, extval);
+            isstring = true;
+        }
+    }
+
+    if showtype == -1 {
+        return Ok(());
+    }
+
+    let needlabel = match node.consttype {
+        BOOLOID | INT4OID | UNKNOWNOID => false,
+        NUMERICOID => !isfloat || node.consttypmod >= 0,
+        _ => {
+            if showtype == -2 {
+                !isstring
+            } else {
+                true
+            }
+        }
+    };
+    if needlabel || showtype > 0 {
+        let ty = deparse_type_name(node.consttype, node.consttypmod)?;
+        let _ = write!(ctx.buf, "::{ty}");
+    }
+    Ok(())
+}
+
+fn deparse_param<'mcx>(ctx: &mut DeparseCtx<'_, 'mcx>, node: Node<'mcx>) -> PgResult<()> {
+    let p = node.as_param().unwrap();
+    let (paramtype, paramtypmod) = (p.paramtype, p.paramtypmod);
+    if ctx.params_list.is_some() {
+        let pindex = param_index(ctx, node)?;
+        print_remote_param(ctx, pindex, paramtype, paramtypmod)?;
+    } else {
+        print_remote_placeholder(ctx, paramtype, paramtypmod)?;
+    }
+    Ok(())
+}
+
+fn deparse_subscripting_ref<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    node: Node<'mcx>,
+) -> PgResult<()> {
+    let sr = node.as_subscripting_ref().unwrap();
+    ctx.buf.push('(');
+    let refexpr = sr.refexpr.expect("SubscriptingRef refexpr");
+    if refexpr.node_tag() == NodeTag::T_Var {
+        deparse_expr(ctx, refexpr)?;
+    } else {
+        ctx.buf.push('(');
+        deparse_expr(ctx, refexpr)?;
+        ctx.buf.push(')');
+    }
+    let lower = &sr.reflowerindexpr;
+    let has_lower = !lower.is_nil();
+    for (i, up) in sr.refupperindexpr.iter().enumerate() {
+        ctx.buf.push('[');
+        if has_lower {
+            if let Some(low) = lower.nth(i) {
+                deparse_expr(ctx, low)?;
+            }
+            ctx.buf.push(':');
+        }
+        if let Some(up) = up {
+            deparse_expr(ctx, up)?;
+        }
+        ctx.buf.push(']');
+    }
+    ctx.buf.push(')');
+    Ok(())
+}
+
+fn deparse_func_expr<'mcx>(ctx: &mut DeparseCtx<'_, 'mcx>, node: Node<'mcx>) -> PgResult<()> {
+    let f = node.as_func_expr().unwrap();
+    if f.funcformat == CoercionForm::COERCE_IMPLICIT_CAST {
+        return deparse_expr(ctx, f.args.nth(0));
+    }
+    if f.funcformat == CoercionForm::COERCE_EXPLICIT_CAST {
+        let rettype = f.funcresulttype;
+        let coerced_typmod = expr_typmod(node);
+        deparse_expr(ctx, f.args.nth(0))?;
+        let ty = deparse_type_name(rettype, coerced_typmod)?;
+        let _ = write!(ctx.buf, "::{ty}");
+        return Ok(());
+    }
+    let node = f;
+    let use_variadic = node.funcvariadic;
+    append_function_name(ctx, node.funcid)?;
+    ctx.buf.push('(');
+    let n = node.args.len();
+    for (i, arg) in node.args.iter().enumerate() {
+        if i > 0 {
+            ctx.buf.push_str(", ");
+        }
+        if use_variadic && i + 1 == n {
+            ctx.buf.push_str("VARIADIC ");
+        }
+        deparse_expr(ctx, arg)?;
+    }
+    ctx.buf.push(')');
+    Ok(())
+}
+
+fn is_plain_foreign_var(ctx: &DeparseCtx<'_, '_>, node: Node<'_>) -> bool {
+    let node = if let Some(r) = node.as_relabel_type() {
+        if r.relabelformat == CoercionForm::COERCE_IMPLICIT_CAST {
+            r.arg
+        } else {
+            node
+        }
+    } else {
+        node
+    };
+    if let Some(var) = node.as_var() {
+        let relids = ctx.scanrel_relids();
+        return types_pathnodes::relids::relids_is_member(var.varno, relids)
+            && var.varlevelsup == 0;
+    }
+    false
+}
+
+fn deparse_op_expr<'mcx>(ctx: &mut DeparseCtx<'_, 'mcx>, node: Node<'mcx>) -> PgResult<()> {
+    let oe = node.as_op_expr().unwrap();
+    let (oprname, oprnamespace) = operator_name_nsp(oe.opno)?;
+    let nargs = oe.args.len();
+    // oprkind 'b' iff binary (C asserts this matches list length).
+    let binary = nargs == 2;
+
+    ctx.buf.push('(');
+    let mut can_suppress_right = false;
+    if binary {
+        let left = oe.args.nth(0);
+        let right = oe.args.nth(1);
+        let left_type = expr_type(left);
+        let right_type = expr_type(right);
+        let mut can_suppress_left = false;
+        if left_type == right_type {
+            if left.node_tag() == NodeTag::T_Const {
+                can_suppress_left = is_plain_foreign_var(ctx, right);
+            } else if right.node_tag() == NodeTag::T_Const {
+                can_suppress_right = is_plain_foreign_var(ctx, left);
+            }
+        }
+        if can_suppress_left {
+            deparse_const(ctx, left.as_const().unwrap(), -2)?;
+        } else {
+            deparse_expr(ctx, left)?;
+        }
+        ctx.buf.push(' ');
+    }
+    deparse_operator_name(&mut ctx.buf, ctx.mcx, &oprname, oprnamespace)?;
+    ctx.buf.push(' ');
+    let right = oe.args.nth(nargs - 1);
+    if can_suppress_right {
+        deparse_const(ctx, right.as_const().unwrap(), -2)?;
+    } else {
+        deparse_expr(ctx, right)?;
+    }
+    ctx.buf.push(')');
+    Ok(())
+}
+
+fn deparse_distinct_expr<'mcx>(ctx: &mut DeparseCtx<'_, 'mcx>, node: Node<'mcx>) -> PgResult<()> {
+    let de = node.as_distinct_expr().unwrap();
+    debug_assert_eq!(de.args.len(), 2);
+    ctx.buf.push('(');
+    deparse_expr(ctx, de.args.nth(0))?;
+    ctx.buf.push_str(" IS DISTINCT FROM ");
+    deparse_expr(ctx, de.args.nth(1))?;
+    ctx.buf.push(')');
+    Ok(())
+}
+
+fn deparse_scalar_array_op_expr<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    node: Node<'mcx>,
+) -> PgResult<()> {
+    let oe = node.as_scalar_array_op_expr().unwrap();
+    let (oprname, oprnamespace) = operator_name_nsp(oe.opno)?;
+    debug_assert_eq!(oe.args.len(), 2);
+    ctx.buf.push('(');
+    deparse_expr(ctx, oe.args.nth(0))?;
+    ctx.buf.push(' ');
+    deparse_operator_name(&mut ctx.buf, ctx.mcx, &oprname, oprnamespace)?;
+    let _ = write!(ctx.buf, " {} (", if oe.useOr { "ANY" } else { "ALL" });
+    deparse_expr(ctx, oe.args.nth(1))?;
+    ctx.buf.push(')');
+    ctx.buf.push(')');
+    Ok(())
+}
+
+fn deparse_relabel_type<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    node: &types_nodes::RelabelType<'mcx>,
+) -> PgResult<()> {
+    deparse_expr(ctx, node.arg)?;
+    if node.relabelformat != CoercionForm::COERCE_IMPLICIT_CAST {
+        let ty = deparse_type_name(node.resulttype, node.resulttypmod)?;
+        let _ = write!(ctx.buf, "::{ty}");
+    }
+    Ok(())
+}
+
+fn deparse_bool_expr<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    node: &types_nodes::BoolExpr<'mcx>,
+) -> PgResult<()> {
+    let op = match node.boolop {
+        BoolExprType::AND_EXPR => "AND",
+        BoolExprType::OR_EXPR => "OR",
+        BoolExprType::NOT_EXPR => {
+            ctx.buf.push_str("(NOT ");
+            deparse_expr(ctx, node.args.nth(0))?;
+            ctx.buf.push(')');
+            return Ok(());
+        }
+    };
+    ctx.buf.push('(');
+    for (i, arg) in node.args.iter().enumerate() {
+        if i > 0 {
+            let _ = write!(ctx.buf, " {op} ");
+        }
+        deparse_expr(ctx, arg)?;
+    }
+    ctx.buf.push(')');
+    Ok(())
+}
+
+fn deparse_null_test<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    node: &types_nodes::NullTest<'mcx>,
+) -> PgResult<()> {
+    ctx.buf.push('(');
+    let arg = node.arg.expect("NullTest arg");
+    deparse_expr(ctx, arg)?;
+    let is_null = node.nulltesttype == NullTestType::IS_NULL;
+    if node.argisrow || !lsyscache::type_is_rowtype(expr_type(arg))? {
+        ctx.buf.push_str(if is_null { " IS NULL)" } else { " IS NOT NULL)" });
+    } else {
+        ctx.buf.push_str(if is_null {
+            " IS NOT DISTINCT FROM NULL)"
+        } else {
+            " IS DISTINCT FROM NULL)"
+        });
+    }
+    Ok(())
+}
+
+fn deparse_case_expr<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    node: &types_nodes::primnodes::CaseExpr<'mcx>,
+) -> PgResult<()> {
+    ctx.buf.push_str("(CASE");
+    if let Some(arg) = node.arg {
+        ctx.buf.push(' ');
+        deparse_expr(ctx, arg)?;
+    }
+    for whennode in node.args.iter() {
+        let cw = whennode.as_case_when().unwrap();
+        ctx.buf.push_str(" WHEN ");
+        let when_expr = cw.expr.expect("CaseWhen expr");
+        if node.arg.is_none() {
+            deparse_expr(ctx, when_expr)?;
+        } else {
+            let op = when_expr.as_op_expr().expect("CASE arg WHEN is OpExpr");
+            deparse_expr(ctx, op.args.nth(1))?;
+        }
+        ctx.buf.push_str(" THEN ");
+        deparse_expr(ctx, cw.result.expect("CaseWhen result"))?;
+    }
+    if let Some(defresult) = node.defresult {
+        ctx.buf.push_str(" ELSE ");
+        deparse_expr(ctx, defresult)?;
+    }
+    ctx.buf.push_str(" END)");
+    Ok(())
+}
+
+fn deparse_array_expr<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    node: &types_nodes::ArrayExpr<'mcx>,
+) -> PgResult<()> {
+    ctx.buf.push_str("ARRAY[");
+    for (i, elem) in node.elements.iter().enumerate() {
+        if i > 0 {
+            ctx.buf.push_str(", ");
+        }
+        deparse_expr(ctx, elem)?;
+    }
+    ctx.buf.push(']');
+    if node.elements.is_nil() {
+        let ty = deparse_type_name(node.array_typeid, -1)?;
+        let _ = write!(ctx.buf, "::{ty}");
+    }
+    Ok(())
+}
+
+fn deparse_aggref<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    node: &'mcx types_nodes::primnodes::Aggref<'mcx>,
+) -> PgResult<()> {
+    debug_assert_eq!(node.aggsplit, types_nodes::primnodes::AGGSPLIT_SIMPLE);
+    let use_variadic = node.aggvariadic;
+    append_function_name(ctx, node.aggfnoid)?;
+    ctx.buf.push('(');
+    if !node.aggdistinct.is_nil() {
+        ctx.buf.push_str("DISTINCT ");
+    }
+    let ordered_set = node.aggkind == types_nodes::primnodes::AGGKIND_ORDERED_SET
+        || node.aggkind == types_nodes::primnodes::AGGKIND_HYPOTHETICAL;
+    if ordered_set {
+        for (i, arg) in node.aggdirectargs.iter().enumerate() {
+            if i > 0 {
+                ctx.buf.push_str(", ");
+            }
+            deparse_expr(ctx, arg)?;
+        }
+        ctx.buf.push_str(") WITHIN GROUP (ORDER BY ");
+        append_agg_order_by(ctx, &node.aggorder, &node.args)?;
+    } else {
+        if node.aggstar {
+            ctx.buf.push('*');
+        } else {
+            let n = node.args.len();
+            let mut first = true;
+            for (i, argnode) in node.args.iter().enumerate() {
+                let tle = argnode.as_target_entry().unwrap();
+                if tle.resjunk {
+                    continue;
+                }
+                if !first {
+                    ctx.buf.push_str(", ");
+                }
+                first = false;
+                if use_variadic && i + 1 == n {
+                    ctx.buf.push_str("VARIADIC ");
+                }
+                deparse_expr(ctx, tle.expr)?;
+            }
+        }
+        if !node.aggorder.is_nil() {
+            ctx.buf.push_str(" ORDER BY ");
+            append_agg_order_by(ctx, &node.aggorder, &node.args)?;
+        }
+    }
+    if let Some(aggfilter) = node.aggfilter {
+        ctx.buf.push_str(") FILTER (WHERE ");
+        deparse_expr(ctx, aggfilter)?;
+    }
+    ctx.buf.push(')');
+    Ok(())
+}
+
+fn append_agg_order_by<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    order_list: &types_nodes::list::NodeList<'mcx>,
+    target_list: &types_nodes::list::NodeList<'mcx>,
+) -> PgResult<()> {
+    for (i, srtnode) in order_list.iter().enumerate() {
+        let srt = srtnode
+            .as_variant::<types_nodes::parsenodes::SortGroupClause>()
+            .expect("aggorder holds SortGroupClause");
+        if i > 0 {
+            ctx.buf.push_str(", ");
+        }
+        let sortexpr = deparse_sort_group_clause(ctx, srt.tleSortGroupRef, target_list, false)?;
+        append_order_by_suffix(ctx, srt.sortop, expr_type(sortexpr), srt.nulls_first)?;
+    }
+    Ok(())
+}
+
+fn append_order_by_suffix<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    sortop: Oid,
+    sortcoltype: Oid,
+    nulls_first: bool,
+) -> PgResult<()> {
+    let typentry = typcache::lookup_type_cache(
+        sortcoltype,
+        typcache::TYPECACHE_LT_OPR | typcache::TYPECACHE_GT_OPR,
+    )?;
+    if sortop == typentry.lt_opr() {
+        ctx.buf.push_str(" ASC");
+    } else if sortop == typentry.gt_opr() {
+        ctx.buf.push_str(" DESC");
+    } else {
+        ctx.buf.push_str(" USING ");
+        let (oprname, oprnamespace) = operator_name_nsp(sortop)?;
+        deparse_operator_name(&mut ctx.buf, ctx.mcx, &oprname, oprnamespace)?;
+    }
+    ctx.buf.push_str(if nulls_first { " NULLS FIRST" } else { " NULLS LAST" });
+    Ok(())
+}
+
+fn deparse_sort_group_clause<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    reference: u32,
+    tlist: &types_nodes::list::NodeList<'mcx>,
+    force_colno: bool,
+) -> PgResult<Node<'mcx>> {
+    let tle = get_sortgroupref_tle(reference, tlist)?;
+    let expr = tle.expr;
+    if force_colno {
+        debug_assert!(!tle.resjunk);
+        let _ = write!(ctx.buf, "{}", tle.resno);
+    } else if expr.node_tag() == NodeTag::T_Const {
+        deparse_const(ctx, expr.as_const().unwrap(), 1)?;
+    } else if expr.node_tag() == NodeTag::T_Var {
+        deparse_expr(ctx, expr)?;
+    } else {
+        ctx.buf.push('(');
+        deparse_expr(ctx, expr)?;
+        ctx.buf.push(')');
+    }
+    Ok(expr)
+}
+
+fn deparse_operator_name(
+    buf: &mut PgString<'_>,
+    mcx: Mcx<'_>,
+    oprname: &str,
+    oprnamespace: Oid,
+) -> PgResult<()> {
+    if oprnamespace != PG_CATALOG_NAMESPACE {
+        let nsp = lsyscache::get_namespace_name(mcx, oprnamespace)?
+            .expect("operator namespace exists");
+        buf.push_str("OPERATOR(");
+        append_quoted_identifier(buf, mcx, nsp.as_str())?;
+        let _ = write!(buf, ".{oprname})");
+    } else {
+        buf.push_str(oprname);
+    }
+    Ok(())
+}
+
+fn print_remote_param<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    paramindex: usize,
+    paramtype: Oid,
+    paramtypmod: i32,
+) -> PgResult<()> {
+    let ptypename = deparse_type_name(paramtype, paramtypmod)?;
+    let _ = write!(ctx.buf, "${paramindex}::{ptypename}");
+    Ok(())
+}
+
+fn print_remote_placeholder<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    paramtype: Oid,
+    paramtypmod: i32,
+) -> PgResult<()> {
+    let ptypename = deparse_type_name(paramtype, paramtypmod)?;
+    let _ = write!(ctx.buf, "((SELECT null::{ptypename})::{ptypename})");
+    Ok(())
+}
+
+fn append_function_name<'mcx>(ctx: &mut DeparseCtx<'_, 'mcx>, funcid: Oid) -> PgResult<()> {
+    let pronamespace = lsyscache::function::get_func_namespace(funcid)?;
+    if pronamespace != PG_CATALOG_NAMESPACE {
+        let schema =
+            lsyscache::get_namespace_name(ctx.mcx, pronamespace)?.expect("func namespace");
+        append_quoted_identifier(&mut ctx.buf, ctx.mcx, schema.as_str())?;
+        ctx.buf.push('.');
+    }
+    let proname = lsyscache::get_func_name(ctx.mcx, funcid)?.expect("func name");
+    append_quoted_identifier(&mut ctx.buf, ctx.mcx, proname.as_str())?;
+    Ok(())
+}
+
+fn operator_name_nsp(opno: Oid) -> PgResult<(String, Oid)> {
+    let (name, nsp) = syscache_seams::pg_operator_oprnamensp::call(opno)?
+        .expect("cache lookup for operator");
+    // SAFETY: NameData is a NUL-padded server-encoding cstring.
+    let s = name.name_str();
+    let s = core::str::from_utf8(s).expect("operator name is UTF-8").to_string();
+    Ok((s, nsp))
+}
+
+fn output_function_call<'mcx>(
+    mcx: Mcx<'mcx>,
+    typoutput: Oid,
+    value: datum::Datum,
+) -> PgResult<PgString<'mcx>> {
+    let mut finfo = fmgr_seams::fmgr_info::call(typoutput)?;
+    let d = types_fmgr::function_call1_coll_in(&mut finfo, types_core::InvalidOid, mcx, value)?;
+    // SAFETY: output functions return a NUL-terminated cstring datum; copied
+    // out before finfo (and its scratch) dies.
+    let s = unsafe { core::ffi::CStr::from_ptr(d.as_usize() as *const core::ffi::c_char) };
+    PgString::from_str_in(s.to_str().expect("output fn result is UTF-8"), mcx)
+}
+
+// ---------- column / relation / target-list ----------
+
+fn add_rel_qualifier(buf: &mut PgString<'_>, varno: i32) {
+    let _ = write!(buf, "{REL_ALIAS_PREFIX}{varno}.");
+}
+
+fn deparse_column_ref<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    varno: i32,
+    varattno: i16,
+    rte: &types_nodes::parsenodes::RangeTblEntry<'mcx>,
+    qualify_col: bool,
+) -> PgResult<()> {
+    if varattno == SELF_ITEM_POINTER_ATTNUM {
+        if qualify_col {
+            add_rel_qualifier(&mut ctx.buf, varno);
+        }
+        ctx.buf.push_str("ctid");
+    } else if varattno < 0 {
+        let fetchval = if varattno == TABLE_OID_ATTNUM { rte.relid } else { 0 };
+        if qualify_col {
+            ctx.buf.push_str("CASE WHEN (");
+            add_rel_qualifier(&mut ctx.buf, varno);
+            let _ = write!(ctx.buf, "*)::text IS NOT NULL THEN {fetchval} END");
+        } else {
+            let _ = write!(ctx.buf, "{fetchval}");
+        }
+    } else if varattno == 0 {
+        // Whole-row reference: ROW(columns) with an outer-join NULL guard.
+        let rel = table::table_open(ctx.mcx, rte.relid, types_rel::lock::NoLock)?;
+        if qualify_col {
+            ctx.buf.push_str("CASE WHEN (");
+            add_rel_qualifier(&mut ctx.buf, varno);
+            ctx.buf.push_str("*)::text IS NOT NULL THEN ");
+        }
+        ctx.buf.push_str("ROW(");
+        let mut attrs_used = types_nodes::Bitmapset::empty();
+        attrs_used.add_member(ctx.mcx, 0 - FIRST_LOW_INVALID_HEAP_ATTNUM)?;
+        let mut retrieved = PgVec::new_in(ctx.mcx);
+        deparse_target_list(
+            &mut ctx.buf,
+            ctx.mcx,
+            Some(ctx.run),
+            varno,
+            &rel,
+            rte,
+            false,
+            &attrs_used,
+            qualify_col,
+            &mut retrieved,
+        )?;
+        ctx.buf.push(')');
+        if qualify_col {
+            ctx.buf.push_str(" END");
+        }
+        table::table_close(rel, types_rel::lock::NoLock)?;
+    } else {
+        let mut colname: Option<String> = None;
+        for opt in foreigncmds::foreign::GetForeignColumnOptions(ctx.mcx, rte.relid, varattno)?.iter()
+        {
+            if opt.name == "column_name" {
+                colname = Some(opt.require_value()?.to_string());
+                break;
+            }
+        }
+        let colname = match colname {
+            Some(c) => c,
+            None => lsyscache::get_attname(ctx.mcx, rte.relid, varattno, false)?
+                .expect("column exists")
+                .as_str()
+                .to_string(),
+        };
+        if qualify_col {
+            add_rel_qualifier(&mut ctx.buf, varno);
+        }
+        append_quoted_identifier(&mut ctx.buf, ctx.mcx, &colname)?;
+    }
+    Ok(())
+}
+
+/// deparseRelation: schema.table with table_name/schema_name option overrides.
+pub fn deparse_relation<'mcx>(
+    buf: &mut PgString<'mcx>,
+    mcx: Mcx<'mcx>,
+    rel: &types_rel::Relation<'mcx>,
+) -> PgResult<()> {
+    let table = foreigncmds::foreign::GetForeignTable(mcx, rel.rd_id)?;
+    let mut nspname: Option<String> = None;
+    let mut relname: Option<String> = None;
+    for opt in table.options.iter() {
+        if opt.name == "schema_name" {
+            nspname = Some(opt.require_value()?.to_string());
+        } else if opt.name == "table_name" {
+            relname = Some(opt.require_value()?.to_string());
+        }
+    }
+    let nspname = match nspname {
+        Some(n) => n,
+        None => lsyscache::get_namespace_name(mcx, rel.namespace())?
+            .expect("namespace")
+            .as_str()
+            .to_string(),
+    };
+    let relname = match relname {
+        Some(r) => r,
+        None => rel.name().to_string(),
+    };
+    append_quoted_identifier(buf, mcx, &nspname)?;
+    buf.push('.');
+    append_quoted_identifier(buf, mcx, &relname)?;
+    Ok(())
+}
+
+/// deparseTruncateSql (deparse.c:2644): `TRUNCATE <rels> {RESTART|CONTINUE}
+/// IDENTITY [RESTRICT|CASCADE]` over one server's foreign tables.
+pub(crate) fn deparse_truncate_sql<'mcx>(
+    buf: &mut PgString<'mcx>,
+    mcx: Mcx<'mcx>,
+    rels: &[&types_rel::Relation<'mcx>],
+    behavior: types_nodes::parsenodes::DropBehavior,
+    restart_seqs: bool,
+) -> PgResult<()> {
+    buf.push_str("TRUNCATE ");
+    for (i, rel) in rels.iter().enumerate() {
+        if i > 0 {
+            buf.push_str(", ");
+        }
+        deparse_relation(buf, mcx, rel)?;
+    }
+    buf.push_str(if restart_seqs { " RESTART IDENTITY" } else { " CONTINUE IDENTITY" });
+    match behavior {
+        types_nodes::parsenodes::DropBehavior::DROP_RESTRICT => buf.push_str(" RESTRICT"),
+        types_nodes::parsenodes::DropBehavior::DROP_CASCADE => buf.push_str(" CASCADE"),
+    }
+    Ok(())
+}
+
+/// deparseAnalyzeSizeSql (deparse.c:2497): the remote page count, at the
+/// LOCAL block size (C's own note: "perhaps debatable").
+pub(crate) fn deparse_analyze_size_sql<'mcx>(
+    buf: &mut PgString<'mcx>,
+    mcx: Mcx<'mcx>,
+    rel: &types_rel::Relation<'mcx>,
+) -> PgResult<()> {
+    let mut relname = PgString::new_in(mcx);
+    deparse_relation(&mut relname, mcx, rel)?;
+    buf.push_str("SELECT pg_catalog.pg_relation_size(");
+    deparse_string_literal(buf, relname.as_str());
+    buf.push_str(&format!("::pg_catalog.regclass) / {}", types_core::BLCKSZ));
+    Ok(())
+}
+
+/// deparseAnalyzeInfoSql (deparse.c:2519): the remote reltuples and relkind.
+pub(crate) fn deparse_analyze_info_sql<'mcx>(
+    buf: &mut PgString<'mcx>,
+    mcx: Mcx<'mcx>,
+    rel: &types_rel::Relation<'mcx>,
+) -> PgResult<()> {
+    let mut relname = PgString::new_in(mcx);
+    deparse_relation(&mut relname, mcx, rel)?;
+    buf.push_str("SELECT reltuples, relkind FROM pg_catalog.pg_class WHERE oid = ");
+    deparse_string_literal(buf, relname.as_str());
+    buf.push_str("::pg_catalog.regclass");
+    Ok(())
+}
+
+/// deparseAnalyzeSql (deparse.c:2559): the SELECT that fetches sample rows
+/// (every non-dropped column by its remote column_name, plus the sampling
+/// clause for the chosen method); returns the retrieved attnums.
+pub(crate) fn deparse_analyze_sql<'mcx>(
+    buf: &mut PgString<'mcx>,
+    mcx: Mcx<'mcx>,
+    rel: &types_rel::Relation<'mcx>,
+    sample_method: crate::analyze::SamplingMethod,
+    sample_frac: f64,
+) -> PgResult<Vec<i32>> {
+    use crate::analyze::SamplingMethod;
+    let relid = rel.rd_id;
+    let tupdesc = &rel.rd_att;
+    let mut retrieved_attrs: Vec<i32> = Vec::new();
+    let mut first = true;
+
+    buf.push_str("SELECT ");
+    for i in 0..tupdesc.natts as usize {
+        let att = tupdesc.attr(i);
+        // Ignore dropped columns.
+        if att.attisdropped {
+            continue;
+        }
+        if !first {
+            buf.push_str(", ");
+        }
+        first = false;
+
+        // Use attribute name or column_name option.
+        let mut colname: Option<String> = None;
+        for opt in foreigncmds::foreign::GetForeignColumnOptions(mcx, relid, (i + 1) as i16)?.iter() {
+            if opt.name == "column_name" {
+                colname = Some(opt.require_value()?.to_string());
+                break;
+            }
+        }
+        let colname = match colname {
+            Some(c) => c,
+            None => String::from_utf8_lossy(att.attname.name_str()).into_owned(),
+        };
+        append_quoted_identifier(buf, mcx, &colname)?;
+        retrieved_attrs.push((i + 1) as i32);
+    }
+    // Don't generate bad syntax for zero-column relation.
+    if first {
+        buf.push_str("NULL");
+    }
+
+    buf.push_str(" FROM ");
+    deparse_relation(buf, mcx, rel)?;
+
+    match sample_method {
+        SamplingMethod::Off => {}
+        SamplingMethod::Random => {
+            buf.push_str(&format!(" WHERE pg_catalog.random() < {sample_frac:.6}"));
+        }
+        SamplingMethod::System => {
+            buf.push_str(&format!(" TABLESAMPLE SYSTEM({:.6})", 100.0 * sample_frac));
+        }
+        SamplingMethod::Bernoulli => {
+            buf.push_str(&format!(" TABLESAMPLE BERNOULLI({:.6})", 100.0 * sample_frac));
+        }
+        SamplingMethod::Auto => {
+            // should have been resolved into actual method
+            return Err(Box::new(PgError::error("unexpected sampling method")));
+        }
+    }
+    Ok(retrieved_attrs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deparse_target_list<'mcx>(
+    buf: &mut PgString<'mcx>,
+    mcx: Mcx<'mcx>,
+    run: Option<&PlannerRun<'mcx>>,
+    rtindex: i32,
+    rel: &types_rel::Relation<'mcx>,
+    rte: &types_nodes::parsenodes::RangeTblEntry<'mcx>,
+    is_returning: bool,
+    attrs_used: &types_nodes::Bitmapset<'mcx>,
+    qualify_col: bool,
+    retrieved_attrs: &mut PgVec<'mcx, i32>,
+) -> PgResult<()> {
+    let _ = run;
+    let tupdesc = &rel.rd_att;
+    let natts = tupdesc.natts as i32;
+    let have_wholerow = attrs_used.is_member(0 - FIRST_LOW_INVALID_HEAP_ATTNUM);
+    let mut first = true;
+    for i in 1..=natts {
+        let attr = tupdesc.attr(i as usize - 1);
+        if attr.attisdropped {
+            continue;
+        }
+        if have_wholerow || attrs_used.is_member(i - FIRST_LOW_INVALID_HEAP_ATTNUM) {
+            if !first {
+                buf.push_str(", ");
+            } else if is_returning {
+                buf.push_str(" RETURNING ");
+            }
+            first = false;
+            deparse_column_ref_buf(buf, mcx, rtindex, i as i16, rte, qualify_col)?;
+            retrieved_attrs.push(i);
+        }
+    }
+    // ctid, if needed.
+    if attrs_used.is_member(SELF_ITEM_POINTER_ATTNUM as i32 - FIRST_LOW_INVALID_HEAP_ATTNUM) {
+        if !first {
+            buf.push_str(", ");
+        } else if is_returning {
+            buf.push_str(" RETURNING ");
+        }
+        first = false;
+        if qualify_col {
+            add_rel_qualifier(buf, rtindex);
+        }
+        buf.push_str("ctid");
+        retrieved_attrs.push(SELF_ITEM_POINTER_ATTNUM as i32);
+    }
+    if first && !is_returning {
+        buf.push_str("NULL");
+    }
+    Ok(())
+}
+
+// deparse_column_ref without an expr context (targetlist path never emits
+// params/whole-row-CASE beyond qualifiers): plain column reference only.
+fn deparse_column_ref_buf<'mcx>(
+    buf: &mut PgString<'mcx>,
+    mcx: Mcx<'mcx>,
+    varno: i32,
+    varattno: i16,
+    rte: &types_nodes::parsenodes::RangeTblEntry<'mcx>,
+    qualify_col: bool,
+) -> PgResult<()> {
+    if varattno == SELF_ITEM_POINTER_ATTNUM {
+        if qualify_col {
+            add_rel_qualifier(buf, varno);
+        }
+        buf.push_str("ctid");
+        return Ok(());
+    }
+    let mut colname: Option<String> = None;
+    for opt in foreigncmds::foreign::GetForeignColumnOptions(mcx, rte.relid, varattno)?.iter() {
+        if opt.name == "column_name" {
+            colname = Some(opt.require_value()?.to_string());
+            break;
+        }
+    }
+    let colname = match colname {
+        Some(c) => c,
+        None => lsyscache::get_attname(mcx, rte.relid, varattno, false)?
+            .expect("column exists")
+            .as_str()
+            .to_string(),
+    };
+    if qualify_col {
+        add_rel_qualifier(buf, varno);
+    }
+    append_quoted_identifier(buf, mcx, &colname)
+}
+
+// ---------- SELECT-statement construction (base + join relations) ----------
+
+/// deparseSelectStmtForRel (deparse.c:1231): base, join and upper (grouping)
+/// relations. `tlist` is the explicit target list for join/upper rels
+/// (fdw_scan_tlist); ignored for base rels. `pathkeys` adds the ORDER BY
+/// clause (Vars from the scan rel, or from `rel`'s reltarget when
+/// `has_final_sort`); `has_limit` adds the query's LIMIT/OFFSET.
+#[allow(clippy::too_many_arguments)]
+pub fn deparse_select_stmt_for_rel<'mcx>(
+    run: &PlannerRun<'mcx>,
+    rel: RelId,
+    tlist: &NodeList<'mcx>,
+    remote_conds: &[types_pathnodes::RinfoId],
+    pathkeys: &[types_pathnodes::PathKey],
+    has_final_sort: bool,
+    has_limit: bool,
+    params_list: Option<PgVec<'mcx, Node<'mcx>>>,
+) -> PgResult<(PgString<'mcx>, PgVec<'mcx, i32>, Option<PgVec<'mcx, Node<'mcx>>>)> {
+    let mcx = run.mcx;
+    let mut ctx = DeparseCtx {
+        run,
+        foreignrel: rel,
+        scanrel: rel,
+        buf: PgString::new_in(mcx),
+        params_list,
+        mcx,
+    };
+    let mut retrieved_attrs = PgVec::new_in(mcx);
+    deparse_select_stmt_inner(
+        &mut ctx,
+        rel,
+        tlist,
+        remote_conds,
+        pathkeys,
+        has_final_sort,
+        has_limit,
+        false,
+        &mut retrieved_attrs,
+    )?;
+    Ok((ctx.buf, retrieved_attrs, ctx.params_list))
+}
+
+fn is_join_rel(run: &PlannerRun<'_>, rel: RelId) -> bool {
+    matches!(
+        run.root.rel(rel).reloptkind,
+        types_pathnodes::RELOPT_JOINREL | types_pathnodes::RELOPT_OTHER_JOINREL
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deparse_select_stmt_inner<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    rel: RelId,
+    tlist: &NodeList<'mcx>,
+    remote_conds: &[types_pathnodes::RinfoId],
+    pathkeys: &[types_pathnodes::PathKey],
+    has_final_sort: bool,
+    has_limit: bool,
+    is_subquery: bool,
+    retrieved_attrs: &mut PgVec<'mcx, i32>,
+) -> PgResult<()> {
+    let run = ctx.run;
+    let mcx = ctx.mcx;
+    let (save_foreignrel, save_scanrel) = (ctx.foreignrel, ctx.scanrel);
+    let is_upper = is_upper_rel(run, rel);
+    ctx.foreignrel = rel;
+    ctx.scanrel = if is_upper {
+        fpinfo(run.root.rel(rel)).borrow().outerrel.expect("upperrel has outerrel")
+    } else {
+        rel
+    };
+
+    // SELECT clause.
+    ctx.buf.push_str("SELECT ");
+    if is_subquery {
+        deparse_subquery_target_list(ctx)?;
+    } else if is_join_rel(run, rel) || is_upper {
+        deparse_explicit_target_list(ctx, tlist, false, retrieved_attrs)?;
+    } else {
+        let fp = fpinfo(run.root.rel(rel)).borrow();
+        let rte = run.rte(run.root.rel(rel).relid as usize);
+        let opened = table::table_open(mcx, rte.relid, types_rel::lock::NoLock)?;
+        let mut buf = core::mem::replace(&mut ctx.buf, PgString::new_in(mcx));
+        deparse_target_list(
+            &mut buf, mcx, Some(run), run.root.rel(rel).relid as i32, &opened, rte, false,
+            &fp.attrs_used, false, retrieved_attrs,
+        )?;
+        drop(fp);
+        ctx.buf = buf;
+        table::table_close(opened, types_rel::lock::NoLock)?;
+    }
+
+    // For upper rels the WHERE clause comes from the underlying scan rel's
+    // remote conds; the given conds become HAVING.
+    let where_conds: Vec<types_pathnodes::RinfoId> = if is_upper {
+        fpinfo(run.root.rel(ctx.scanrel)).borrow().remote_conds.iter().copied().collect()
+    } else {
+        remote_conds.to_vec()
+    };
+
+    // FROM + WHERE.
+    ctx.buf.push_str(" FROM ");
+    let scanrel = ctx.scanrel;
+    let use_alias =
+        types_pathnodes::relids::relids_num_members(&run.root.rel(scanrel).relids) > 1;
+    let mut additional_conds: Vec<String> = Vec::new();
+    deparse_from_expr_for_rel(ctx, scanrel, use_alias, &mut additional_conds)?;
+    append_where_clause(ctx, &where_conds, &additional_conds)?;
+
+    if is_upper {
+        append_group_by_clause(ctx, tlist)?;
+        if !remote_conds.is_empty() {
+            ctx.buf.push_str(" HAVING ");
+            append_conditions(ctx, remote_conds)?;
+        }
+    }
+
+    // Add ORDER BY clause if we found any useful pathkeys.
+    if !pathkeys.is_empty() {
+        append_order_by_clause(ctx, pathkeys, has_final_sort)?;
+    }
+
+    // Add LIMIT clause if necessary.
+    if has_limit {
+        append_limit_clause(ctx)?;
+    }
+
+    deparse_locking_clause(ctx)?;
+
+    ctx.foreignrel = save_foreignrel;
+    ctx.scanrel = save_scanrel;
+    Ok(())
+}
+
+// deparseLockingClause: FOR UPDATE for UPDATE/DELETE targets (rows lock at
+// fetch time), FOR UPDATE/SHARE for explicit row marks; "OF rN" on joins.
+fn deparse_locking_clause<'mcx>(ctx: &mut DeparseCtx<'_, 'mcx>) -> PgResult<()> {
+    use types_nodes::nodes_enums::LockClauseStrength;
+    let run = ctx.run;
+    let rel = ctx.scanrel;
+    let is_join = is_join_rel(run, rel);
+    let relids: Vec<i32> = {
+        let mut v = Vec::new();
+        for m in types_pathnodes::relids::relids_members(&run.root.rel(rel).relids) {
+            v.push(m);
+        }
+        v
+    };
+    let lower_subquery_rels = {
+        let fp = fpinfo(run.root.rel(rel)).borrow();
+        types_pathnodes::relids::relids_copy(ctx.mcx, &fp.lower_subquery_rels)
+    };
+    let multiple = types_pathnodes::relids::relids_num_members(&run.root.rel(rel).relids) > 1;
+    for relid in relids {
+        if types_pathnodes::relids::relids_is_member(relid, &lower_subquery_rels) {
+            continue;
+        }
+        let cmd = run.parse().commandType;
+        if types_pathnodes::relids::relids_is_member(relid, &run.root.all_result_relids)
+            && (cmd == types_nodes::CmdType::CMD_UPDATE
+                || cmd == types_nodes::CmdType::CMD_DELETE)
+        {
+            ctx.buf.push_str(" FOR UPDATE");
+            if is_join {
+                let _ = write!(ctx.buf, " OF {REL_ALIAS_PREFIX}{relid}");
+            }
+        } else if let Some(rc) = run.rowmarks.iter().find(|rc| rc.rti as i32 == relid) {
+            let strength = rc.strength;
+            match strength {
+                LockClauseStrength::LCS_NONE => {}
+                LockClauseStrength::LCS_FORKEYSHARE | LockClauseStrength::LCS_FORSHARE => {
+                    ctx.buf.push_str(" FOR SHARE");
+                }
+                LockClauseStrength::LCS_FORNOKEYUPDATE
+                | LockClauseStrength::LCS_FORUPDATE => {
+                    ctx.buf.push_str(" FOR UPDATE");
+                }
+            }
+            if multiple && strength != LockClauseStrength::LCS_NONE {
+                let _ = write!(ctx.buf, " OF {REL_ALIAS_PREFIX}{relid}");
+            }
+        }
+    }
+    Ok(())
+}
+
+// appendGroupByClause: ship the whole groupClause, by column number.
+fn append_group_by_clause<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    tlist: &NodeList<'mcx>,
+) -> PgResult<()> {
+    let query = ctx.run.parse();
+    if query.groupClause.is_nil() {
+        return Ok(());
+    }
+    ctx.buf.push_str(" GROUP BY ");
+    let nestlevel = crate::transmission::set_transmission_modes();
+    debug_assert!(query.groupingSets.is_nil());
+    for (i, sgc_node) in query.groupClause.iter().enumerate() {
+        let sgc = sgc_node
+            .as_variant::<types_nodes::parsenodes::SortGroupClause>()
+            .expect("groupClause holds SortGroupClause");
+        if i > 0 {
+            ctx.buf.push_str(", ");
+        }
+        deparse_sort_group_clause(ctx, sgc.tleSortGroupRef, tlist, true)?;
+    }
+    crate::transmission::reset_transmission_modes(nestlevel);
+    Ok(())
+}
+
+// appendOrderByClause (deparse.c:3908): the ORDER BY clause for the given
+// pathkeys. The clause uses Vars from ctx.scanrel if !has_final_sort, or
+// from ctx.foreignrel's reltarget if has_final_sort. Some earlier step
+// verified that a suitable (shippable) pathkey expression exists.
+fn append_order_by_clause<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    pathkeys: &[types_pathnodes::PathKey],
+    has_final_sort: bool,
+) -> PgResult<()> {
+    // Make sure any constants in the exprs are printed portably.
+    let nestlevel = crate::transmission::set_transmission_modes();
+    let r = append_order_by_clause_body(ctx, pathkeys, has_final_sort);
+    crate::transmission::reset_transmission_modes(nestlevel);
+    r
+}
+
+fn append_order_by_clause_body<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    pathkeys: &[types_pathnodes::PathKey],
+    has_final_sort: bool,
+) -> PgResult<()> {
+    let run = ctx.run;
+    let mut gotone = false;
+    for pathkey in pathkeys {
+        let ec = pathkey.pk_eclass.expect("canonical pathkey has an eclass");
+        let em = if has_final_sort {
+            // By construction, ctx.foreignrel is the input relation to the
+            // final sort.
+            crate::plan::find_em_for_rel_target(run, ec, ctx.foreignrel)?
+        } else {
+            crate::plan::find_em_for_rel(run, ec, ctx.scanrel)?
+        };
+        // We don't expect any error here; it would mean that shippability
+        // wasn't verified earlier. For the same reason, we don't recheck
+        // shippability of the sort operator.
+        let Some(em) = em else {
+            return Err(Box::new(PgError::error("could not find pathkey item to sort")));
+        };
+        let (em_expr_id, em_datatype) = {
+            let m = run.root.em(em);
+            (m.em_expr, m.em_datatype)
+        };
+        let em_expr = *run.root.expr_node(em_expr_id);
+
+        // If the member is a Const expression then we needn't add it to the
+        // ORDER BY clause (UNION ALL children with a Const in the tlist; an
+        // integer literal would read as an ordinal column position).
+        if em_expr.node_tag() == NodeTag::T_Const {
+            continue;
+        }
+
+        if !gotone {
+            ctx.buf.push_str(" ORDER BY ");
+            gotone = true;
+        } else {
+            ctx.buf.push_str(", ");
+        }
+
+        // Lookup the operator corresponding to the compare type in the
+        // opclass. The datatype used by the opfamily is not necessarily the
+        // same as the expression type (for array types for example).
+        let oprid = lsyscache::get_opfamily_member_for_cmptype(
+            pathkey.pk_opfamily,
+            em_datatype,
+            em_datatype,
+            pathkey.pk_cmptype,
+        )?;
+        if oprid == types_core::InvalidOid {
+            return Err(Box::new(PgError::error(format!(
+                "missing operator {}({},{}) in opfamily {}",
+                pathkey.pk_cmptype, em_datatype, em_datatype, pathkey.pk_opfamily
+            ))));
+        }
+
+        deparse_expr(ctx, em_expr)?;
+
+        // Here we need to use the expression's actual type to discover
+        // whether the desired operator will be the default or not.
+        append_order_by_suffix(ctx, oprid, expr_type(em_expr), pathkey.pk_nulls_first)?;
+    }
+    Ok(())
+}
+
+// appendLimitClause (deparse.c:4002): LIMIT/OFFSET from the query.
+fn append_limit_clause<'mcx>(ctx: &mut DeparseCtx<'_, 'mcx>) -> PgResult<()> {
+    // Make sure any constants in the exprs are printed portably.
+    let nestlevel = crate::transmission::set_transmission_modes();
+    let r = append_limit_clause_body(ctx);
+    crate::transmission::reset_transmission_modes(nestlevel);
+    r
+}
+
+fn append_limit_clause_body<'mcx>(ctx: &mut DeparseCtx<'_, 'mcx>) -> PgResult<()> {
+    let parse = ctx.run.parse();
+    if let Some(count) = parse.limitCount {
+        ctx.buf.push_str(" LIMIT ");
+        deparse_expr(ctx, count)?;
+    }
+    if let Some(offset) = parse.limitOffset {
+        ctx.buf.push_str(" OFFSET ");
+        deparse_expr(ctx, offset)?;
+    }
+    Ok(())
+}
+
+// get_jointype_name over the planner's numeric JoinType.
+pub(crate) fn jointype_name(jointype: types_pathnodes::JoinType) -> PgResult<&'static str> {
+    match jointype {
+        types_pathnodes::JOIN_INNER => Ok("INNER"),
+        types_pathnodes::JOIN_LEFT => Ok("LEFT"),
+        types_pathnodes::JOIN_RIGHT => Ok("RIGHT"),
+        types_pathnodes::JOIN_FULL => Ok("FULL"),
+        types_pathnodes::JOIN_SEMI => Ok("SEMI"),
+        other => Err(unsupported_join_type(other)),
+    }
+}
+
+// deparseExplicitTargetList: tlist of TargetEntries over Vars (join rels).
+fn deparse_explicit_target_list<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    tlist: &NodeList<'mcx>,
+    is_returning: bool,
+    retrieved_attrs: &mut PgVec<'mcx, i32>,
+) -> PgResult<()> {
+    let mut i = 0i32;
+    for tle_node in tlist {
+        let tle = tle_node.as_target_entry().expect("TargetEntry");
+        if i > 0 {
+            ctx.buf.push_str(", ");
+        } else if is_returning {
+            ctx.buf.push_str(" RETURNING ");
+        }
+        deparse_expr(ctx, tle.expr)?;
+        retrieved_attrs.push(i + 1);
+        i += 1;
+    }
+    if i == 0 && !is_returning {
+        ctx.buf.push_str("NULL");
+    }
+    Ok(())
+}
+
+// deparseSubqueryTargetList: the relation's reltarget exprs.
+fn deparse_subquery_target_list<'mcx>(ctx: &mut DeparseCtx<'_, 'mcx>) -> PgResult<()> {
+    let exprs: Vec<types_pathnodes::NodeId> = {
+        let rel = ctx.run.root.rel(ctx.foreignrel);
+        ctx.run.pathtarget(rel.pathtarget_id.expect("rel has reltarget")).exprs.iter().copied().collect()
+    };
+    let mut first = true;
+    for id in exprs {
+        if !first {
+            ctx.buf.push_str(", ");
+        }
+        first = false;
+        let node = *ctx.run.root.expr_node(id);
+        deparse_expr(ctx, node)?;
+    }
+    if first {
+        ctx.buf.push_str("NULL");
+    }
+    Ok(())
+}
+
+// deparseFromExprForRel: base rel → "schema.table [rN]"; join rel →
+// "(outer <type> JOIN inner ON (conds))"; SEMI joins become EXISTS strings
+// pushed into additional_conds. The UPDATE/DELETE ignore_rel lane is not
+// wired here (direct modify is a later phase).
+fn deparse_from_expr_for_rel<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    foreignrel: RelId,
+    use_alias: bool,
+    additional_conds: &mut Vec<String>,
+) -> PgResult<()> {
+    let run = ctx.run;
+    let mcx = ctx.mcx;
+    if is_join_rel(run, foreignrel) {
+        let (outerrel, innerrel, jointype, make_o_sub, make_i_sub, joinclauses): (
+            RelId,
+            RelId,
+            types_pathnodes::JoinType,
+            bool,
+            bool,
+            Vec<types_pathnodes::RinfoId>,
+        ) = {
+            let fp = fpinfo(run.root.rel(foreignrel)).borrow();
+            (
+                fp.outerrel.expect("join fpinfo outerrel"),
+                fp.innerrel.expect("join fpinfo innerrel"),
+                fp.jointype,
+                fp.make_outerrel_subquery,
+                fp.make_innerrel_subquery,
+                fp.joinclauses.iter().copied().collect(),
+            )
+        };
+        let mut conds_o: Vec<String> = Vec::new();
+        let mut conds_i: Vec<String> = Vec::new();
+
+        let mut join_sql_o = {
+            let saved = core::mem::replace(&mut ctx.buf, PgString::new_in(mcx));
+            deparse_range_tbl_ref(ctx, outerrel, make_o_sub, &mut conds_o)?;
+            core::mem::replace(&mut ctx.buf, saved)
+        };
+        let join_sql_i = {
+            let saved = core::mem::replace(&mut ctx.buf, PgString::new_in(mcx));
+            deparse_range_tbl_ref(ctx, innerrel, make_i_sub, &mut conds_i)?;
+            core::mem::replace(&mut ctx.buf, saved)
+        };
+
+        if jointype == types_pathnodes::JOIN_SEMI {
+            // EXISTS (SELECT NULL FROM <inner> WHERE <joinclauses AND lower conds>)
+            let (save_f, save_s) = (ctx.foreignrel, ctx.scanrel);
+            ctx.foreignrel = foreignrel;
+            ctx.scanrel = foreignrel;
+            let saved = core::mem::replace(&mut ctx.buf, PgString::new_in(mcx));
+            ctx.buf.push_str("EXISTS (SELECT NULL FROM ");
+            ctx.buf.push_str(join_sql_i.as_str());
+            append_where_clause(ctx, &joinclauses, &conds_i)?;
+            conds_i.clear();
+            ctx.buf.push(')');
+            let exists = core::mem::replace(&mut ctx.buf, saved);
+            ctx.foreignrel = save_f;
+            ctx.scanrel = save_s;
+            additional_conds.push(exists.as_str().to_string());
+            // FROM clause is just the outer relation.
+            ctx.buf.push_str(join_sql_o.as_str());
+            let _ = &mut join_sql_o;
+        } else {
+            ctx.buf.push('(');
+            ctx.buf.push_str(join_sql_o.as_str());
+            ctx.buf.push(' ');
+            ctx.buf.push_str(jointype_name(jointype)?);
+            ctx.buf.push_str(" JOIN ");
+            ctx.buf.push_str(join_sql_i.as_str());
+            ctx.buf.push_str(" ON ");
+            if !joinclauses.is_empty() {
+                let (save_f, save_s) = (ctx.foreignrel, ctx.scanrel);
+                ctx.foreignrel = foreignrel;
+                ctx.scanrel = foreignrel;
+                ctx.buf.push('(');
+                append_conditions(ctx, &joinclauses)?;
+                ctx.buf.push(')');
+                ctx.foreignrel = save_f;
+                ctx.scanrel = save_s;
+            } else {
+                ctx.buf.push_str("(TRUE)");
+            }
+            ctx.buf.push(')');
+        }
+        additional_conds.append(&mut conds_o);
+        additional_conds.append(&mut conds_i);
+    } else {
+        let rte = run.rte(run.root.rel(foreignrel).relid as usize);
+        let opened = table::table_open(mcx, rte.relid, types_rel::lock::NoLock)?;
+        let mut buf = core::mem::replace(&mut ctx.buf, PgString::new_in(mcx));
+        deparse_relation(&mut buf, mcx, &opened)?;
+        ctx.buf = buf;
+        table::table_close(opened, types_rel::lock::NoLock)?;
+        if use_alias {
+            let _ = write!(ctx.buf, " {}{}", REL_ALIAS_PREFIX, run.root.rel(foreignrel).relid);
+        }
+    }
+    Ok(())
+}
+
+// deparseRangeTblRef: FROM-entry for one side of a join; subquery form when
+// the deparser flagged it (FULL JOIN with conds / SEMI hidden rels).
+fn deparse_range_tbl_ref<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    foreignrel: RelId,
+    make_subquery: bool,
+    additional_conds: &mut Vec<String>,
+) -> PgResult<()> {
+    let run = ctx.run;
+    debug_assert!(fpinfo(run.root.rel(foreignrel)).borrow().local_conds.is_empty());
+    if make_subquery {
+        let (remote_conds, relation_index, ncols): (Vec<types_pathnodes::RinfoId>, i32, usize) = {
+            let fp = fpinfo(run.root.rel(foreignrel)).borrow();
+            let rel = run.root.rel(foreignrel);
+            (
+                fp.remote_conds.iter().copied().collect(),
+                fp.relation_index,
+                run.pathtarget(rel.pathtarget_id.expect("rel has reltarget")).exprs.len(),
+            )
+        };
+        ctx.buf.push('(');
+        let mut ignored_attrs = PgVec::new_in(ctx.mcx);
+        deparse_select_stmt_inner(
+            ctx,
+            foreignrel,
+            &NodeList::nil(),
+            &remote_conds,
+            &[],
+            false,
+            false,
+            true,
+            &mut ignored_attrs,
+        )?;
+        ctx.buf.push(')');
+        let _ = write!(ctx.buf, " {SUBQUERY_REL_ALIAS_PREFIX}{relation_index}");
+        if ncols > 0 {
+            ctx.buf.push('(');
+            for i in 1..=ncols {
+                if i > 1 {
+                    ctx.buf.push_str(", ");
+                }
+                let _ = write!(ctx.buf, "{SUBQUERY_COL_ALIAS_PREFIX}{i}");
+            }
+            ctx.buf.push(')');
+        }
+        Ok(())
+    } else {
+        deparse_from_expr_for_rel(ctx, foreignrel, true, additional_conds)
+    }
+}
+
+fn append_where_clause<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    exprs: &[types_pathnodes::RinfoId],
+    additional_conds: &[String],
+) -> PgResult<()> {
+    if exprs.is_empty() && additional_conds.is_empty() {
+        return Ok(());
+    }
+    ctx.buf.push_str(" WHERE ");
+    let mut need_and = false;
+    if !exprs.is_empty() {
+        append_conditions(ctx, exprs)?;
+        need_and = true;
+    }
+    for c in additional_conds {
+        if need_and {
+            ctx.buf.push_str(" AND ");
+        }
+        ctx.buf.push_str(c);
+        need_and = true;
+    }
+    Ok(())
+}
+
+// appendConditions over bare expression nodes (final_remote_exprs shape).
+fn append_conditions_nodes<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    exprs: &[types_pathnodes::NodeId],
+) -> PgResult<()> {
+    let nestlevel = crate::transmission::set_transmission_modes();
+    for (i, &id) in exprs.iter().enumerate() {
+        let expr = *ctx.run.root.expr_node(id);
+        if i > 0 {
+            ctx.buf.push_str(" AND ");
+        }
+        ctx.buf.push('(');
+        deparse_expr(ctx, expr)?;
+        ctx.buf.push(')');
+    }
+    crate::transmission::reset_transmission_modes(nestlevel);
+    Ok(())
+}
+
+fn append_where_clause_nodes<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    exprs: &[types_pathnodes::NodeId],
+) -> PgResult<()> {
+    if exprs.is_empty() {
+        return Ok(());
+    }
+    ctx.buf.push_str(" WHERE ");
+    append_conditions_nodes(ctx, exprs)
+}
+
+fn append_conditions<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    exprs: &[types_pathnodes::RinfoId],
+) -> PgResult<()> {
+    let nestlevel = crate::transmission::set_transmission_modes();
+    for (i, &ri) in exprs.iter().enumerate() {
+        let clause = ctx.run.root.rinfo(ri).clause;
+        let expr = *ctx.run.root.expr_node(clause);
+        if i > 0 {
+            ctx.buf.push_str(" AND ");
+        }
+        ctx.buf.push('(');
+        deparse_expr(ctx, expr)?;
+        ctx.buf.push(')');
+    }
+    crate::transmission::reset_transmission_modes(nestlevel);
+    Ok(())
+}
+
+// ---------- DML deparse (INSERT / UPDATE / DELETE + direct modify) ----------
+//
+// Plan-time deparse entry points for postgresPlanForeignModify /
+// postgresPlanDirectModify (deparse.c:2081-2445); `rebuild_insert_sql` is the
+// one exec-time deparse (batch-size re-expansion).
+
+/// deparseReturningList: append a RETURNING clause (if any), collecting the
+/// attnums retrieved by WITH CHECK OPTION or RETURNING into `retrieved_attrs`.
+/// `trig_after_row` = the target relation has an AFTER ROW trigger for the op,
+/// which forces a whole-row retrieval (C: bms_make_singleton).
+#[allow(clippy::too_many_arguments)]
+pub fn deparse_returning_list<'mcx>(
+    buf: &mut PgString<'mcx>,
+    mcx: Mcx<'mcx>,
+    run: Option<&PlannerRun<'mcx>>,
+    rte: &types_nodes::parsenodes::RangeTblEntry<'mcx>,
+    rtindex: i32,
+    rel: &types_rel::Relation<'mcx>,
+    trig_after_row: bool,
+    wco_list: &[Node<'mcx>],
+    returning_list: &[Node<'mcx>],
+    retrieved_attrs: &mut PgVec<'mcx, i32>,
+) -> PgResult<()> {
+    let mut attrs_used = types_nodes::Bitmapset::empty();
+    if trig_after_row {
+        // whole-row reference acquires all non-system columns.
+        attrs_used.add_member(mcx, 0 - FIRST_LOW_INVALID_HEAP_ATTNUM)?;
+    }
+    for &node in wco_list {
+        vars::pull_varattnos(mcx, node, rtindex, &mut attrs_used)?;
+    }
+    for &node in returning_list {
+        vars::pull_varattnos(mcx, node, rtindex, &mut attrs_used)?;
+    }
+    if !attrs_used.is_empty() {
+        deparse_target_list(
+            buf, mcx, run, rtindex, rel, rte, true, &attrs_used, false, retrieved_attrs,
+        )?;
+    }
+    // else: *retrieved_attrs stays NIL (empty), matching C.
+    Ok(())
+}
+
+/// deparseInsertSql. Appends
+///   INSERT INTO rel (cols...) VALUES ($1, $2, DEFAULT, ...) [ON CONFLICT DO
+///   NOTHING] [RETURNING ...]
+/// Generated columns emit DEFAULT (no param). Returns `values_end_len`, the
+/// byte offset of the end of the first row's VALUES clause (batch-insert reuses
+/// it via `rebuild_insert_sql`).
+#[allow(clippy::too_many_arguments)]
+pub fn deparse_insert_sql<'mcx>(
+    buf: &mut PgString<'mcx>,
+    mcx: Mcx<'mcx>,
+    run: Option<&PlannerRun<'mcx>>,
+    rte: &types_nodes::parsenodes::RangeTblEntry<'mcx>,
+    rtindex: i32,
+    rel: &types_rel::Relation<'mcx>,
+    target_attrs: &[i32],
+    do_nothing: bool,
+    trig_after_row: bool,
+    wco_list: &[Node<'mcx>],
+    returning_list: &[Node<'mcx>],
+    retrieved_attrs: &mut PgVec<'mcx, i32>,
+) -> PgResult<i32> {
+    let tupdesc = &rel.rd_att;
+    buf.push_str("INSERT INTO ");
+    deparse_relation(buf, mcx, rel)?;
+
+    if !target_attrs.is_empty() {
+        buf.push('(');
+        let mut first = true;
+        for &attnum in target_attrs {
+            if !first {
+                buf.push_str(", ");
+            }
+            first = false;
+            deparse_column_ref_buf(buf, mcx, rtindex, attnum as i16, rte, false)?;
+        }
+        buf.push_str(") VALUES (");
+
+        let mut pindex = 1;
+        let mut first = true;
+        for &attnum in target_attrs {
+            let attr = tupdesc.attr(attnum as usize - 1);
+            if !first {
+                buf.push_str(", ");
+            }
+            first = false;
+            if attr.attgenerated != 0 {
+                buf.push_str("DEFAULT");
+            } else {
+                let _ = write!(buf, "${pindex}");
+                pindex += 1;
+            }
+        }
+        buf.push(')');
+    } else {
+        buf.push_str(" DEFAULT VALUES");
+    }
+    let values_end_len = buf.as_str().len() as i32;
+
+    if do_nothing {
+        buf.push_str(" ON CONFLICT DO NOTHING");
+    }
+
+    deparse_returning_list(
+        buf, mcx, run, rte, rtindex, rel, trig_after_row, wco_list, returning_list,
+        retrieved_attrs,
+    )?;
+    Ok(values_end_len)
+}
+
+/// rebuildInsertSql: given a single-row INSERT template (`orig_query`) and its
+/// `values_end_len`, rebuild an INSERT with `num_rows` VALUES tuples for batch
+/// insert. `num_params` = params already emitted for the first row. Exec-time.
+pub fn rebuild_insert_sql<'mcx>(
+    buf: &mut PgString<'mcx>,
+    rel: &types_rel::Relation<'mcx>,
+    orig_query: &str,
+    target_attrs: &[i32],
+    values_end_len: i32,
+    num_params: i32,
+    num_rows: i32,
+) {
+    let tupdesc = &rel.rd_att;
+    let end = values_end_len as usize;
+    debug_assert!(end > 0 && end <= orig_query.len());
+    // Copy up to the end of the first record from the original query.
+    buf.push_str(&orig_query[..end]);
+
+    // Add the extra rows; params for the first row already exist, so continue.
+    let mut pindex = num_params + 1;
+    for _ in 0..num_rows {
+        buf.push_str(", (");
+        let mut first = true;
+        for &attnum in target_attrs {
+            let attr = tupdesc.attr(attnum as usize - 1);
+            if !first {
+                buf.push_str(", ");
+            }
+            first = false;
+            if attr.attgenerated != 0 {
+                buf.push_str("DEFAULT");
+            } else {
+                let _ = write!(buf, "${pindex}");
+                pindex += 1;
+            }
+        }
+        buf.push(')');
+    }
+    // Copy the stuff after the VALUES clause (RETURNING, ON CONFLICT, ...).
+    buf.push_str(&orig_query[end..]);
+}
+
+/// deparseUpdateSql: UPDATE rel SET col = $n, gen = DEFAULT, ... WHERE ctid = $1
+/// [RETURNING ...]. ctid is always param $1; SET params start at $2.
+#[allow(clippy::too_many_arguments)]
+pub fn deparse_update_sql<'mcx>(
+    buf: &mut PgString<'mcx>,
+    mcx: Mcx<'mcx>,
+    run: &PlannerRun<'mcx>,
+    rte: &types_nodes::parsenodes::RangeTblEntry<'mcx>,
+    rtindex: i32,
+    rel: &types_rel::Relation<'mcx>,
+    target_attrs: &[i32],
+    trig_after_row: bool,
+    wco_list: &[Node<'mcx>],
+    returning_list: &[Node<'mcx>],
+    retrieved_attrs: &mut PgVec<'mcx, i32>,
+) -> PgResult<()> {
+    let tupdesc = &rel.rd_att;
+    buf.push_str("UPDATE ");
+    deparse_relation(buf, mcx, rel)?;
+    buf.push_str(" SET ");
+
+    let mut pindex = 2; // ctid is always the first param
+    let mut first = true;
+    for &attnum in target_attrs {
+        let attr = tupdesc.attr(attnum as usize - 1);
+        if !first {
+            buf.push_str(", ");
+        }
+        first = false;
+        deparse_column_ref_buf(buf, mcx, rtindex, attnum as i16, rte, false)?;
+        if attr.attgenerated != 0 {
+            buf.push_str(" = DEFAULT");
+        } else {
+            let _ = write!(buf, " = ${pindex}");
+            pindex += 1;
+        }
+    }
+    buf.push_str(" WHERE ctid = $1");
+
+    deparse_returning_list(
+        buf, mcx, Some(run), rte, rtindex, rel, trig_after_row, wco_list, returning_list,
+        retrieved_attrs,
+    )
+}
+
+/// deparseDeleteSql: DELETE FROM rel WHERE ctid = $1 [RETURNING ...].
+#[allow(clippy::too_many_arguments)]
+pub fn deparse_delete_sql<'mcx>(
+    buf: &mut PgString<'mcx>,
+    mcx: Mcx<'mcx>,
+    run: &PlannerRun<'mcx>,
+    rte: &types_nodes::parsenodes::RangeTblEntry<'mcx>,
+    rtindex: i32,
+    rel: &types_rel::Relation<'mcx>,
+    trig_after_row: bool,
+    returning_list: &[Node<'mcx>],
+    retrieved_attrs: &mut PgVec<'mcx, i32>,
+) -> PgResult<()> {
+    buf.push_str("DELETE FROM ");
+    deparse_relation(buf, mcx, rel)?;
+    buf.push_str(" WHERE ctid = $1");
+
+    deparse_returning_list(
+        buf, mcx, Some(run), rte, rtindex, rel, trig_after_row, &[], returning_list, retrieved_attrs,
+    )
+}
+
+/// deparseDirectUpdateSql, base-relation case only. The join case
+/// (foreignrel is a RELOPT_JOINREL, needing deparseFromExprForRel + the
+/// FROM/alias machinery) is phase-4 join pushdown; reaching it raises a loud
+/// FEATURE_NOT_SUPPORTED.
+#[allow(clippy::too_many_arguments)]
+pub fn deparse_direct_update_sql<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    rtindex: i32,
+    rel: &types_rel::Relation<'mcx>,
+    rte: &types_nodes::parsenodes::RangeTblEntry<'mcx>,
+    targetlist: &[Node<'mcx>],
+    target_attrs: &[i32],
+    remote_conds: &[types_pathnodes::NodeId],
+    returning_list: &[Node<'mcx>],
+    retrieved_attrs: &mut PgVec<'mcx, i32>,
+) -> PgResult<()> {
+    // Direct modify over a pushed-down join (UPDATE ... FROM ft2) needs the
+    // EPQ-capable join paths that are not generated yet.
+    if ctx.run.root.rel(ctx.foreignrel).reloptkind == types_pathnodes::RELOPT_JOINREL {
+        return Err(direct_modify_join_unported());
+    }
+    let mcx = ctx.mcx;
+    ctx.buf.push_str("UPDATE ");
+    deparse_relation(&mut ctx.buf, mcx, rel)?;
+    ctx.buf.push_str(" SET ");
+
+    // Make sure any constants in the exprs are printed portably.
+    let nestlevel = crate::transmission::set_transmission_modes();
+    let mut first = true;
+    for (i, &tle_node) in targetlist.iter().enumerate() {
+        let tle = tle_node.as_target_entry().expect("direct-update tlist is TargetEntry");
+        let attnum = target_attrs[i];
+        debug_assert!(!tle.resjunk);
+        if !first {
+            ctx.buf.push_str(", ");
+        }
+        first = false;
+        deparse_column_ref_buf(&mut ctx.buf, mcx, rtindex, attnum as i16, rte, false)?;
+        ctx.buf.push_str(" = ");
+        deparse_expr(ctx, tle.expr)?;
+    }
+    crate::transmission::reset_transmission_modes(nestlevel);
+
+    // base-rel: no FROM clause, additional_conds is NIL.
+    append_where_clause_nodes(ctx, remote_conds)?;
+
+    deparse_returning_list(
+        &mut ctx.buf, mcx, Some(ctx.run), rte, rtindex, rel, false, &[], returning_list,
+        retrieved_attrs,
+    )
+}
+
+/// deparseDirectDeleteSql, base-relation case only (join case is phase-4).
+#[allow(clippy::too_many_arguments)]
+pub fn deparse_direct_delete_sql<'mcx>(
+    ctx: &mut DeparseCtx<'_, 'mcx>,
+    rtindex: i32,
+    rel: &types_rel::Relation<'mcx>,
+    rte: &types_nodes::parsenodes::RangeTblEntry<'mcx>,
+    remote_conds: &[types_pathnodes::NodeId],
+    returning_list: &[Node<'mcx>],
+    retrieved_attrs: &mut PgVec<'mcx, i32>,
+) -> PgResult<()> {
+    // Direct modify over a pushed-down join needs EPQ-capable join paths.
+    if ctx.run.root.rel(ctx.foreignrel).reloptkind == types_pathnodes::RELOPT_JOINREL {
+        return Err(direct_modify_join_unported());
+    }
+    let mcx = ctx.mcx;
+    ctx.buf.push_str("DELETE FROM ");
+    deparse_relation(&mut ctx.buf, mcx, rel)?;
+
+    // base-rel: no USING clause, additional_conds is NIL.
+    append_where_clause_nodes(ctx, remote_conds)?;
+
+    deparse_returning_list(
+        &mut ctx.buf, mcx, Some(ctx.run), rte, rtindex, rel, false, &[], returning_list,
+        retrieved_attrs,
+    )
+}
+
+#[track_caller]
+#[cold]
+fn direct_modify_join_unported() -> Box<PgError> {
+    Box::new(
+        PgError::error(
+            "postgres_fdw: direct modify over a foreign join is phase-4 join pushdown",
+        )
+        .with_sqlstate(types_error::ERRCODE_FEATURE_NOT_SUPPORTED),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn string_literal_escaping() {
+        let mcx = mcx::MemoryContext::new("t");
+        let m = mcx.mcx();
+        let mut b = PgString::new_in(m);
+        deparse_string_literal(&mut b, "abc");
+        assert_eq!(b.as_str(), "'abc'");
+
+        let mut b = PgString::new_in(m);
+        deparse_string_literal(&mut b, "a'b");
+        assert_eq!(b.as_str(), "'a''b'");
+
+        let mut b = PgString::new_in(m);
+        deparse_string_literal(&mut b, "a\\b");
+        assert_eq!(b.as_str(), "E'a\\\\b'");
+    }
+
+    // tlist.c get_sortgroupref_tle: a missing sort/group ref is elog(ERROR)
+    // (XX000 "ORDER/GROUP BY expression not found in targetlist"), catchable.
+    #[test]
+    fn missing_sortgroupref_is_an_error_not_a_panic() {
+        let mcx = mcx::MemoryContext::new("t");
+        let m = mcx.mcx();
+        let expr = types_nodes::Node::mk_integer(m, 1).unwrap();
+        let tle = types_nodes::Node::mk_target_entry(m, expr, 1, None, false).unwrap();
+        let mut tlist: NodeList<'_> = NodeList::nil();
+        tlist.lappend(m, tle).unwrap();
+        let err = match get_sortgroupref_tle(7, &tlist) {
+            Ok(_) => panic!("ref 7 is absent: expected an error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.message(), "ORDER/GROUP BY expression not found in targetlist");
+        assert_eq!(err.sqlstate(), types_error::ERRCODE_INTERNAL_ERROR);
+    }
+
+    #[test]
+    fn jointype_names() {
+        assert_eq!(get_jointype_name(JoinType::JOIN_INNER).unwrap(), "INNER");
+        assert_eq!(get_jointype_name(JoinType::JOIN_LEFT).unwrap(), "LEFT");
+        assert_eq!(get_jointype_name(JoinType::JOIN_RIGHT).unwrap(), "RIGHT");
+        assert_eq!(get_jointype_name(JoinType::JOIN_FULL).unwrap(), "FULL");
+        assert_eq!(get_jointype_name(JoinType::JOIN_SEMI).unwrap(), "SEMI");
+        let e = get_jointype_name(JoinType::JOIN_ANTI).err().unwrap();
+        assert_eq!(e.message(), "unsupported join type 5");
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_INTERNAL_ERROR);
+        let e = jointype_name(types_pathnodes::JOIN_RIGHT_ANTI).err().unwrap();
+        assert_eq!(e.message(), "unsupported join type 7");
+    }
+
+    // deparse.c:1660 get_jointype_name: an unsupported join type is
+    // elog(ERROR, "unsupported join type %d") (XX000, catchable), never a
+    // process abort. Both faces (the nodes JoinType and the planner's numeric
+    // JoinType) are checked through catch_unwind so the witness compiles on
+    // the unfixed tree too.
+    #[test]
+    fn unsupported_jointype_is_an_error_not_a_panic() {
+        let r = std::panic::catch_unwind(|| {
+            let _ = get_jointype_name(JoinType::JOIN_ANTI);
+        });
+        assert!(r.is_ok(), "get_jointype_name(JOIN_ANTI) panicked");
+        let r = std::panic::catch_unwind(|| {
+            let _ = jointype_name(types_pathnodes::JOIN_ANTI);
+        });
+        assert!(r.is_ok(), "jointype_name(JOIN_ANTI) panicked");
+    }
+
+    // deparse.c:2932: the unsupported-node error prints the tag as an
+    // integer ("%d", (int) nodeTag(node)), not a symbolic name.
+    #[test]
+    fn unsupported_deparse_expr_prints_the_numeric_node_tag() {
+        let e = unsupported_deparse_expr(NodeTag::T_CoalesceExpr);
+        assert_eq!(
+            e.message(),
+            format!(
+                "unsupported expression type for deparse: {}",
+                NodeTag::T_CoalesceExpr as u16
+            )
+        );
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_INTERNAL_ERROR);
+    }
+
+    // deparseColumnRef emits the local relation OID for TableOidAttributeNumber
+    // (sysattr.h: -6), not -7; a -7 fallback silently deparsed tableoid as 0.
+    #[test]
+    fn table_oid_attnum_matches_sysattr() {
+        assert_eq!(TABLE_OID_ATTNUM, types_tuple::htup::TableOidAttributeNumber as i16);
+        assert_eq!(TABLE_OID_ATTNUM, -6);
+    }
+}

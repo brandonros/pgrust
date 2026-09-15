@@ -1,0 +1,34 @@
+[package]
+name = "sysv_shmem"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "sysv_shmem"
+path = "src/lib.rs"
+
+[dependencies]
+types_error = { path = "../../../_support/types/types_error" }
+types_storage = { path = "../../../_support/types/types_storage" }
+elog = { path = "../../utils/error/elog" }
+init_small = { path = "../../utils/init/init_small" }
+# The sanctioned stat route (DST P1 Vfs choke, docs/design/dst-and-wasm.md
+# #2.1): C stats DataDir with raw stat(2), we go through fd::pg_stat.
+fd = { path = "../../storage/file/fd" }
+vfs = { path = "../../storage/file/vfs" }
+shmem_seams = { path = "../../storage/ipc/shmem_seams" }
+# check_huge_page_size (sysv_shmem.c:578) is a GUC check hook: slot + errdetail seam.
+guc_tables = { path = "../../utils/misc/guc_tables" }
+guc_seams = { path = "../../utils/misc/guc_seams" }
+types_guc = { path = "../../../_support/types/types_guc" }
+# GetHugePageSize's MAP_HUGE_SHIFT encoding (sysv_shmem.c:552): pg_ceil_log2_64.
+pg_bitutils = { path = "../../../port/pg_bitutils" }
+libc = "0.2"
+
+[dev-dependencies]
+# The key-space walk's FATAL refusal exits through elog's proc_exit seam; the
+# tests install it as a panic (miscinit's first-contact tests do the same).
+pgstat_seams = { path = "../../utils/activity/pgstat_seams" }
+init_small_seams = { path = "../../utils/init/init_small_seams" }
+ipc_seams = { path = "../../storage/ipc/ipc_seams" }

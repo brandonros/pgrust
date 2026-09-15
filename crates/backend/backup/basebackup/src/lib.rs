@@ -1,0 +1,2857 @@
+// basebackup.c (PG 18.3) — the base-backup driver. Assembles the bbsink chain
+// (client copy sink + optional throttle), drives do_pg_backup_start/stop, walks
+// the data directory streaming each file as a tar archive, injects backup_label
+// / tablespace_map / pg_control, and emits the backup manifest.
+//
+// Scope: server-side compression (COMPRESSION 'gzip'|'lz4'|'zstd' +
+// COMPRESSION_DETAIL) is implemented via the basebackup_compress sinks.
+// Incremental backups (BASE_BACKUP (INCREMENTAL) after UPLOAD_MANIFEST) are
+// implemented: PrepareForIncrementalBackup merges the WAL summaries, sendDir
+// consults GetFileBackupMethod per relation file, and sendFile emits the
+// incremental file format (INCREMENTAL_MAGIC header + block list + blocks).
+// Backup-time page-checksum verification is implemented; WAL=true is handled
+// inline.
+#![allow(non_snake_case)]
+#![allow(clippy::too_many_arguments)]
+
+use std::cell::Cell;
+
+use compression::{
+    parse_compress_algorithm, parse_compress_specification, validate_compress_specification,
+    PgCompressAlgorithm, PgCompressSpecification,
+};
+use elog::ereport;
+use mcx::Mcx;
+use repl_gram::{BaseBackupCmd, ReplOption, ReplOptionArg};
+use types_core::{Oid, TimeLineID, XLogRecPtr};
+use types_error::{
+    ErrorLocation, PgResult,
+    ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE, ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+    ERRCODE_PROGRAM_LIMIT_EXCEEDED, ERRCODE_SYNTAX_ERROR, ERROR, WARNING,
+};
+
+use manifest::checksum::{
+    PgChecksumContext, PgChecksumType, CHECKSUM_TYPE_CRC32C, CHECKSUM_TYPE_NONE,
+};
+use manifest::{
+    AddFileToBackupManifest, AddWALInfoToBackupManifest, BackupManifestInfo, BackupManifestOption,
+    FreeBackupManifest, InitializeBackupManifest, SendBackupManifest,
+};
+use sink::{
+    bbsink_archive_contents, bbsink_begin_archive, bbsink_begin_backup, bbsink_cleanup,
+    bbsink_end_archive, bbsink_end_backup, Bbsink, BbsinkState,
+};
+// TablespaceInfo is homed in xlogbackup (shared by do_pg_backup_start + the
+// sink chain) to avoid a transam_xlog -> sink layering inversion.
+use xlogbackup::TablespaceInfo;
+use walsender::WalSndState;
+
+#[track_caller]
+fn loc(func: &'static str) -> ErrorLocation {
+    // pgrust is Rust: report OUR source site (call site via track_caller).
+    let site = core::panic::Location::caller();
+    ErrorLocation::new(site.file(), site.line() as i32, func)
+}
+
+// SINK_BUFFER_LENGTH = Max(32768, BLCKSZ).
+const SINK_BUFFER_LENGTH: usize = if 32768 > types_core::BLCKSZ { 32768 } else { types_core::BLCKSZ };
+const TAR_BLOCK_SIZE: usize = 512;
+
+const INVALID_OID: Oid = types_core::InvalidOid;
+
+// pg_tablespace_d.h: the pinned tablespace OIDs (GetFileBackupMethod's
+// manifest lookups key shared/default relations by these).
+const DEFAULTTABLESPACE_OID: Oid = 1663;
+const GLOBALTABLESPACE_OID: Oid = 1664;
+
+const BACKUP_LABEL_FILE: &str = "backup_label";
+const TABLESPACE_MAP: &str = "tablespace_map";
+const XLOG_CONTROL_FILE: &str = "global/pg_control";
+const TABLESPACE_VERSION_DIRECTORY: &str = types_storage::file::TABLESPACE_VERSION_DIRECTORY;
+const PG_TEMP_FILE_PREFIX: &str = "pgsql_tmp";
+
+const MAX_RATE_LOWER: i64 = 32;
+const MAX_RATE_UPPER: i64 = 1_048_576;
+
+const S_IFMT: u32 = 0o170000;
+const S_IFDIR: u32 = 0o040000;
+const S_IFREG: u32 = 0o100000;
+const S_IFLNK: u32 = 0o120000;
+fn S_ISDIR(m: u32) -> bool { m & S_IFMT == S_IFDIR }
+fn S_ISREG(m: u32) -> bool { m & S_IFMT == S_IFREG }
+fn S_ISLNK(m: u32) -> bool { m & S_IFMT == S_IFLNK }
+
+const O_RDONLY: i32 = 0;
+
+// basebackup.c file-statics: backup_started_in_recovery, noverify_checksums,
+// total_checksum_failures.
+thread_local! {
+    static BACKUP_STARTED_IN_RECOVERY: Cell<bool> = const { Cell::new(false) };
+    static NOVERIFY_CHECKSUMS: Cell<bool> = const { Cell::new(false) };
+    static TOTAL_CHECKSUM_FAILURES: Cell<i64> = const { Cell::new(0) };
+}
+
+// excludeDirContents[] — contents excluded, empty dir kept.
+const EXCLUDE_DIR_CONTENTS: &[&str] =
+    &["pg_stat_tmp", "pg_replslot", "pg_dynshmem", "pg_notify", "pg_serial", "pg_snapshots", "pg_subtrans"];
+
+struct ExcludeListItem {
+    name: &'static str,
+    match_prefix: bool,
+}
+
+const EXCLUDE_FILES: &[ExcludeListItem] = &[
+    ExcludeListItem { name: "postgresql.auto.conf.tmp", match_prefix: false },
+    ExcludeListItem { name: "current_logfiles.tmp", match_prefix: false },
+    ExcludeListItem { name: "pg_internal.init", match_prefix: true },
+    ExcludeListItem { name: BACKUP_LABEL_FILE, match_prefix: false },
+    ExcludeListItem { name: TABLESPACE_MAP, match_prefix: false },
+    ExcludeListItem { name: "backup_manifest", match_prefix: false },
+    ExcludeListItem { name: "postmaster.pid", match_prefix: false },
+    ExcludeListItem { name: "postmaster.opts", match_prefix: false },
+];
+
+// ---------------------------------------------------------------------------
+// lstat / readlink / directory listing (C's file primitives, inlined).
+// ---------------------------------------------------------------------------
+
+struct LstatInfo {
+    size: i64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    mtime: i64,
+}
+
+/// lstat(2); `Err(errno)` on failure.
+fn lstat_raw(path: &str) -> Result<LstatInfo, i32> {
+    let mut st = fd::FileInfo::zeroed();
+    if fd::pg_lstat(path, &mut st) != 0 {
+        return Err(fd::get_errno());
+    }
+    Ok(LstatInfo {
+        size: st.size,
+        mode: st.mode,
+        uid: st.uid,
+        gid: st.gid,
+        mtime: st.mtime_sec,
+    })
+}
+
+/// C's `could not stat <what> "<path>": %m` under errcode_for_file_access:
+/// `what` is "file" at perform_base_backup's sites (basebackup.c:333/577)
+/// and "file or directory" inside the walk (sendDir basebackup.c:1356,
+/// sendTablespace basebackup.c:1157).
+fn stat_error<T>(path: &str, what: &str, errnum: i32, func: &'static str) -> PgResult<T> {
+    ereport(ERROR)
+        .errcode(elog::errno::sqlstate_for_file_access(errnum))
+        .errmsg(format!(
+            "could not stat {what} \"{path}\": {}",
+            elog::errno::strerror(errnum)
+        ))
+        .finish(loc(func))?;
+    unreachable!()
+}
+
+/// lstat as sendDir/sendTablespace consume it: `Ok(None)` when the entry
+/// went away mid-scan (ENOENT is not an error there), else the C error.
+fn lstat_file(path: &str, func: &'static str) -> PgResult<Option<LstatInfo>> {
+    match lstat_raw(path) {
+        Ok(st) => Ok(Some(st)),
+        Err(libc::ENOENT) => Ok(None),
+        Err(errnum) => stat_error(path, "file or directory", errnum, func),
+    }
+}
+
+fn read_link(path: &str) -> PgResult<String> {
+    // readlink(2) via the fd-crate front; MAXPGPATH-class buffer.
+    let mut buf = [0u8; 1024];
+    let n = fd::pg_readlink(path, &mut buf);
+    if n < 0 {
+        // basebackup.c:1416: could not read symbolic link "%s": %m
+        let errnum = fd::get_errno();
+        ereport(ERROR)
+            .errcode(elog::errno::sqlstate_for_file_access(errnum))
+            .errmsg(format!(
+                "could not read symbolic link \"{path}\": {}",
+                elog::errno::strerror(errnum)
+            ))
+            .finish(loc("read_link"))?;
+        unreachable!()
+    }
+    // As in C's sendDir: a target that fills the whole buffer may have been
+    // truncated -- error out rather than emit a truncated link target.
+    if n as usize >= buf.len() {
+        return readlink_target_too_long(path);
+    }
+    Ok(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+fn readlink_target_too_long(path: &str) -> PgResult<String> {
+    ereport(ERROR)
+        .errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED)
+        .errmsg(format!("symbolic link \"{path}\" target is too long"))
+        .finish(loc("read_link"))?;
+    unreachable!()
+}
+
+fn read_dir_names(path: &str) -> PgResult<Vec<String>> {
+    let mut names = Vec::new();
+    fd::with_allocated_dir(path, &mut |name| {
+        names.push(name.to_owned());
+        Ok(false)
+    })?;
+    Ok(names)
+}
+
+// ---------------------------------------------------------------------------
+// tar header (port/tar.c tarCreateHeader), inlined.
+// ---------------------------------------------------------------------------
+
+fn print_tar_number(s: &mut [u8], mut val: u64) {
+    let len = s.len();
+    if val < 1u64 << ((len - 1) * 3) {
+        // octal with trailing space
+        s[len - 1] = b' ';
+        let mut i = len - 1;
+        while i > 0 {
+            i -= 1;
+            s[i] = (val & 7) as u8 + b'0';
+            val >>= 3;
+        }
+    } else {
+        // base-256 with leading \200
+        s[0] = 0o200;
+        let mut i = len;
+        while i > 1 {
+            i -= 1;
+            s[i] = (val & 255) as u8;
+            val >>= 8;
+        }
+    }
+}
+
+fn tar_checksum(header: &[u8; TAR_BLOCK_SIZE]) -> u64 {
+    // Sum all bytes, treating the checksum field [148,156) as 8 spaces.
+    let mut sum: u64 = 8 * b' ' as u64;
+    for (i, &b) in header.iter().enumerate() {
+        if i < 148 || i >= 156 {
+            sum += b as u64;
+        }
+    }
+    sum
+}
+
+fn strlcpy(dst: &mut [u8], src: &str) {
+    let s = src.as_bytes();
+    let n = s.len().min(dst.len().saturating_sub(1));
+    dst[..n].copy_from_slice(&s[..n]);
+}
+
+enum TarError {
+    Ok,
+    NameTooLong,
+    SymlinkTooLong,
+}
+
+// tarCreateHeader (port/tar.c). Returns the 512-byte header + status.
+fn tar_create_header(
+    filename: &str,
+    linktarget: Option<&str>,
+    size: i64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    mtime: i64,
+) -> (TarError, [u8; TAR_BLOCK_SIZE]) {
+    let mut h = [0u8; TAR_BLOCK_SIZE];
+    if filename.len() > 99 {
+        return (TarError::NameTooLong, h);
+    }
+    if let Some(lt) = linktarget {
+        if lt.len() > 99 {
+            return (TarError::SymlinkTooLong, h);
+        }
+    }
+
+    strlcpy(&mut h[0..100], filename); // name
+    if linktarget.is_some() || S_ISDIR(mode) {
+        // directory / symlink-to-directory: trailing slash
+        let flen = filename.len().min(99);
+        h[flen] = b'/';
+    }
+
+    print_tar_number(&mut h[100..108], (mode & 0o7777) as u64);
+    print_tar_number(&mut h[108..116], uid as u64);
+    print_tar_number(&mut h[116..124], gid as u64);
+    let sz = if linktarget.is_some() || S_ISDIR(mode) { 0 } else { size as u64 };
+    print_tar_number(&mut h[124..136], sz);
+    print_tar_number(&mut h[136..148], mtime as u64);
+    // checksum [148,156) computed last
+
+    if let Some(lt) = linktarget {
+        h[156] = b'2'; // symlink
+        strlcpy(&mut h[157..257], lt);
+    } else if S_ISDIR(mode) {
+        h[156] = b'5';
+    } else {
+        h[156] = b'0';
+    }
+
+    h[257..262].copy_from_slice(b"ustar");
+    h[263..265].copy_from_slice(b"00");
+    strlcpy(&mut h[265..297], "postgres");
+    strlcpy(&mut h[297..329], "postgres");
+    print_tar_number(&mut h[329..337], 0);
+    print_tar_number(&mut h[337..345], 0);
+
+    let cksum = tar_checksum(&h);
+    print_tar_number(&mut h[148..156], cksum);
+    (TarError::Ok, h)
+}
+
+// ---------------------------------------------------------------------------
+// basebackup_options.
+// ---------------------------------------------------------------------------
+
+struct BasebackupOptions {
+    label: String,
+    progress: bool,
+    fastcheckpoint: bool,
+    nowait: bool,
+    includewal: bool,
+    incremental: bool,
+    maxrate: u32,
+    sendtblspcmapfile: bool,
+    send_to_client: bool,
+    target_handle: Option<basebackup_target::BaseBackupTargetHandle>,
+    manifest: BackupManifestOption,
+    manifest_checksum_type: PgChecksumType,
+    compression: PgCompressAlgorithm,
+    compression_specification: PgCompressSpecification,
+}
+
+impl Default for BasebackupOptions {
+    fn default() -> Self {
+        Self {
+            label: String::new(),
+            progress: false,
+            fastcheckpoint: false,
+            nowait: false,
+            includewal: false,
+            incremental: false,
+            maxrate: 0,
+            sendtblspcmapfile: false,
+            send_to_client: false,
+            target_handle: None,
+            manifest: BackupManifestOption::No,
+            manifest_checksum_type: CHECKSUM_TYPE_CRC32C,
+            compression: PgCompressAlgorithm::None,
+            compression_specification: PgCompressSpecification::default(),
+        }
+    }
+}
+
+// defGetString (define.c:35): a missing argument is "%s requires a
+// parameter"; an Integer is rendered with %ld, a Boolean as true/false.
+fn opt_string(o: &ReplOption) -> PgResult<String> {
+    match &o.arg {
+        None => {
+            ereport(ERROR)
+                .errcode(ERRCODE_SYNTAX_ERROR)
+                .errmsg(format!("{} requires a parameter", o.name))
+                .finish(loc("defGetString"))?;
+            unreachable!()
+        }
+        Some(ReplOptionArg::Str(s)) => Ok(s.clone()),
+        Some(ReplOptionArg::Int(i)) => Ok(format!("{i}")),
+        Some(ReplOptionArg::Bool(b)) => Ok(if *b { "true" } else { "false" }.to_string()),
+    }
+}
+
+// parse_bool (bool.c) as the MANIFEST option consumes it.
+fn parse_bool_str(s: &str) -> Option<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" | "t" | "y" => Some(true),
+        "false" | "no" | "off" | "0" | "f" | "n" => Some(false),
+        _ => None,
+    }
+}
+
+// defGetBoolean (define.c:94): no argument means true; Integer 0/1; any
+// other node through defGetString, accepting only true/false/on/off.
+fn opt_bool(o: &ReplOption) -> PgResult<bool> {
+    match &o.arg {
+        None => return Ok(true),
+        Some(ReplOptionArg::Int(0)) => return Ok(false),
+        Some(ReplOptionArg::Int(1)) => return Ok(true),
+        Some(ReplOptionArg::Int(_)) => {}
+        _ => {
+            let sval = opt_string(o)?;
+            if strcasecmp(&sval, "true") {
+                return Ok(true);
+            }
+            if strcasecmp(&sval, "false") {
+                return Ok(false);
+            }
+            if strcasecmp(&sval, "on") {
+                return Ok(true);
+            }
+            if strcasecmp(&sval, "off") {
+                return Ok(false);
+            }
+        }
+    }
+    ereport(ERROR)
+        .errcode(ERRCODE_SYNTAX_ERROR)
+        .errmsg(format!("{} requires a Boolean value", o.name))
+        .finish(loc("defGetBoolean"))?;
+    unreachable!()
+}
+
+// defGetInt64 (define.c:173): only an Integer (the replication grammar's
+// UCONST) is numeric; strings and a missing argument are errors. (C's
+// T_Float arm is unreachable: repl_gram never produces one.)
+fn opt_int(o: &ReplOption) -> PgResult<i64> {
+    if let Some(ReplOptionArg::Int(i)) = &o.arg {
+        return Ok(i64::from(*i));
+    }
+    ereport(ERROR)
+        .errcode(ERRCODE_SYNTAX_ERROR)
+        .errmsg(format!("{} requires a numeric value", o.name))
+        .finish(loc("defGetInt64"))?;
+    unreachable!()
+}
+
+fn strcasecmp(a: &str, b: &str) -> bool {
+    pgstrcasecmp::pg_strcasecmp(a.as_bytes(), b.as_bytes()) == 0
+}
+
+fn dup_err(name: &str) -> PgResult<()> {
+    ereport(ERROR)
+        .errcode(ERRCODE_SYNTAX_ERROR)
+        .errmsg(format!("duplicate option \"{name}\""))
+        .finish(loc("parse_basebackup_options"))
+}
+
+fn parse_basebackup_options(options: &[ReplOption]) -> PgResult<BasebackupOptions> {
+    let mut opt = BasebackupOptions::default();
+    NOVERIFY_CHECKSUMS.with(|c| c.set(false));
+
+    let (mut o_label, mut o_progress, mut o_checkpoint, mut o_nowait) = (false, false, false, false);
+    let (mut o_wal, mut o_incremental, mut o_maxrate, mut o_tsmap) = (false, false, false, false);
+    let (mut o_noverify, mut o_manifest, mut o_manifest_cksums) = (false, false, false);
+    let mut o_target = false;
+    let mut o_target_detail = false;
+    let mut o_compression = false;
+    let mut o_compression_detail = false;
+    let mut target_str: Option<String> = None;
+    let mut target_detail_str: Option<String> = None;
+    let mut compression_detail_str: Option<String> = None;
+
+    for o in options {
+        let name = o.name.as_str();
+        match name {
+            "label" => {
+                if o_label { dup_err(name)?; }
+                opt.label = opt_string(o)?;
+                o_label = true;
+            }
+            "progress" => {
+                if o_progress { dup_err(name)?; }
+                opt.progress = opt_bool(o)?;
+                o_progress = true;
+            }
+            "checkpoint" => {
+                if o_checkpoint { dup_err(name)?; }
+                let v = opt_string(o)?;
+                if strcasecmp(&v, "fast") {
+                    opt.fastcheckpoint = true;
+                } else if strcasecmp(&v, "spread") {
+                    opt.fastcheckpoint = false;
+                } else {
+                    ereport(ERROR).errcode(ERRCODE_SYNTAX_ERROR)
+                        .errmsg(format!("unrecognized checkpoint type: \"{v}\""))
+                        .finish(loc("parse_basebackup_options"))?;
+                }
+                o_checkpoint = true;
+            }
+            "wait" => {
+                if o_nowait { dup_err(name)?; }
+                opt.nowait = !opt_bool(o)?;
+                o_nowait = true;
+            }
+            "wal" => {
+                if o_wal { dup_err(name)?; }
+                opt.includewal = opt_bool(o)?;
+                o_wal = true;
+            }
+            "incremental" => {
+                if o_incremental { dup_err(name)?; }
+                opt.incremental = opt_bool(o)?;
+                // C basebackup.c line ~792: the summarize_wal prerequisite
+                // gate, raised at option-parse time exactly as in C.
+                if opt.incremental && !guc_tables::vars::summarize_wal.read() {
+                    ereport(ERROR).errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE)
+                        .errmsg("incremental backups cannot be taken unless WAL summarization is enabled")
+                        .finish(loc("parse_basebackup_options"))?;
+                }
+                o_incremental = true;
+            }
+            "max_rate" => {
+                if o_maxrate { dup_err(name)?; }
+                let mr = opt_int(o)?;
+                if mr < MAX_RATE_LOWER || mr > MAX_RATE_UPPER {
+                    ereport(ERROR).errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE)
+                        .errmsg(format!(
+                            "{} is outside the valid range for parameter \"MAX_RATE\" ({MAX_RATE_LOWER} .. {MAX_RATE_UPPER})",
+                            mr as i32
+                        ))
+                        .finish(loc("parse_basebackup_options"))?;
+                }
+                opt.maxrate = mr as u32;
+                o_maxrate = true;
+            }
+            "tablespace_map" => {
+                if o_tsmap { dup_err(name)?; }
+                opt.sendtblspcmapfile = opt_bool(o)?;
+                o_tsmap = true;
+            }
+            "verify_checksums" => {
+                if o_noverify { dup_err(name)?; }
+                let verify = opt_bool(o)?;
+                NOVERIFY_CHECKSUMS.with(|c| c.set(!verify));
+                o_noverify = true;
+            }
+            "manifest" => {
+                if o_manifest { dup_err(name)?; }
+                let v = opt_string(o)?;
+                opt.manifest = if let Some(b) = parse_bool_str(&v) {
+                    if b { BackupManifestOption::Yes } else { BackupManifestOption::No }
+                } else if strcasecmp(&v, "force-encode") {
+                    BackupManifestOption::ForceEncode
+                } else {
+                    ereport(ERROR).errcode(ERRCODE_SYNTAX_ERROR)
+                        .errmsg(format!("unrecognized manifest option: \"{v}\""))
+                        .finish(loc("parse_basebackup_options"))?;
+                    unreachable!()
+                };
+                o_manifest = true;
+            }
+            "manifest_checksums" => {
+                if o_manifest_cksums { dup_err(name)?; }
+                let v = opt_string(o)?;
+                match parse_checksum_type(v.as_bytes()) {
+                    Some(t) => opt.manifest_checksum_type = t,
+                    None => {
+                        ereport(ERROR).errcode(ERRCODE_SYNTAX_ERROR)
+                            .errmsg(format!("unrecognized checksum algorithm: \"{v}\""))
+                            .finish(loc("parse_basebackup_options"))?;
+                    }
+                }
+                o_manifest_cksums = true;
+            }
+            "target" => {
+                if o_target { dup_err(name)?; }
+                target_str = Some(opt_string(o)?);
+                o_target = true;
+            }
+            "target_detail" => {
+                if o_target_detail { dup_err(name)?; }
+                target_detail_str = Some(opt_string(o)?);
+                o_target_detail = true;
+            }
+            "compression" => {
+                if o_compression { dup_err(name)?; }
+                let v = opt_string(o)?;
+                // parse_compress_algorithm is case-sensitive, as C's strcmp.
+                match parse_compress_algorithm(&v) {
+                    Some(alg) => opt.compression = alg,
+                    None => {
+                        ereport(ERROR).errcode(ERRCODE_SYNTAX_ERROR)
+                            .errmsg(format!("unrecognized compression algorithm: \"{v}\""))
+                            .finish(loc("parse_basebackup_options"))?;
+                    }
+                }
+                o_compression = true;
+            }
+            "compression_detail" => {
+                if o_compression_detail { dup_err(name)?; }
+                compression_detail_str = Some(opt_string(o)?);
+                o_compression_detail = true;
+            }
+            _ => {
+                ereport(ERROR).errcode(ERRCODE_SYNTAX_ERROR)
+                    .errmsg(format!("unrecognized base backup option: \"{name}\""))
+                    .finish(loc("parse_basebackup_options"))?;
+            }
+        }
+    }
+
+    if !o_label {
+        opt.label = "base backup".to_string();
+    }
+    if matches!(opt.manifest, BackupManifestOption::No) {
+        if o_manifest_cksums {
+            ereport(ERROR).errcode(ERRCODE_SYNTAX_ERROR)
+                .errmsg("manifest checksums require a backup manifest")
+                .finish(loc("parse_basebackup_options"))?;
+        }
+        opt.manifest_checksum_type = CHECKSUM_TYPE_NONE;
+    }
+
+    match target_str.as_deref() {
+        None => {
+            if target_detail_str.is_some() {
+                ereport(ERROR).errcode(ERRCODE_SYNTAX_ERROR)
+                    .errmsg("target detail cannot be used without target")
+                    .finish(loc("parse_basebackup_options"))?;
+            }
+            opt.send_to_client = true;
+        }
+        Some("client") => {
+            if target_detail_str.is_some() {
+                ereport(ERROR).errcode(ERRCODE_SYNTAX_ERROR)
+                    .errmsg("target \"client\" does not accept a target detail")
+                    .finish(loc("parse_basebackup_options"))?;
+            }
+            opt.send_to_client = true;
+        }
+        Some(target) => {
+            opt.target_handle = Some(basebackup_target::BaseBackupGetTargetHandle(
+                target,
+                target_detail_str.as_deref(),
+            )?);
+        }
+    }
+
+    if o_compression_detail && !o_compression {
+        ereport(ERROR).errcode(ERRCODE_SYNTAX_ERROR)
+            .errmsg("compression detail cannot be specified unless compression is enabled")
+            .finish(loc("parse_basebackup_options"))?;
+    }
+    if o_compression {
+        opt.compression_specification =
+            parse_compress_specification(opt.compression, compression_detail_str.as_deref());
+        if let Some(error_detail) =
+            validate_compress_specification(&opt.compression_specification)
+        {
+            ereport(ERROR).errcode(ERRCODE_SYNTAX_ERROR)
+                .errmsg(format!("invalid compression specification: {error_detail}"))
+                .finish(loc("parse_basebackup_options"))?;
+        }
+    }
+
+    Ok(opt)
+}
+
+// ===========================================================================
+// SendBaseBackup — the BASE_BACKUP entry point.
+// ===========================================================================
+
+pub fn SendBaseBackup<'mcx>(mcx: Mcx<'mcx>, cmd: &BaseBackupCmd) -> PgResult<()> {
+    if transam_xlog::get_backup_status() == transam_xlog::SessionBackupState::Running {
+        return ereport(ERROR)
+            .errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE)
+            .errmsg("a backup is already in progress in this session")
+            .finish(loc("SendBaseBackup"));
+    }
+
+    let mut opt = parse_basebackup_options(&cmd.options)?;
+
+    // C basebackup.c line ~1015: an incremental backup without a prior
+    // UPLOAD_MANIFEST is an ERROR; a full backup with one just ignores it
+    // (C: `if (!opt.incremental) ib = NULL`). C threads `ib` in as an
+    // argument; the session-owned store lives in walsender — see
+    // WalSndCtlData.uploaded_manifests, the Q2 ruling site. We hold the
+    // session cell's lock for the duration of the backup: the only other
+    // toucher is this same session's UploadManifest/WalSndKill, neither of
+    // which can run while this synchronous command is executing.
+    let mut manifest_guard = None;
+    if opt.incremental {
+        let locked = walsender::uploaded_manifest_cell()
+            .map(|cell| cell.lock().expect("uploaded manifest mutex"));
+        match locked {
+            Some(guard) if guard.is_some() => manifest_guard = Some(guard),
+            _ => {
+                return ereport(ERROR)
+                    .errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE)
+                    .errmsg("must UPLOAD_MANIFEST before performing an incremental BASE_BACKUP")
+                    .finish(loc("SendBaseBackup"));
+            }
+        }
+    }
+
+    walsender::WalSndSetState(WalSndState::Backup);
+
+    if ps_status::update_process_title() {
+        let mut msg = format!("sending backup \"{}\"", opt.label);
+        if msg.len() > 49 {
+            msg.truncate(truncate_char_boundary(&msg, 49));
+        }
+        ps_status_seams::set_ps_display::call(msg.as_str());
+    }
+
+    // Client copy sink; if the target is not 'client' the backup data goes
+    // wherever BaseBackupGetSink routes it instead.
+    let mut sink: Box<Bbsink<'mcx>> = backup_copy::bbsink_copystream_new(mcx, opt.send_to_client);
+    if let Some(handle) = opt.target_handle.take() {
+        sink = basebackup_target::BaseBackupGetSink(mcx, handle, sink)?;
+    }
+
+    // Set up network throttling, if client requested it (as in C, throttling
+    // wraps inside compression: the rate limit applies to compressed bytes).
+    if opt.maxrate > 0 {
+        sink = throttle::bbsink_throttle_new(mcx, sink, opt.maxrate);
+    }
+
+    // Set up server-side compression, if client requested it.
+    match opt.compression {
+        PgCompressAlgorithm::Gzip => {
+            sink = basebackup_compress::bbsink_gzip_new(mcx, sink, &opt.compression_specification)?;
+        }
+        PgCompressAlgorithm::Lz4 => {
+            sink = basebackup_compress::bbsink_lz4_new(mcx, sink, &opt.compression_specification)?;
+        }
+        PgCompressAlgorithm::Zstd => {
+            sink = basebackup_compress::bbsink_zstd_new(mcx, sink, &opt.compression_specification)?;
+        }
+        PgCompressAlgorithm::None => {}
+    }
+
+    // Set up progress reporting (basebackup.c:1051). Always wrapped, as in C;
+    // opt.progress only controls the (unported, inc-5 refusal-free) size
+    // estimate, so bytes_total stays invalid — equivalent to --no-estimate-size.
+    sink = sink_support::bbsink_progress_new(mcx, sink, opt.progress);
+
+    let mut state = BbsinkState::default();
+    // The uploaded IncrementalBackupInfo, borrowed from the locked session
+    // cell for the duration of the backup (C: the `ib` argument).
+    let ib: Option<&mut basebackup_incremental::IncrementalBackupInfo> =
+        manifest_guard.as_mut().and_then(|g| g.as_deref_mut());
+    // The DestRemoteSimple bridge needs the command mcx during the synchronous
+    // result-set sends inside perform_base_backup.
+    bcs_bridge::set_backup_mcx(mcx);
+    let result = perform_base_backup(mcx, &opt, &mut sink, &mut state, ib);
+    bcs_bridge::clear_backup_mcx();
+
+    // PG_FINALLY: always clean up the sink; propagate the primary error first.
+    let cleanup = bbsink_cleanup(&mut sink, &mut state);
+    result?;
+    cleanup
+}
+
+fn truncate_char_boundary(s: &str, max: usize) -> usize {
+    let mut idx = max.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+// ===========================================================================
+// perform_base_backup.
+// ===========================================================================
+
+fn perform_base_backup<'mcx>(
+    mcx: Mcx<'mcx>,
+    opt: &BasebackupOptions,
+    sink: &mut Bbsink<'mcx>,
+    state: &mut BbsinkState,
+    mut ib: Option<&mut basebackup_incremental::IncrementalBackupInfo>,
+) -> PgResult<()> {
+    state.tablespaces = Vec::new();
+    state.tablespace_num = 0;
+    state.bytes_done = 0;
+    state.bytes_total = 0;
+    state.bytes_total_is_valid = false;
+
+    BACKUP_STARTED_IN_RECOVERY.with(|c| c.set(transam_xlog::RecoveryInProgress()));
+    TOTAL_CHECKSUM_FAILURES.with(|c| c.set(0));
+
+    let mut manifest = BackupManifestInfo::zeroed();
+    InitializeBackupManifest(mcx, &mut manifest, opt.manifest, opt.manifest_checksum_type)?;
+
+    // do_pg_backup_start (inc-4, C-faithful out-params): fills the tablespace
+    // list, the BackupState, and the tablespace_map bytes.
+    transam_xlog::register_persistent_abort_backup_handler()?;
+    let mut backup_state = xlogbackup::BackupState::default();
+    let mut tablespace_map: Vec<u8> = Vec::new();
+    sink_support::basebackup_progress_wait_checkpoint();
+    transam_xlog::do_pg_backup_start(
+        opt.label.as_bytes(),
+        opt.fastcheckpoint,
+        Some(&mut state.tablespaces),
+        &mut backup_state,
+        &mut tablespace_map,
+    )?;
+
+    state.startptr = backup_state.startpoint;
+    state.starttli = backup_state.starttli;
+
+    let mut endptr: XLogRecPtr = 0;
+    let mut endtli: TimeLineID = 0;
+
+    let mut body = || -> PgResult<()> {
+        // If this is an incremental backup, execute preparatory steps
+        // (basebackup.c:287): validate the manifest WAL ranges against this
+        // server's history, wait for WAL summarization, and merge the
+        // required summaries into one block-reference table. C keeps the
+        // result in ib->brtab; here it is returned and threaded to
+        // GetFileBackupMethod alongside &IncrementalBackupInfo.
+        let brtab = match ib.as_deref_mut() {
+            Some(ib) => Some(ib.PrepareForIncrementalBackup(mcx, &mut backup_state)?),
+            None => None,
+        };
+        let incr: Option<(&basebackup_incremental::IncrementalBackupInfo, &blkreftable::BlockRefTable<'_>)> =
+            match (ib.as_deref(), brtab.as_ref()) {
+                (Some(ib), Some(brtab)) => Some((ib, brtab)),
+                _ => None,
+            };
+
+        // Node for the base directory, sent last.
+        state.tablespaces.push(TablespaceInfo {
+            oid: INVALID_OID,
+            path: None,
+            rpath: None,
+            size: -1,
+        });
+
+        // Calculate the total backup size by summing up the size of each
+        // tablespace (basebackup.c:300): a sizeonly walk of every
+        // tablespace, before the sink chain starts.
+        if opt.progress {
+            sink_support::basebackup_progress_estimate_backup_size();
+
+            for i in 0..state.tablespaces.len() {
+                let (path, oid) = {
+                    let ti = &state.tablespaces[i];
+                    (ti.path.clone(), ti.oid)
+                };
+                let size = match path {
+                    None => sendDir(sink, state, ".", 1, true, true, &mut manifest, None)?,
+                    Some(p) => sendTablespace(sink, state, &p, oid, true, &mut manifest, None)?,
+                };
+                state.tablespaces[i].size = size;
+                state.bytes_total += size as u64;
+            }
+            state.bytes_total_is_valid = true;
+        }
+
+        bbsink_begin_backup(sink, state, SINK_BUFFER_LENGTH)?;
+
+        let n = state.tablespaces.len();
+        for i in 0..n {
+            let (is_pgdata, path, oid) = {
+                let ti = &state.tablespaces[i];
+                (ti.path.is_none(), ti.path.clone(), ti.oid)
+            };
+
+            if is_pgdata {
+                bbsink_begin_archive(sink, state, "base.tar")?;
+
+                // backup_label first.
+                // build_backup_content_default wasn't in the checked-out inc-4
+                // xlogbackup; call the guaranteed-present lower-level fn.
+                let backup_label =
+                    xlogbackup::build_backup_content(mcx, &backup_state, false, transam_xlog::wal_segment_size())?;
+                sendFileWithContent(sink, state, BACKUP_LABEL_FILE, &backup_label, &mut manifest)?;
+
+                let mut sendtblspclinks = true;
+                if opt.sendtblspcmapfile {
+                    sendFileWithContent(sink, state, TABLESPACE_MAP, &tablespace_map, &mut manifest)?;
+                    sendtblspclinks = false;
+                }
+
+                sendDir(sink, state, ".", 1, false, sendtblspclinks, &mut manifest, incr)?;
+
+                // pg_control last (basebackup.c:333).
+                let statbuf = match lstat_raw(XLOG_CONTROL_FILE) {
+                    Ok(s) => s,
+                    Err(errnum) => {
+                        return stat_error(XLOG_CONTROL_FILE, "file", errnum, "perform_base_backup");
+                    }
+                };
+                sendFile(sink, state, XLOG_CONTROL_FILE, XLOG_CONTROL_FILE, &statbuf, false, INVALID_OID, INVALID_OID, None, &mut manifest, None, 0)?;
+            } else {
+                let archive_name = format!("{oid}.tar");
+                bbsink_begin_archive(sink, state, &archive_name)?;
+                sendTablespace(sink, state, path.as_deref().unwrap(), oid, false, &mut manifest, incr)?;
+            }
+
+            // If we're including WAL, and this is the main data directory,
+            // don't treat this as the end of the tablespace: the xlog files
+            // are appended below and the archive terminated afterwards. Safe
+            // because the main data directory is always sent last.
+            if opt.includewal && is_pgdata {
+                debug_assert!(i == n - 1);
+            } else {
+                // Terminate the tarfile.
+                zero_buffer(sink, 2 * TAR_BLOCK_SIZE);
+                bbsink_archive_contents(sink, state, 2 * TAR_BLOCK_SIZE)?;
+                // tablespace_num is advanced by the progress sink's end_archive
+                // (basebackup_progress.c:139), which is always in the chain.
+                bbsink_end_archive(sink, state)?;
+            }
+        }
+
+        sink_support::basebackup_progress_wait_wal_archive(state);
+        transam_xlog::do_pg_backup_stop(&mut backup_state, !opt.nowait)?;
+        endptr = backup_state.stoppoint;
+        endtli = backup_state.stoptli;
+        Ok(())
+    };
+
+    // PG_ENSURE_ERROR_CLEANUP(do_pg_abort_backup): abort the backup on failure.
+    match body() {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = transam_xlog::do_pg_abort_backup(false);
+            return Err(e);
+        }
+    }
+
+    if opt.includewal {
+        // We've left the last tar file "open", so we can now append the
+        // required WAL files to it (basebackup.c:409). Scan pg_wal and
+        // include all WAL files in the range between startptr and endptr,
+        // regardless of the timeline the file is stamped with.
+        sink_support::basebackup_progress_transfer_wal();
+
+        let wal_segsz = transam_xlog::wal_segment_size();
+        let startsegno = state.startptr / wal_segsz as u64; // XLByteToSeg
+        let firstoff = xlog_file_name(state.starttli, startsegno, wal_segsz);
+        let endsegno = (endptr - 1) / wal_segsz as u64; // XLByteToPrevSeg
+        let lastoff = xlog_file_name(endtli, endsegno, wal_segsz);
+
+        let mut wal_file_list: Vec<String> = Vec::new();
+        let mut history_file_list: Vec<String> = Vec::new();
+        for name in read_dir_names("pg_wal")? {
+            if is_xlog_file_name(&name)
+                && name[8..] >= firstoff[8..]
+                && name[8..] <= lastoff[8..]
+            {
+                wal_file_list.push(name);
+            } else if transam_xlog::IsTLHistoryFileName(&name) {
+                history_file_list.push(name);
+            }
+        }
+
+        // Check that none of the WAL segments we need were removed.
+        transam_xlog::CheckXLogRemoved(startsegno, state.starttli)?;
+
+        // Oldest to newest, to reduce the chance of recycling mid-send.
+        wal_file_list.sort_by(|a, b| a[8..].cmp(&b[8..]));
+
+        if wal_file_list.is_empty() {
+            return ereport(ERROR)
+                .errmsg("could not find any WAL files")
+                .finish(loc("perform_base_backup"));
+        }
+
+        // Sanity check: first and last segments cover startptr and endptr,
+        // with no gaps in between.
+        let (_, mut segno) = xlog_from_file_name(&wal_file_list[0], wal_segsz);
+        if segno != startsegno {
+            let startfname = xlog_file_name(state.starttli, startsegno, wal_segsz);
+            return ereport(ERROR)
+                .errmsg(format!("could not find WAL file \"{startfname}\""))
+                .finish(loc("perform_base_backup"));
+        }
+        for wal_file_name in &wal_file_list {
+            let currsegno = segno;
+            let nextsegno = segno + 1;
+            let (tli, s) = xlog_from_file_name(wal_file_name, wal_segsz);
+            segno = s;
+            if !(nextsegno == segno || currsegno == segno) {
+                let nextfname = xlog_file_name(tli, nextsegno, wal_segsz);
+                return ereport(ERROR)
+                    .errmsg(format!("could not find WAL file \"{nextfname}\""))
+                    .finish(loc("perform_base_backup"));
+            }
+        }
+        if segno != endsegno {
+            let endfname = xlog_file_name(endtli, endsegno, wal_segsz);
+            return ereport(ERROR)
+                .errmsg(format!("could not find WAL file \"{endfname}\""))
+                .finish(loc("perform_base_backup"));
+        }
+
+        // Ok, we have everything we need. Send the WAL files.
+        for wal_file_name in &wal_file_list {
+            let pathbuf = format!("pg_wal/{wal_file_name}");
+            let (tli, segno) = xlog_from_file_name(wal_file_name, wal_segsz);
+
+            let fd = match fd::OpenTransientFile(&pathbuf, O_RDONLY) {
+                Ok(fd) if fd >= 0 => fd,
+                _ => {
+                    // Most likely the file was already removed by a
+                    // checkpoint; check for a better error message
+                    // (basebackup.c:549: could not open file "%s": %m).
+                    let save_errno = fd::get_errno();
+                    transam_xlog::CheckXLogRemoved(segno, tli)?;
+                    return ereport(ERROR)
+                        .errcode(elog::errno::sqlstate_for_file_access(save_errno))
+                        .errmsg(format!(
+                            "could not open file \"{pathbuf}\": {}",
+                            elog::errno::strerror(save_errno)
+                        ))
+                        .finish(loc("perform_base_backup"));
+                }
+            };
+            let statbuf = fstat_fd(fd, &pathbuf)?;
+            if statbuf.size != wal_segsz as i64 {
+                fd::CloseTransientFile(fd);
+                transam_xlog::CheckXLogRemoved(segno, tli)?;
+                return ereport(ERROR)
+                    .errcode_for_file_access()
+                    .errmsg(format!("unexpected WAL file size \"{wal_file_name}\""))
+                    .finish(loc("perform_base_backup"));
+            }
+
+            // Send the WAL file itself. WAL segments are deliberately not
+            // added to the manifest (AddWALInfoToBackupManifest records the
+            // range instead).
+            _tarWriteHeader(sink, state, &pathbuf, None, &statbuf, false)?;
+
+            let mut len: i64 = 0;
+            loop {
+                let want = sink.buffer_length().min((wal_segsz as i64 - len) as usize);
+                let cnt = {
+                    let buf = sink.buffer_slice_mut(want);
+                    basebackup_read_file(fd, buf, len, &pathbuf, true)?
+                };
+                if cnt == 0 {
+                    break;
+                }
+                transam_xlog::CheckXLogRemoved(segno, tli)?;
+                bbsink_archive_contents(sink, state, cnt as usize)?;
+                len += cnt as i64;
+                if len == wal_segsz as i64 {
+                    break;
+                }
+            }
+            if len != wal_segsz as i64 {
+                transam_xlog::CheckXLogRemoved(segno, tli)?;
+                fd::CloseTransientFile(fd);
+                return ereport(ERROR)
+                    .errcode_for_file_access()
+                    .errmsg(format!("unexpected WAL file size \"{wal_file_name}\""))
+                    .finish(loc("perform_base_backup"));
+            }
+
+            // wal_segment_size is a multiple of TAR_BLOCK_SIZE: no padding.
+            fd::CloseTransientFile(fd);
+
+            // Mark file as archived, otherwise files can get archived again
+            // after promotion of a new node.
+            let done_path = transam_xlog::StatusFilePath(wal_file_name, ".done");
+            sendFileWithContent(sink, state, &done_path, b"", &mut manifest)?;
+        }
+
+        // Send timeline history files too — small and highly useful for
+        // debugging, so include them all, always.
+        for fname in &history_file_list {
+            let pathbuf = format!("pg_wal/{fname}");
+            // basebackup.c:577: could not stat file "%s": %m
+            let statbuf = match lstat_raw(&pathbuf) {
+                Ok(s) => s,
+                Err(errnum) => return stat_error(&pathbuf, "file", errnum, "perform_base_backup"),
+            };
+            sendFile(sink, state, &pathbuf, &pathbuf, &statbuf, false, INVALID_OID, INVALID_OID, None, &mut manifest, None, 0)?;
+
+            // Unconditionally mark file as archived.
+            let done_path = transam_xlog::StatusFilePath(fname, ".done");
+            sendFileWithContent(sink, state, &done_path, b"", &mut manifest)?;
+        }
+
+        // Properly terminate the tar file.
+        zero_buffer(sink, 2 * TAR_BLOCK_SIZE);
+        bbsink_archive_contents(sink, state, 2 * TAR_BLOCK_SIZE)?;
+        bbsink_end_archive(sink, state)?;
+    }
+
+    AddWALInfoToBackupManifest(mcx, &mut manifest, state.startptr, state.starttli, endptr, endtli)?;
+    // manifest ships a finalize-and-return-bytes SendBackupManifest; stream the
+    // returned bytes through the sink's manifest dispatch (Lane C option (a)).
+    // backup_manifest.c SendBackupManifest: nothing is sent (no manifest
+    // archive at all) unless a manifest was requested.
+    if manifest::IsManifestEnabled(&manifest) {
+        let mbytes = SendBackupManifest(&mut manifest)?;
+        sink::bbsink_begin_manifest(sink, state)?;
+        let mut off = 0usize;
+        while off < mbytes.len() {
+            let n = sink.buffer_length().min(mbytes.len() - off);
+            sink.buffer_slice_mut(n).copy_from_slice(&mbytes[off..off + n]);
+            sink::bbsink_manifest_contents(sink, state, n)?;
+            off += n;
+        }
+        sink::bbsink_end_manifest(sink, state)?;
+    }
+    bbsink_end_backup(sink, state, endptr, endtli)?;
+
+    FreeBackupManifest(&mut manifest);
+
+    let total_checksum_failures = TOTAL_CHECKSUM_FAILURES.with(Cell::get);
+    if total_checksum_failures != 0 {
+        if total_checksum_failures > 1 {
+            let _ = ereport(WARNING)
+                .errmsg_plural(
+                    format!("{total_checksum_failures} total checksum verification failure"),
+                    format!("{total_checksum_failures} total checksum verification failures"),
+                    total_checksum_failures as u64,
+                )
+                .finish(loc("perform_base_backup"));
+        }
+        return ereport(ERROR)
+            .errcode(types_error::ERRCODE_DATA_CORRUPTED)
+            .errmsg("checksum verification failure during base backup")
+            .finish(loc("perform_base_backup"));
+    }
+
+    // upstream e7564ee8cdcb (18.6): Clear base backup progress on backup failure
+    // (progress reporting now ends in the progress sink's cleanup callback).
+    Ok(())
+}
+
+fn zero_buffer(sink: &mut Bbsink<'_>, len: usize) {
+    sink.buffer_slice_mut(len).fill(0);
+}
+
+// ---------------------------------------------------------------------------
+// WAL filename helpers (xlog_internal.h macros, inlined for the includewal
+// section; the transam_xlog copies are pub(crate)).
+// ---------------------------------------------------------------------------
+
+// IsXLogFileName: 24 upper-case hex characters.
+fn is_xlog_file_name(fname: &str) -> bool {
+    fname.len() == 24
+        && fname
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'A'..=b'F').contains(&c))
+}
+
+// XLogFileName.
+fn xlog_file_name(tli: TimeLineID, seg_no: u64, wal_segsz: i32) -> String {
+    let per_id = 0x1_0000_0000u64 / wal_segsz as u64;
+    format!("{:08X}{:08X}{:08X}", tli, seg_no / per_id, seg_no % per_id)
+}
+
+// XLogFromFileName.
+fn xlog_from_file_name(fname: &str, wal_segsz: i32) -> (TimeLineID, u64) {
+    let per_id = 0x1_0000_0000u64 / wal_segsz as u64;
+    let tli = u32::from_str_radix(&fname[0..8], 16).unwrap_or(0);
+    let log = u64::from_str_radix(&fname[8..16], 16).unwrap_or(0);
+    let seg = u64::from_str_radix(&fname[16..24], 16).unwrap_or(0);
+    (tli, log * per_id + seg)
+}
+
+// verify_page_checksum (basebackup.c:104): None = page OK (new page, page
+// newer than the backup start, or checksum matches); Some(calculated) on a
+// mismatch.
+fn verify_page_checksum(page: &[u8], start_lsn: XLogRecPtr, blkno: u32) -> Option<u16> {
+    // PageIsNew: pd_upper == 0.
+    let pd_upper = u16::from_ne_bytes([page[14], page[15]]);
+    // PageGetLSN: pd_lsn = { xlogid u32, xrecoff u32 }.
+    let lsn = ((u32::from_ne_bytes(page[0..4].try_into().unwrap()) as u64) << 32)
+        | u32::from_ne_bytes(page[4..8].try_into().unwrap()) as u64;
+    if pd_upper == 0 || lsn >= start_lsn {
+        return None;
+    }
+    let checksum = pg_checksum_page(page, blkno);
+    let pd_checksum = u16::from_ne_bytes([page[8], page[9]]);
+    if pd_checksum == checksum {
+        None
+    } else {
+        Some(checksum)
+    }
+}
+
+// pg_checksum_page (storage/checksum_impl.h): FNV-1a-derived block checksum
+// computed with pd_checksum treated as zero (same algorithm as bufmgr's
+// PageSetChecksumInplace).
+fn pg_checksum_page(page: &[u8], blkno: u32) -> u16 {
+    const N_SUMS: usize = 32;
+    const FNV_PRIME: u32 = 16777619;
+    const CHECKSUM_BASE_OFFSETS: [u32; N_SUMS] = [
+        0x5B1F36E9, 0xB8525960, 0x02AB50AA, 0x1DE66D2A, 0x79FF467A, 0x9BB9F8A3, 0x217E7CD2,
+        0x83E13D2C, 0xF8D4474F, 0xE39EB970, 0x42C6AE16, 0x993216FA, 0x7B093B5D, 0x98DAFF3C,
+        0xF718902A, 0x0B1C9CDB, 0xE58F764B, 0x187636BC, 0x5D7B3BB1, 0xE73DE7DE, 0x92BEC979,
+        0xCCA6C0B2, 0x304A0979, 0x85AA43D4, 0x783125BB, 0x6CA8EAA2, 0xE407EAC6, 0x4B5CFC3E,
+        0x9FBF8C76, 0x15CA20BE, 0xF2CA9FD3, 0x959BD756,
+    ];
+    #[inline(always)]
+    fn comp(sum: &mut u32, value: u32) {
+        let tmp = *sum ^ value;
+        *sum = tmp.wrapping_mul(FNV_PRIME) ^ (tmp >> 17);
+    }
+    let blcksz = types_core::BLCKSZ;
+    debug_assert_eq!(page.len(), blcksz);
+    let mut sums = CHECKSUM_BASE_OFFSETS;
+    let rows = blcksz / (4 * N_SUMS);
+    for row in 0..rows {
+        for (lane, sum) in sums.iter_mut().enumerate() {
+            let off = (row * N_SUMS + lane) * 4;
+            // pd_checksum (bytes 8..10) is computed as zero.
+            let v = if off == 8 {
+                u32::from_ne_bytes([0, 0, page[10], page[11]])
+            } else {
+                u32::from_ne_bytes(page[off..off + 4].try_into().unwrap())
+            };
+            comp(sum, v);
+        }
+    }
+    for _ in 0..2 {
+        for sum in sums.iter_mut() {
+            comp(sum, 0);
+        }
+    }
+    let mut checksum: u32 = sums.into_iter().fold(0, |a, s| a ^ s);
+    checksum ^= blkno;
+    (checksum % 65535 + 1) as u16
+}
+
+fn fstat_fd(fd: i32, path: &str) -> PgResult<LstatInfo> {
+    // SAFETY: zeroed stat is POD; fd is an open file descriptor.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    if rc != 0 {
+        // basebackup.c:552: could not stat file "%s": %m
+        return stat_error(path, "file", fd::get_errno(), "perform_base_backup");
+    }
+    Ok(LstatInfo {
+        size: st.st_size,
+        mode: st.st_mode as u32,
+        uid: st.st_uid,
+        gid: st.st_gid,
+        #[cfg(not(target_family = "wasm"))]
+        mtime: st.st_mtime,
+        // wasm32: wasi-libc's stat spells it st_mtim (timespec), no
+        // st_mtime alias in the libc crate.
+        #[cfg(target_family = "wasm")]
+        mtime: st.st_mtim.tv_sec as i64,
+    })
+}
+
+// ===========================================================================
+// sendFileWithContent / sendTablespace / sendDir / sendFile.
+// ===========================================================================
+
+fn sendFileWithContent(
+    sink: &mut Bbsink<'_>,
+    state: &mut BbsinkState,
+    filename: &str,
+    content: &[u8],
+    manifest: &mut BackupManifestInfo,
+) -> PgResult<()> {
+    let mut ctx = checksum_init(manifest.checksum_type(), filename)?;
+    let len = content.len();
+
+    let statbuf = LstatInfo {
+        size: len as i64,
+        mode: pg_file_create_mode(),
+        uid: geteuid(),
+        gid: getegid(),
+        mtime: time_now(),
+    };
+
+    _tarWriteHeader(sink, state, filename, None, &statbuf, false)?;
+    checksum_update(&mut ctx, content)?;
+
+    let mut done = 0usize;
+    while done < len {
+        let nbytes = sink.buffer_length().min(len - done);
+        sink.buffer_slice_mut(nbytes).copy_from_slice(&content[done..done + nbytes]);
+        bbsink_archive_contents(sink, state, nbytes)?;
+        done += nbytes;
+    }
+    _tarWritePadding(sink, state, len)?;
+
+    AddFileToBackupManifest(manifest, INVALID_OID, filename.as_bytes(), len as i64, statbuf.mtime, &mut ctx)
+}
+
+/// The per-relation-file incremental context threaded from
+/// perform_base_backup down to sendDir/sendFile: the uploaded manifest info
+/// plus the merged block-reference table (C: the `ib` parameter, whose brtab
+/// member carries the merged table).
+type IncrCtx<'a, 'mcx> = Option<(
+    &'a basebackup_incremental::IncrementalBackupInfo,
+    &'a blkreftable::BlockRefTable<'mcx>,
+)>;
+
+// CHECK_FOR_INTERRUPTS() (miscadmin.h): a raised cancel/die comes back as
+// the Err, exactly as the seam renders ProcessInterrupts.
+fn check_for_interrupts() -> PgResult<()> {
+    if init_small::globals::InterruptPending() {
+        return postgres_seams::check_for_interrupts::call();
+    }
+    Ok(())
+}
+
+fn sendTablespace(
+    sink: &mut Bbsink<'_>,
+    state: &mut BbsinkState,
+    path: &str,
+    spcoid: Oid,
+    sizeonly: bool,
+    manifest: &mut BackupManifestInfo,
+    incr: IncrCtx<'_, '_>,
+) -> PgResult<i64> {
+    let pathbuf = format!("{path}/{TABLESPACE_VERSION_DIRECTORY}");
+    let statbuf = match lstat_file(&pathbuf, "sendTablespace")? {
+        Some(s) => s,
+        None => return Ok(0), // tablespace went away — not an error
+    };
+    let mut size =
+        _tarWriteHeader(sink, state, TABLESPACE_VERSION_DIRECTORY, None, &statbuf, sizeonly)?;
+    size += sendDir_spc(
+        sink, state, &pathbuf, path.len() as i32, sizeonly, true, manifest, spcoid, incr,
+    )?;
+    Ok(size)
+}
+
+fn sendDir(
+    sink: &mut Bbsink<'_>,
+    state: &mut BbsinkState,
+    path: &str,
+    basepathlen: i32,
+    sizeonly: bool,
+    sendtblspclinks: bool,
+    manifest: &mut BackupManifestInfo,
+    incr: IncrCtx<'_, '_>,
+) -> PgResult<i64> {
+    sendDir_spc(sink, state, path, basepathlen, sizeonly, sendtblspclinks, manifest, INVALID_OID, incr)
+}
+
+// sendDir (basebackup.c:1244). With `sizeonly` nothing is emitted: the walk
+// only totals the tar bytes it would produce (the PROGRESS size estimate).
+fn sendDir_spc(
+    sink: &mut Bbsink<'_>,
+    state: &mut BbsinkState,
+    path: &str,
+    basepathlen: i32,
+    sizeonly: bool,
+    sendtblspclinks: bool,
+    manifest: &mut BackupManifestInfo,
+    spcoid: Oid,
+    incr: IncrCtx<'_, '_>,
+) -> PgResult<i64> {
+    let mut size: i64 = 0;
+
+    // Since this array is relatively large, avoid putting it on the stack.
+    // But we don't need it at all if this is not an incremental backup.
+    // (C: palloc(sizeof(BlockNumber) * RELSEG_SIZE) per sendDir call.)
+    let mut relative_block_numbers: Vec<types_core::BlockNumber> = if incr.is_some() {
+        vec![0; basebackup_incremental::RELSEG_SIZE as usize]
+    } else {
+        Vec::new()
+    };
+
+    // Determine if the current path is a database directory that can contain
+    // relations (basebackup.c sendDir head): last path component all digits
+    // with parent "./base" or a tablespace version path, or "./global".
+    let is_global_dir = path == "./global";
+    let (is_relation_dir, dboid): (bool, u32) = match path.rfind('/') {
+        Some(idx)
+            if idx + 1 < path.len()
+                && path[idx + 1..].bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            let parent = &path[..idx];
+            if parent == "./base" || parent.ends_with(TABLESPACE_VERSION_DIRECTORY) {
+                (true, path[idx + 1..].parse::<u32>().unwrap_or(0))
+            } else {
+                (false, 0)
+            }
+        }
+        _ => (is_global_dir, 0),
+    };
+
+    for d_name in read_dir_names(path)? {
+        if d_name == "." || d_name == ".." || d_name == ".DS_Store" {
+            continue;
+        }
+        if d_name.starts_with(PG_TEMP_FILE_PREFIX) {
+            continue;
+        }
+
+        // Check if the postmaster has signaled us to exit, and abort with an
+        // error in that case (basebackup.c:1277). Also check that if the
+        // backup was started while still in recovery, the server wasn't
+        // promoted: promotion mid-backup corrupts the backup.
+        check_for_interrupts()?;
+        if transam_xlog::RecoveryInProgress() != BACKUP_STARTED_IN_RECOVERY.with(Cell::get) {
+            return ereport(ERROR).errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE)
+                .errmsg("the standby was promoted during online backup")
+                .errhint(
+                    "This means that the backup being taken is corrupt and should not be used. \
+                     Try taking another online backup.",
+                )
+                .finish(loc("sendDir")).map(|()| 0);
+        }
+
+        // Excluded files.
+        let mut excluded = false;
+        for item in EXCLUDE_FILES {
+            let cmplen = if item.match_prefix { item.name.len() } else { item.name.len() + 1 };
+            if strncmp(&d_name, item.name, cmplen) == 0 {
+                excluded = true;
+                break;
+            }
+        }
+        if excluded {
+            continue;
+        }
+
+        // If there could be non-temporary relation files in this directory,
+        // try to parse the filename.
+        let mut is_relation_file = false;
+        let mut relfilenumber: u32 = 0;
+        let mut segno_of: u32 = 0;
+        let mut rel_fork = types_core::ForkNumber::MAIN_FORKNUM;
+        if is_relation_dir {
+            if let Some((num, fork, segno)) =
+                fd::reinit::parse_filename_for_nontemp_relation(&d_name)
+            {
+                is_relation_file = true;
+                relfilenumber = num;
+                segno_of = segno;
+                rel_fork = fork;
+            }
+        }
+
+        // Exclude all forks for unlogged tables except the init fork: any
+        // other fork with a matching _init fork present is skipped.
+        if is_relation_file && rel_fork != types_core::ForkNumber::INIT_FORKNUM {
+            // basebackup.c:1332: any lstat failure means "no init fork".
+            let init_fork_file = format!("{path}/{relfilenumber}_init");
+            if lstat_raw(&init_fork_file).is_ok() {
+                continue;
+            }
+        }
+
+        // Exclude temporary relations.
+        if dboid != 0 && fd::looks_like_temp_rel_name(&d_name) {
+            continue;
+        }
+
+        let pathbuf = format!("{path}/{d_name}");
+        if pathbuf == format!("./{XLOG_CONTROL_FILE}") {
+            continue; // pg_control sent last
+        }
+
+        let mut statbuf = match lstat_file(&pathbuf, "sendDir")? {
+            Some(s) => s,
+            None => continue, // vanished mid-scan
+        };
+
+        // Directories whose contents are excluded (kept as empty dirs).
+        let mut excl_contents = false;
+        for excl in EXCLUDE_DIR_CONTENTS {
+            if &d_name == excl {
+                convert_link_to_directory(&mut statbuf);
+                size += _tarWriteHeader(
+                    sink, state, &pathbuf[basepathlen as usize + 1..], None, &statbuf, sizeonly,
+                )?;
+                excl_contents = true;
+                break;
+            }
+        }
+        if excl_contents {
+            continue;
+        }
+
+        // pg_wal is included as an empty directory (+ archive_status, summaries).
+        if pathbuf == "./pg_wal" {
+            convert_link_to_directory(&mut statbuf);
+            size += _tarWriteHeader(
+                sink, state, &pathbuf[basepathlen as usize + 1..], None, &statbuf, sizeonly,
+            )?;
+            // Also send archive_status and summaries directories, named as
+            // C names them (basebackup.c:1399).
+            size += _tarWriteHeader(sink, state, "./pg_wal/archive_status", None, &statbuf, sizeonly)?;
+            size += _tarWriteHeader(sink, state, "./pg_wal/summaries", None, &statbuf, sizeonly)?;
+            continue;
+        }
+
+        if path == "./pg_tblspc" && S_ISLNK(statbuf.mode) {
+            let linkpath = read_link(&pathbuf)?;
+            size += _tarWriteHeader(
+                sink, state, &pathbuf[basepathlen as usize + 1..], Some(&linkpath), &statbuf, sizeonly,
+            )?;
+        } else if S_ISDIR(statbuf.mode) {
+            size += _tarWriteHeader(
+                sink, state, &pathbuf[basepathlen as usize + 1..], None, &statbuf, sizeonly,
+            )?;
+
+            // Recurse, unless this is a separate tablespace located within PGDATA.
+            let mut skip = false;
+            let cmp = &pathbuf[2..];
+            for ti in state.tablespaces.iter() {
+                if let Some(rpath) = &ti.rpath {
+                    if rpath == cmp {
+                        skip = true;
+                        break;
+                    }
+                }
+            }
+            if pathbuf == "./pg_tblspc" && !sendtblspclinks {
+                skip = true;
+            }
+            if !skip {
+                size += sendDir_spc(
+                    sink, state, &pathbuf, basepathlen, sizeonly, sendtblspclinks, manifest, spcoid, incr,
+                )?;
+            }
+        } else if S_ISREG(statbuf.mode) {
+            let mut tarfilename = pathbuf[basepathlen as usize + 1..].to_string();
+            let relfile = if is_relation_file {
+                Some((relfilenumber, segno_of))
+            } else {
+                None
+            };
+
+            // Incremental decision per relation file (basebackup.c:1478).
+            let mut num_blocks_required: u32 = 0;
+            let mut truncation_block_length: u32 = 0;
+            let mut method = basebackup_incremental::FileBackupMethod::Fully;
+            if let (Some((ib, brtab)), true) = (incr, is_relation_file) {
+                // The manifest stores a tablespace-relative path for files in
+                // user tablespaces; recompute the tablespace OID for shared
+                // vs. default-database relations (C: relspcoid/lookup_path).
+                let (relspcoid, lookup_path) = if spcoid != INVALID_OID {
+                    (spcoid, format!("pg_tblspc/{spcoid}/{tarfilename}"))
+                } else if is_global_dir {
+                    (GLOBALTABLESPACE_OID, tarfilename.clone())
+                } else {
+                    (DEFAULTTABLESPACE_OID, tarfilename.clone())
+                };
+
+                method = ib.GetFileBackupMethod(
+                    brtab,
+                    &lookup_path,
+                    dboid,
+                    relspcoid,
+                    relfilenumber,
+                    rel_fork,
+                    segno_of,
+                    statbuf.size as u64,
+                    &mut num_blocks_required,
+                    &mut relative_block_numbers,
+                    &mut truncation_block_length,
+                )?;
+                if method == basebackup_incremental::FileBackupMethod::Incrementally {
+                    statbuf.size =
+                        basebackup_incremental::GetIncrementalFileSize(num_blocks_required) as i64;
+                    tarfilename = format!(
+                        "{}/INCREMENTAL.{}",
+                        &path[basepathlen as usize + 1..],
+                        d_name
+                    );
+                }
+            }
+
+            let incremental_blocks =
+                if method == basebackup_incremental::FileBackupMethod::Incrementally {
+                    Some(&relative_block_numbers[..num_blocks_required as usize])
+                } else {
+                    None
+                };
+            let sent = if sizeonly {
+                false
+            } else {
+                sendFile(
+                    sink, state, &pathbuf, &tarfilename, &statbuf, true, dboid, spcoid, relfile,
+                    manifest, incremental_blocks, truncation_block_length,
+                )?
+            };
+            if sent || sizeonly {
+                size += statbuf.size;
+                size += tar_padding_bytes_required(statbuf.size as usize) as i64;
+                size += TAR_BLOCK_SIZE as i64;
+            }
+        } else {
+            let _ = ereport(WARNING)
+                .errmsg(format!("skipping special file \"{pathbuf}\""))
+                .finish(loc("sendDir"));
+        }
+    }
+
+    Ok(size)
+}
+
+// read_file_data_into_buffer (basebackup.c:1850): read up to
+// min(buffer_length, length) bytes at `offset` into the start of the sink
+// buffer, verifying page checksums (with the one-shot torn-write retry) when
+// requested. `blkno` is the *absolute* block number of the first block in
+// the read (caller adds segno * RELSEG_SIZE). Returns the byte count read;
+// on a mid-verify concurrent truncation the count is clamped to the blocks
+// already processed.
+#[allow(clippy::too_many_arguments)]
+fn read_file_data_into_buffer(
+    sink: &mut Bbsink<'_>,
+    state: &BbsinkState,
+    readfilename: &str,
+    fd: i32,
+    offset: i64,
+    length: usize,
+    blkno: u32,
+    verify_checksum: bool,
+    checksum_failures: &mut i32,
+) -> PgResult<isize> {
+    const BLCKSZ: usize = types_core::BLCKSZ;
+
+    // Try to read some more data.
+    let want = sink.buffer_length().min(length);
+    let mut cnt = {
+        let buf = sink.buffer_slice_mut(want);
+        basebackup_read_file(fd, buf, offset, readfilename, true)?
+    };
+
+    // Can't verify checksums if read length is not a multiple of BLCKSZ.
+    if !verify_checksum || cnt <= 0 || (cnt as usize % BLCKSZ) != 0 {
+        return Ok(cnt);
+    }
+
+    // Verify checksum for each block.
+    let nblocks = cnt as usize / BLCKSZ;
+    for i in 0..nblocks {
+        let expected = {
+            let buf = sink.buffer_slice(cnt as usize);
+            verify_page_checksum(
+                &buf[i * BLCKSZ..(i + 1) * BLCKSZ],
+                state.startptr,
+                blkno + i as u32,
+            )
+        };
+        let Some(_) = expected else { continue };
+
+        // Retry the block once: a torn concurrent write may finish
+        // and update the page LSN so we then skip it. A short re-read
+        // (other than EOF) is an error here (partial_read_ok = false).
+        let reread_cnt = {
+            let buf = sink.buffer_slice_mut(cnt as usize);
+            basebackup_read_file(
+                fd,
+                &mut buf[i * BLCKSZ..(i + 1) * BLCKSZ],
+                offset + (i * BLCKSZ) as i64,
+                readfilename,
+                false,
+            )?
+        };
+        if reread_cnt == 0 {
+            // Concurrent truncation: keep only the processed blocks.
+            cnt = (BLCKSZ * i) as isize;
+            break;
+        }
+        let (expected, actual) = {
+            let buf = sink.buffer_slice(cnt as usize);
+            let page = &buf[i * BLCKSZ..(i + 1) * BLCKSZ];
+            (
+                verify_page_checksum(page, state.startptr, blkno + i as u32),
+                u16::from_ne_bytes([page[8], page[9]]),
+            )
+        };
+        let Some(expected) = expected else { continue };
+
+        *checksum_failures += 1;
+        if *checksum_failures <= 5 {
+            let _ = ereport(WARNING)
+                .errmsg(format!(
+                    "checksum verification failed in file \"{readfilename}\", block {}: calculated {:X} but expected {:X}",
+                    blkno + i as u32, expected, actual
+                ))
+                .finish(loc("read_file_data_into_buffer"));
+        }
+        if *checksum_failures == 5 {
+            let _ = ereport(WARNING)
+                .errmsg(format!(
+                    "further checksum verification failures in file \"{readfilename}\" will not be reported"
+                ))
+                .finish(loc("read_file_data_into_buffer"));
+        }
+    }
+
+    Ok(cnt)
+}
+
+// wait_event_names.txt WaitEventIO section order: AIO_IO_COMPLETION(0),
+// AIO_IO_URING_SUBMIT(1), AIO_IO_URING_EXECUTION(2), BASEBACKUP_READ(3).
+const WAIT_EVENT_BASEBACKUP_READ: u32 = 0x0A00_0000 + 3;
+
+/// basebackup_read_file (basebackup.c:2113): read `buf.len()` bytes at
+/// `offset`, setting WAIT_EVENT_BASEBACKUP_READ around the pread and
+/// reporting any error. If `partial_read_ok` is false, a read that returns
+/// fewer bytes than requested is an error too. Returns the byte count.
+fn basebackup_read_file(
+    fd: i32,
+    buf: &mut [u8],
+    offset: i64,
+    filename: &str,
+    partial_read_ok: bool,
+) -> PgResult<isize> {
+    let nbytes = buf.len();
+
+    waitevent_seams::pgstat_report_wait_start::call(WAIT_EVENT_BASEBACKUP_READ);
+    let rc = fd::pg_pread(fd, buf, offset);
+    let errnum = fd::get_errno();
+    waitevent_seams::pgstat_report_wait_end::call();
+
+    if rc < 0 {
+        ereport(ERROR)
+            .errcode(elog::errno::sqlstate_for_file_access(errnum))
+            .errmsg(format!(
+                "could not read file \"{filename}\": {}",
+                elog::errno::strerror(errnum)
+            ))
+            .finish(loc("basebackup_read_file"))?;
+    }
+    if !partial_read_ok && rc > 0 && rc as usize != nbytes {
+        ereport(ERROR)
+            .errcode(elog::errno::sqlstate_for_file_access(errnum))
+            .errmsg(format!("could not read file \"{filename}\": read {rc} of {nbytes}"))
+            .finish(loc("basebackup_read_file"))?;
+    }
+
+    Ok(rc)
+}
+
+// push_to_sink (basebackup.c:1900): copy data into the sink buffer at
+// `*bytes_done`, flushing (checksum + archive) whenever the buffer fills.
+// The sink buffer length is a BLCKSZ multiple, so flush boundaries preserve
+// block alignment.
+fn push_to_sink(
+    sink: &mut Bbsink<'_>,
+    state: &mut BbsinkState,
+    ctx: &mut PgChecksumContext,
+    bytes_done: &mut usize,
+    mut data: &[u8],
+) -> PgResult<()> {
+    while !data.is_empty() {
+        let buffer_len = sink.buffer_length();
+        let n = (buffer_len - *bytes_done).min(data.len());
+        sink.buffer_slice_mut(*bytes_done + n)[*bytes_done..].copy_from_slice(&data[..n]);
+        *bytes_done += n;
+        data = &data[n..];
+
+        // If the buffer is full, we need to push the contents to the sink
+        // and then flush the checksum over what we pushed.
+        if *bytes_done == buffer_len {
+            let chunk = sink.buffer_slice(buffer_len).to_vec();
+            checksum_update(ctx, &chunk)?;
+            bbsink_archive_contents(sink, state, buffer_len)?;
+            *bytes_done = 0;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sendFile(
+    sink: &mut Bbsink<'_>,
+    state: &mut BbsinkState,
+    readfilename: &str,
+    tarfilename: &str,
+    statbuf: &LstatInfo,
+    missing_ok: bool,
+    dboid: Oid,
+    spcoid: Oid,
+    // Some((relfilenumber, segno)) when the caller parsed a relation
+    // filename in a relation directory (checksum verification surface).
+    relfile: Option<(u32, u32)>,
+    manifest: &mut BackupManifestInfo,
+    // If the file is to be sent incrementally, the sorted segment-relative
+    // block numbers to send (C: incremental_blocks + num_incremental_blocks;
+    // None sends the whole file) and the truncation block length for the
+    // incremental file header.
+    incremental_blocks: Option<&[u32]>,
+    truncation_block_length: u32,
+) -> PgResult<bool> {
+    let mut ctx = checksum_init(manifest.checksum_type(), readfilename)?;
+
+    let fd = match fd::OpenTransientFile(readfilename, O_RDONLY) {
+        Ok(fd) if fd >= 0 => fd,
+        _ => {
+            let errnum = fd::get_errno();
+            if errnum == libc::ENOENT && missing_ok {
+                return Ok(false);
+            }
+            // basebackup.c:1595: could not open file "%s": %m
+            return ereport(ERROR)
+                .errcode(elog::errno::sqlstate_for_file_access(errnum))
+                .errmsg(format!(
+                    "could not open file \"{readfilename}\": {}",
+                    elog::errno::strerror(errnum)
+                ))
+                .finish(loc("sendFile")).map(|()| false);
+        }
+    };
+
+    _tarWriteHeader(sink, state, tarfilename, None, statbuf, false)?;
+
+    const BLCKSZ: usize = types_core::BLCKSZ;
+    const RELSEG_SIZE: u32 = basebackup_incremental::RELSEG_SIZE;
+
+    // Checksums are verified in multiples of BLCKSZ, so the buffer length
+    // should be a multiple of the block size as well.
+    debug_assert!(sink.buffer_length() % BLCKSZ == 0);
+
+    // If we weren't told not to verify checksums, and checksums are enabled
+    // for this cluster, and this is a relation file, verify per-block.
+    let mut verify_checksum = !NOVERIFY_CHECKSUMS.with(Cell::get)
+        && transam_xlog::DataChecksumsEnabled()
+        && relfile.is_some();
+    let segno = relfile.map(|(_, s)| s).unwrap_or(0);
+    let mut checksum_failures: i32 = 0;
+    let mut blkno: u32 = 0;
+    let mut ibindex: usize = 0;
+
+    let mut bytes_done: i64 = 0;
+
+    // If we're sending an incremental file, write the file header
+    // (basebackup.c:1623): INCREMENTAL_MAGIC, block count, truncation block
+    // length, the sorted relative block numbers, zero-padded to a BLCKSZ
+    // multiple iff the file has any block data. Native-endian, like C.
+    if let Some(blocks) = incremental_blocks {
+        let num_incremental_blocks = blocks.len() as u32;
+        let mut header_bytes_done: usize = 0;
+
+        push_to_sink(sink, state, &mut ctx, &mut header_bytes_done,
+            &basebackup_incremental::INCREMENTAL_MAGIC.to_ne_bytes())?;
+        push_to_sink(sink, state, &mut ctx, &mut header_bytes_done,
+            &num_incremental_blocks.to_ne_bytes())?;
+        push_to_sink(sink, state, &mut ctx, &mut header_bytes_done,
+            &truncation_block_length.to_ne_bytes())?;
+        let mut blkbytes: Vec<u8> = Vec::with_capacity(4 * blocks.len());
+        for b in blocks {
+            blkbytes.extend_from_slice(&b.to_ne_bytes());
+        }
+        push_to_sink(sink, state, &mut ctx, &mut header_bytes_done, &blkbytes)?;
+
+        // Add padding to align header to a multiple of BLCKSZ, but only if
+        // the incremental file has some blocks, and the alignment is
+        // actually needed. If there are no blocks we don't want to make the
+        // file unnecessarily large, as that might make some filesystem
+        // optimizations impossible. (The buffer length is a BLCKSZ multiple,
+        // so the in-buffer offset is congruent to the total mod BLCKSZ.)
+        if num_incremental_blocks > 0 && header_bytes_done % BLCKSZ != 0 {
+            let paddinglen = BLCKSZ - (header_bytes_done % BLCKSZ);
+            let padding = vec![0u8; paddinglen];
+            bytes_done += paddinglen as i64;
+            push_to_sink(sink, state, &mut ctx, &mut header_bytes_done, &padding)?;
+        }
+
+        // Flush out any data still in the buffer so it's again empty.
+        if header_bytes_done > 0 {
+            let chunk = sink.buffer_slice(header_bytes_done).to_vec();
+            checksum_update(&mut ctx, &chunk)?;
+            bbsink_archive_contents(sink, state, header_bytes_done)?;
+        }
+
+        // Update our notion of file position.
+        bytes_done += 4 + 4 + 4 + 4 * num_incremental_blocks as i64;
+    }
+
+    // Loop until we read the amount of data the caller told us to expect.
+    // The file could be longer, if it was extended while we were sending it,
+    // but for a base backup we can ignore such extended data. It will be
+    // restored from WAL.
+    loop {
+        // Determine whether we've read all the data that we need, and if
+        // not, read some more.
+        let cnt;
+        match incremental_blocks {
+            None => {
+                // If we've read the required number of bytes, then it's time
+                // to stop.
+                if bytes_done >= statbuf.size {
+                    break;
+                }
+                let remaining = (statbuf.size - bytes_done) as usize;
+                cnt = read_file_data_into_buffer(
+                    sink, state, readfilename, fd, bytes_done, remaining,
+                    blkno + segno * RELSEG_SIZE, verify_checksum, &mut checksum_failures,
+                )?;
+            }
+            Some(blocks) => {
+                // If we've read all the blocks, then it's time to stop.
+                if ibindex >= blocks.len() {
+                    break;
+                }
+
+                // Read just one block, whichever one is the next that we're
+                // supposed to include.
+                let relative_blkno = blocks[ibindex];
+                ibindex += 1;
+                cnt = read_file_data_into_buffer(
+                    sink, state, readfilename, fd,
+                    relative_blkno as i64 * BLCKSZ as i64, BLCKSZ,
+                    relative_blkno + segno * RELSEG_SIZE,
+                    verify_checksum, &mut checksum_failures,
+                )?;
+
+                // If we get a partial read, that must mean that the relation
+                // is being truncated. Ultimately, it should be truncated to
+                // a multiple of BLCKSZ, since this path should only be
+                // reached for relation files, but we might transiently
+                // observe an intermediate value.
+                //
+                // It should be fine to treat this just as if the entire
+                // block had been truncated away - i.e. fill this and all
+                // later blocks with zeroes. WAL replay will fix things up.
+                if (cnt as usize) < BLCKSZ {
+                    break;
+                }
+            }
+        }
+
+        // Block-level checksums can't be verified on a partial read.
+        if verify_checksum && cnt > 0 && (cnt as usize % BLCKSZ) != 0 {
+            let _ = ereport(WARNING)
+                .errmsg(format!(
+                    "could not verify checksum in file \"{readfilename}\", block {blkno}: read buffer size {cnt} and page size {BLCKSZ} differ"
+                ))
+                .finish(loc("sendFile"));
+            verify_checksum = false;
+        }
+
+        // If we hit end-of-file, a concurrent truncation must have occurred.
+        // That's not an error condition, because WAL replay will fix things
+        // up.
+        if cnt == 0 {
+            break;
+        }
+
+        // Update block number and # of bytes done for next loop iteration.
+        blkno += (cnt as usize / BLCKSZ) as u32;
+        bytes_done += cnt as i64;
+
+        // Make sure incremental files with block data are properly aligned
+        // (header is a multiple of BLCKSZ, blocks are BLCKSZ too).
+        debug_assert!(
+            !(matches!(incremental_blocks, Some(b) if !b.is_empty())
+                && bytes_done % BLCKSZ as i64 != 0)
+        );
+
+        // Archive the data we just read; also feed it to the checksum
+        // machinery.
+        let chunk = sink.buffer_slice(cnt as usize).to_vec();
+        checksum_update(&mut ctx, &chunk)?;
+        bbsink_archive_contents(sink, state, cnt as usize)?;
+    }
+
+    // Pad with zeros if truncated during send.
+    while bytes_done < statbuf.size {
+        let nbytes = sink.buffer_length().min((statbuf.size - bytes_done) as usize);
+        zero_buffer(sink, nbytes);
+        let chunk = sink.buffer_slice(nbytes).to_vec();
+        checksum_update(&mut ctx, &chunk)?;
+        bbsink_archive_contents(sink, state, nbytes)?;
+        bytes_done += nbytes as i64;
+    }
+
+    _tarWritePadding(sink, state, bytes_done as usize)?;
+    fd::CloseTransientFile(fd);
+
+    if checksum_failures > 1 {
+        let _ = ereport(WARNING)
+            .errmsg_plural(
+                format!(
+                    "file \"{readfilename}\" has a total of {checksum_failures} checksum verification failure"
+                ),
+                format!(
+                    "file \"{readfilename}\" has a total of {checksum_failures} checksum verification failures"
+                ),
+                checksum_failures as u64,
+            )
+            .finish(loc("sendFile"));
+
+        // basebackup.c:1818: the failures reach pg_stat_database.
+        pgstat::pgstat_prepare_report_checksum_failure(dboid);
+        pgstat::pgstat_report_checksum_failures_in_db(dboid, i64::from(checksum_failures));
+    }
+    TOTAL_CHECKSUM_FAILURES.with(|c| c.set(c.get() + checksum_failures as i64));
+
+    AddFileToBackupManifest(manifest, spcoid, tarfilename.as_bytes(), statbuf.size, statbuf.mtime, &mut ctx)?;
+    Ok(true)
+}
+
+// ===========================================================================
+// tar header emission + helpers.
+// ===========================================================================
+
+// _tarWriteHeader (basebackup.c:2020): with `sizeonly` only the header's
+// byte count is returned; nothing touches the sink.
+fn _tarWriteHeader(
+    sink: &mut Bbsink<'_>,
+    state: &mut BbsinkState,
+    filename: &str,
+    linktarget: Option<&str>,
+    statbuf: &LstatInfo,
+    sizeonly: bool,
+) -> PgResult<i64> {
+    if !sizeonly {
+        let (rc, header) = tar_create_header(
+            filename, linktarget, statbuf.size, statbuf.mode, statbuf.uid, statbuf.gid, statbuf.mtime,
+        );
+        match rc {
+            TarError::Ok => {}
+            TarError::NameTooLong | TarError::SymlinkTooLong => {
+                return tar_header_limit_error(rc, filename, linktarget).map(|()| 0);
+            }
+        }
+        sink.buffer_slice_mut(TAR_BLOCK_SIZE).copy_from_slice(&header);
+        bbsink_archive_contents(sink, state, TAR_BLOCK_SIZE)?;
+    }
+    Ok(TAR_BLOCK_SIZE as i64)
+}
+
+fn tar_header_limit_error(
+    rc: TarError,
+    filename: &str,
+    linktarget: Option<&str>,
+) -> PgResult<()> {
+    match rc {
+        TarError::NameTooLong => ereport(ERROR)
+            .errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED)
+            .errmsg(format!("file name too long for tar format: \"{filename}\""))
+            .finish(loc("_tarWriteHeader")),
+        TarError::SymlinkTooLong => ereport(ERROR)
+            .errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED)
+            .errmsg(format!(
+                "symbolic link target too long for tar format: file name \"{}\", target \"{}\"",
+                filename,
+                linktarget.unwrap_or("")
+            ))
+            .finish(loc("_tarWriteHeader")),
+        TarError::Ok => Ok(()),
+    }
+}
+
+fn _tarWritePadding(sink: &mut Bbsink<'_>, state: &mut BbsinkState, len: usize) -> PgResult<()> {
+    let pad = tar_padding_bytes_required(len);
+    if pad > 0 {
+        zero_buffer(sink, pad);
+        bbsink_archive_contents(sink, state, pad)?;
+    }
+    Ok(())
+}
+
+fn tar_padding_bytes_required(len: usize) -> usize {
+    (len + (TAR_BLOCK_SIZE - 1)) / TAR_BLOCK_SIZE * TAR_BLOCK_SIZE - len
+}
+
+fn convert_link_to_directory(statbuf: &mut LstatInfo) {
+    if S_ISLNK(statbuf.mode) {
+        statbuf.mode = S_IFDIR | pg_dir_create_mode();
+    }
+}
+
+fn checksum_init(type_: PgChecksumType, _filename: &str) -> PgResult<PgChecksumContext> {
+    Ok(PgChecksumContext::init(type_))
+}
+
+fn checksum_update(ctx: &mut PgChecksumContext, data: &[u8]) -> PgResult<()> {
+    ctx.update(data);
+    Ok(())
+}
+
+// pg_checksum_parse_type (checksum_helper.c) — case-insensitive algorithm name.
+fn parse_checksum_type(name: &[u8]) -> Option<PgChecksumType> {
+    match name.to_ascii_uppercase().as_slice() {
+        b"NONE" => Some(PgChecksumType::None),
+        b"CRC32C" => Some(PgChecksumType::Crc32c),
+        b"SHA224" => Some(PgChecksumType::Sha224),
+        b"SHA256" => Some(PgChecksumType::Sha256),
+        b"SHA384" => Some(PgChecksumType::Sha384),
+        b"SHA512" => Some(PgChecksumType::Sha512),
+        _ => None,
+    }
+}
+
+fn strncmp(a: &str, b: &str, n: usize) -> i32 {
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    for i in 0..n {
+        let (ca, cb) = (ab.get(i).copied(), bb.get(i).copied());
+        match (ca, cb) {
+            (Some(x), Some(y)) if x == y => {
+                if x == 0 {
+                    return 0;
+                }
+            }
+            (x, y) => return x.unwrap_or(0) as i32 - y.unwrap_or(0) as i32,
+        }
+    }
+    0
+}
+
+// File-permission globals for injected files (backup_label, tablespace_map,
+// .done markers) and symlink-to-directory conversions: read fd's file_perm
+// globals — the exact values the server's own file creation uses. (The
+// init_small data_directory_mode copy read stale 0700 in walsender threads;
+// pg_basebackup extracts these members with the TAR HEADER modes, so a stale
+// header broke the group-permission leg of pg_basebackup/010 subtest 83.)
+fn pg_file_create_mode() -> u32 {
+    fd::vfd::pg_file_create_mode()
+}
+fn pg_dir_create_mode() -> u32 {
+    fd::vfd::pg_dir_create_mode()
+}
+#[cfg(not(target_family = "wasm"))]
+fn geteuid() -> u32 {
+    // SAFETY: geteuid never fails.
+    unsafe { libc::geteuid() }
+}
+#[cfg(not(target_family = "wasm"))]
+fn getegid() -> u32 {
+    // SAFETY: getegid never fails.
+    unsafe { libc::getegid() }
+}
+// wasm32: WASI has no uids/gids; 0 is the tar-header owner word C would
+// emit on a credential-less platform (base backups are postmaster-only —
+// unreachable from --single).
+#[cfg(target_family = "wasm")]
+fn geteuid() -> u32 {
+    0
+}
+#[cfg(target_family = "wasm")]
+fn getegid() -> u32 {
+    0
+}
+fn time_now() -> i64 {
+    // SAFETY: time(NULL) returns the current unix time.
+    pg_clock::wall_secs()
+}
+
+// ===========================================================================
+// init_seams — install the inward BASE_BACKUP seam walsender dispatches to.
+// ===========================================================================
+
+pub fn init_seams() {
+    walsender_seams::base_backup::set(send_base_backup_entry);
+    // manifest needs C's GetSystemIdentifier; backup_copy needs a flush + the
+    // DestRemoteSimple result-set router (SendXlogRecPtrResult/SendTablespaceList).
+    manifest::seams::get_system_identifier::set(|| transam_xlog::GetSystemIdentifier());
+    backup_copy_seams::pq_flush_if_writable::set(|| pqcomm_seams::pq_flush::call());
+    bcs_bridge::install();
+}
+
+// Bridge backup_copy's no_std DestRemoteSimple router seams to the real
+// exectuples_output result-set path. backup_copy pushes logical rows through the
+// opaque-handle seams; we buffer them and materialize + send in end_tup_output.
+// Wire output is byte-identical (RowDescription + DataRows + CommandComplete, in
+// order) — deferral within the same command is invisible on the wire.
+mod bcs_bridge {
+    use core::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    use backup_copy_seams::{
+        DestReceiverHandle, ResultColumn, ResultColumnType, ResultValue, TupOutputState,
+    };
+    use datum::Datum;
+    use mcx::{Mcx, MemoryContext};
+    use types_core::{Oid, INT8OID, OIDOID, TEXTOID};
+    use types_error::PgResult;
+
+    struct Buffered {
+        columns: Vec<ResultColumn>,
+        rows: Vec<Vec<Option<ResultValue>>>,
+    }
+
+    thread_local! {
+        static BACKUP_MCX: Cell<usize> = const { Cell::new(0) };
+        static NEXT_ID: Cell<u64> = const { Cell::new(1) };
+        static REGISTRY: RefCell<HashMap<u64, Buffered>> = RefCell::new(HashMap::new());
+    }
+
+    pub fn set_backup_mcx(mcx: Mcx<'_>) {
+        BACKUP_MCX.with(|c| c.set(mcx.context() as *const MemoryContext as usize));
+    }
+    pub fn clear_backup_mcx() {
+        BACKUP_MCX.with(|c| c.set(0));
+    }
+
+    fn col_oid(t: ResultColumnType) -> Oid {
+        match t {
+            ResultColumnType::Text => TEXTOID,
+            ResultColumnType::Int8 => INT8OID,
+            ResultColumnType::Oid => OIDOID,
+        }
+    }
+
+    fn create() -> DestReceiverHandle {
+        let id = NEXT_ID.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        });
+        REGISTRY.with(|r| {
+            r.borrow_mut()
+                .insert(id, Buffered { columns: Vec::new(), rows: Vec::new() });
+        });
+        DestReceiverHandle(id)
+    }
+
+    fn begin(dest: DestReceiverHandle, columns: Vec<ResultColumn>) -> TupOutputState {
+        REGISTRY.with(|r| {
+            r.borrow_mut().get_mut(&dest.0).expect("bcs_bridge dest").columns = columns;
+        });
+        TupOutputState { dest }
+    }
+
+    fn do_out(tstate: TupOutputState, values: Vec<Option<ResultValue>>) {
+        REGISTRY.with(|r| {
+            r.borrow_mut()
+                .get_mut(&tstate.dest.0)
+                .expect("bcs_bridge dest")
+                .rows
+                .push(values);
+        });
+    }
+
+    fn end(tstate: TupOutputState) {
+        let buf = REGISTRY
+            .with(|r| r.borrow_mut().remove(&tstate.dest.0))
+            .expect("bcs_bridge dest");
+        let p = BACKUP_MCX.with(|c| c.get());
+        assert!(p != 0, "bcs_bridge: backup mcx not set");
+        // SAFETY: the pointer is the live command mcx set by SendBaseBackup for
+        // the synchronous duration of the backup, cleared on return.
+        let ctx = unsafe { &*(p as *const MemoryContext) };
+        materialize(ctx.mcx(), &buf).expect("bcs_bridge: result-set send");
+    }
+
+    fn materialize(mcx: Mcx<'_>, buf: &Buffered) -> PgResult<()> {
+        let ncols = buf.columns.len();
+        let mut dest = tcop_dest::CreateDestReceiver(types_dest::CommandDest::RemoteSimple);
+        let mut td = tupdesc::CreateTemplateTupleDesc(mcx, ncols as i32)?;
+        for (i, c) in buf.columns.iter().enumerate() {
+            tupdesc::TupleDescInitBuiltinEntry(&mut td, (i + 1) as i16, &c.name, col_oid(c.typ), -1, 0)?;
+        }
+        let mut tstate = exectuples_output::begin_tup_output_tupdesc(mcx, &mut dest, Rc::new(td))?;
+        for row in &buf.rows {
+            let mut values = vec![Datum::null(); ncols];
+            let mut nulls = vec![false; ncols];
+            for (i, v) in row.iter().enumerate() {
+                match v {
+                    None => nulls[i] = true,
+                    Some(ResultValue::Text(s)) => {
+                        // varlena_result yields the image (header) pointer; as_bytes()
+                        // would point past the header and corrupt the DataRow.
+                        values[i] = fmgr::varlena_result(varlena::cstring_to_text(mcx, s.as_bytes())?);
+                    }
+                    Some(ResultValue::Int8(x)) => values[i] = Datum::from_i64(*x),
+                    Some(ResultValue::Oid(o)) => values[i] = Datum::from_oid(*o),
+                }
+            }
+            exectuples_output::do_tup_output(&mut tstate, mcx, &values, &nulls)?;
+        }
+        exectuples_output::end_tup_output(tstate)
+    }
+
+    pub fn install() {
+        backup_copy_seams::create_dest_remote_simple::set(create);
+        backup_copy_seams::begin_tup_output_tupdesc::set(begin);
+        backup_copy_seams::do_tup_output::set(do_out);
+        backup_copy_seams::end_tup_output::set(end);
+    }
+}
+
+fn send_base_backup_entry(cmd: BaseBackupCmd) -> PgResult<()> {
+    let ctx = mcx::MemoryContext::new("SendBaseBackup");
+    SendBaseBackup(ctx.mcx(), &cmd)
+}
+
+#[cfg(test)]
+mod incremental_gate_tests {
+    use super::*;
+
+    fn incr_opt() -> Vec<ReplOption> {
+        vec![ReplOption { name: "incremental".to_string(), arg: Some(ReplOptionArg::Bool(true)) }]
+    }
+
+    // C basebackup.c line ~792: INCREMENTAL without summarize_wal fails at
+    // option parse with C's exact prerequisite error; with summarize_wal on,
+    // the option parses and the UPLOAD_MANIFEST gate (line ~1015) then lives
+    // in SendBaseBackup against the session-owned store (protocol coverage
+    // in the walsender crate). One test: the GUC backing is process-global,
+    // so the two branches must not run in parallel.
+    #[test]
+    fn incremental_summarize_wal_gate_c_exact() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(guc_tables::init_seams);
+
+        assert!(!guc_tables::vars::summarize_wal.read(), "boot default is off");
+        let err = match parse_basebackup_options(&incr_opt()) {
+            Ok(_) => panic!("expected prerequisite error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.sqlstate(), ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE);
+        assert_eq!(
+            err.message(),
+            "incremental backups cannot be taken unless WAL summarization is enabled"
+        );
+
+        guc_tables::vars::summarize_wal.write(true);
+        let parsed = parse_basebackup_options(&incr_opt());
+        guc_tables::vars::summarize_wal.write(false);
+        assert!(parsed.unwrap().incremental);
+    }
+}
+
+#[cfg(test)]
+mod tar_limit_sqlstate_tests {
+    use super::*;
+
+    #[test]
+    fn tar_name_too_long_is_54000() {
+        let name = "a".repeat(100);
+        let (rc, _) = tar_create_header(&name, None, 0, 0o644, 0, 0, 0);
+        let err = tar_header_limit_error(rc, &name, None).unwrap_err();
+        assert_eq!(err.sqlstate(), ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+        assert_eq!(
+            err.message(),
+            format!("file name too long for tar format: \"{name}\"")
+        );
+    }
+
+    #[test]
+    fn tar_symlink_target_too_long_is_54000() {
+        let target = "b".repeat(100);
+        let (rc, _) = tar_create_header("link", Some(&target), 0, 0o644, 0, 0, 0);
+        let err = tar_header_limit_error(rc, "link", Some(&target)).unwrap_err();
+        assert_eq!(err.sqlstate(), ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+        assert_eq!(
+            err.message(),
+            format!(
+                "symbolic link target too long for tar format: file name \"link\", target \"{target}\""
+            )
+        );
+    }
+
+    #[test]
+    fn readlink_target_too_long_is_54000() {
+        let err = readlink_target_too_long("./pg_tblspc").unwrap_err();
+        assert_eq!(err.sqlstate(), ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+        assert_eq!(err.message(), "symbolic link \"./pg_tblspc\" target is too long");
+    }
+}
+
+// upstream e7564ee8cdcb (18.6): Clear base backup progress on backup failure
+#[cfg(test)]
+mod progress_cleanup_tests {
+    use ::sink::{bbsink_cleanup, Bbsink, BbsinkOps, BbsinkState};
+    use ::types_core::primitive::{Size, TimeLineID, XLogRecPtr};
+    use ::types_error::PgResult;
+
+    /// No-op leaf under the progress sink: `cleanup` is the only callback the
+    /// test drives, and forwarding needs a `next`.
+    struct NullLeaf;
+
+    impl<'mcx> BbsinkOps<'mcx> for NullLeaf {
+        fn begin_backup(&mut self, _: &mut Bbsink<'mcx>, _: &mut BbsinkState) -> PgResult<()> {
+            Ok(())
+        }
+        fn begin_archive(
+            &mut self,
+            _: &mut Bbsink<'mcx>,
+            _: &mut BbsinkState,
+            _: &str,
+        ) -> PgResult<()> {
+            Ok(())
+        }
+        fn archive_contents(
+            &mut self,
+            _: &mut Bbsink<'mcx>,
+            _: &mut BbsinkState,
+            _: Size,
+        ) -> PgResult<()> {
+            Ok(())
+        }
+        fn end_archive(&mut self, _: &mut Bbsink<'mcx>, _: &mut BbsinkState) -> PgResult<()> {
+            Ok(())
+        }
+        fn begin_manifest(&mut self, _: &mut Bbsink<'mcx>, _: &mut BbsinkState) -> PgResult<()> {
+            Ok(())
+        }
+        fn manifest_contents(
+            &mut self,
+            _: &mut Bbsink<'mcx>,
+            _: &mut BbsinkState,
+            _: Size,
+        ) -> PgResult<()> {
+            Ok(())
+        }
+        fn end_manifest(&mut self, _: &mut Bbsink<'mcx>, _: &mut BbsinkState) -> PgResult<()> {
+            Ok(())
+        }
+        fn end_backup(
+            &mut self,
+            _: &mut Bbsink<'mcx>,
+            _: &mut BbsinkState,
+            _: XLogRecPtr,
+            _: TimeLineID,
+        ) -> PgResult<()> {
+            Ok(())
+        }
+        fn cleanup(&mut self, _: &mut Bbsink<'mcx>, _: &mut BbsinkState) -> PgResult<()> {
+            Ok(())
+        }
+    }
+
+    // Binds this thread to a real PgBackendStatus slot so pgstat_progress_*
+    // has a target (bare unit tests have no MyBEEntry and the calls are
+    // no-ops). Same recipe as lmgr's progress_beentry test helper; the guard
+    // serializes binders of the shared slot.
+    fn progress_beentry() -> (
+        &'static backend_status::PgBackendStatus,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            init_small::globals::SetMaxBackends(8);
+            ipc_seams::on_shmem_exit::set(|_, _| {});
+            backend_status::init_seams();
+            backend_progress::init_seams();
+            backend_status::BackendStatusShmemInit().unwrap();
+        });
+        static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        init_small::globals::SetMyProcNumber(3);
+        backend_status::pgstat_beinit().unwrap();
+        backend_status::set_pgstat_track_activities_backing(true);
+        (
+            backend_status::MyBEEntry().expect("pgstat_beinit bound a beentry"),
+            guard,
+        )
+    }
+
+    // C 18.6 basebackup_progress.c bbsink_progress_cleanup: the progress
+    // command started by bbsink_progress_new ends in the sink's cleanup
+    // callback, which SendBaseBackup's PG_FINALLY runs on the error path
+    // too. Pre-fix only the successful tail of perform_base_backup ended it,
+    // so a failed backup left a stale pg_stat_progress_basebackup row.
+    #[test]
+    fn progress_sink_cleanup_ends_command_without_end_backup() {
+        let (be, _slot_guard) = progress_beentry();
+        // SAFETY: own-backend read; no other thread writes this slot while
+        // the SLOT guard is held.
+        let command = || unsafe { be.st_progress_command.get() };
+
+        let ctx = mcx::MemoryContext::new("progress cleanup test");
+        let mcx = ctx.mcx();
+        let leaf = Box::new(Bbsink::new(mcx, Box::new(NullLeaf), None));
+        let mut sink = sink_support::bbsink_progress_new(mcx, leaf, false);
+        assert_eq!(command(), backend_status::PROGRESS_COMMAND_BASEBACKUP);
+
+        // Error path: perform_base_backup failed before end_backup ran;
+        // only bbsink_cleanup follows.
+        let mut state = BbsinkState::default();
+        bbsink_cleanup(&mut sink, &mut state).unwrap();
+        assert_eq!(command(), backend_status::PROGRESS_COMMAND_INVALID);
+    }
+}
+
+// audit-18.6 remediation b086 (backend/backup/basebackup): regression
+// witnesses for the C 18.6 divergences fixed in this lane. Each asserts the
+// C-expected outcome (basebackup.c / define.c cited inline).
+#[cfg(test)]
+mod remediation_b086_tests {
+    use super::*;
+    use ::sink::{BbsinkOps, BbsinkState};
+    use ::types_core::primitive::Size;
+    use std::os::unix::fs::PermissionsExt;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    use std::sync::{Mutex, MutexGuard};
+
+    // Serializes every test here: the recording seams and the cwd are
+    // process-global.
+    static LOCK: Mutex<()> = Mutex::new(());
+    static WAIT_EVENTS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    static CANCEL: AtomicBool = AtomicBool::new(false);
+
+    fn setup() -> MutexGuard<'static, ()> {
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Process-wide init, done once under LOCK (a plain flag rather than
+        // Once: a failure here must not poison every later test).
+        static INITED: AtomicBool = AtomicBool::new(false);
+        if !INITED.load(Relaxed) {
+            // XLOGShmemInit sizes the WAL buffers from the xlog.c-owned
+            // wal_buffers cell; absent here, as in slot's tests.
+            static XLOG_BUFFERS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(64);
+            guc_tables::vars::XLOGbuffers.install_if_absent(guc_tables::GucVarAccessors {
+                get: || XLOG_BUFFERS.load(Relaxed),
+                set: |v| XLOG_BUFFERS.store(v, Relaxed),
+            });
+            if !waitevent_seams::pgstat_report_wait_start::is_installed() {
+                waitevent_seams::pgstat_report_wait_start::set(|info| {
+                    WAIT_EVENTS.lock().unwrap_or_else(|e| e.into_inner()).push(info);
+                });
+            }
+            if !waitevent_seams::pgstat_report_wait_end::is_installed() {
+                waitevent_seams::pgstat_report_wait_end::set(|| {
+                    WAIT_EVENTS.lock().unwrap_or_else(|e| e.into_inner()).push(0);
+                });
+            }
+            // fd.c AllocateDesc stamps the current subtransaction id.
+            if !xact_seams::get_current_sub_transaction_id::is_installed() {
+                xact_seams::get_current_sub_transaction_id::set(|| 1);
+            }
+            if !postgres_seams::check_for_interrupts::is_installed() {
+                postgres_seams::check_for_interrupts::set(|| {
+                    if CANCEL.load(Relaxed) {
+                        return ereport(ERROR)
+                            .errcode(types_error::ERRCODE_QUERY_CANCELED)
+                            .errmsg("canceling statement due to user request")
+                            .finish(loc("ProcessInterrupts"));
+                    }
+                    Ok(())
+                });
+            }
+            // RecoveryInProgress() consults XLogCtl; a bare test has none.
+            transam_xlog::XLOGShmemInit();
+            transam_xlog::ctl::XLogCtl()
+                .SharedRecoveryState
+                .store(transam_xlog::RECOVERY_STATE_DONE, Relaxed);
+            INITED.store(true, Relaxed);
+        }
+        NOVERIFY_CHECKSUMS.with(|c| c.set(true));
+        BACKUP_STARTED_IN_RECOVERY.with(|c| c.set(false));
+        CANCEL.store(false, Relaxed);
+        init_small::globals::SetInterruptPending(false);
+        guard
+    }
+
+    /// Leaf sink that records every archived byte.
+    struct RecordingLeaf(Rc<RefCell<Vec<u8>>>);
+
+    impl<'mcx> BbsinkOps<'mcx> for RecordingLeaf {
+        fn begin_backup(&mut self, _: &mut Bbsink<'mcx>, _: &mut BbsinkState) -> PgResult<()> {
+            Ok(())
+        }
+        fn begin_archive(&mut self, _: &mut Bbsink<'mcx>, _: &mut BbsinkState, _: &str) -> PgResult<()> {
+            Ok(())
+        }
+        fn archive_contents(&mut self, sink: &mut Bbsink<'mcx>, _: &mut BbsinkState, len: Size) -> PgResult<()> {
+            self.0.borrow_mut().extend_from_slice(sink.buffer_slice(len));
+            Ok(())
+        }
+        fn end_archive(&mut self, _: &mut Bbsink<'mcx>, _: &mut BbsinkState) -> PgResult<()> {
+            Ok(())
+        }
+        fn begin_manifest(&mut self, _: &mut Bbsink<'mcx>, _: &mut BbsinkState) -> PgResult<()> {
+            Ok(())
+        }
+        fn manifest_contents(&mut self, _: &mut Bbsink<'mcx>, _: &mut BbsinkState, _: Size) -> PgResult<()> {
+            Ok(())
+        }
+        fn end_manifest(&mut self, _: &mut Bbsink<'mcx>, _: &mut BbsinkState) -> PgResult<()> {
+            Ok(())
+        }
+        fn end_backup(&mut self, _: &mut Bbsink<'mcx>, _: &mut BbsinkState, _: XLogRecPtr, _: TimeLineID) -> PgResult<()> {
+            Ok(())
+        }
+        fn cleanup(&mut self, _: &mut Bbsink<'mcx>, _: &mut BbsinkState) -> PgResult<()> {
+            Ok(())
+        }
+    }
+
+    fn make_sink<'mcx>(mcx: Mcx<'mcx>) -> (Bbsink<'mcx>, Rc<RefCell<Vec<u8>>>) {
+        let rec = Rc::new(RefCell::new(Vec::new()));
+        let mut sink = Bbsink::new(mcx, Box::new(RecordingLeaf(rec.clone())), None);
+        sink.set_buffer(mcx, 4 * types_core::BLCKSZ).unwrap();
+        (sink, rec)
+    }
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "pgrust-b086-{tag}-{}-{}",
+                std::process::id(),
+                pg_clock::mono_ns()
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            // Restore search permission on anything the test locked down.
+            if let Ok(rd) = std::fs::read_dir(&self.0) {
+                for e in rd.flatten() {
+                    let _ = std::fs::set_permissions(e.path(), std::fs::Permissions::from_mode(0o755));
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn send_dir_of(dir: &str) -> (PgResult<i64>, Vec<u8>) {
+        let ctx = mcx::MemoryContext::new("b086 sendDir");
+        let mcx = ctx.mcx();
+        let (mut sink, rec) = make_sink(mcx);
+        let mut state = BbsinkState::default();
+        let mut manifest = BackupManifestInfo::zeroed();
+        let r = sendDir(&mut sink, &mut state, dir, dir.len() as i32, false, true, &mut manifest, None);
+        let bytes = rec.borrow().clone();
+        (r, bytes)
+    }
+
+    /// tar member names in a recorded archive (every recorded entry here is
+    /// a directory, so headers are consecutive 512-byte blocks).
+    fn tar_names(bytes: &[u8]) -> Vec<String> {
+        bytes
+            .chunks(TAR_BLOCK_SIZE)
+            .filter(|b| b[0] != 0)
+            .map(|b| {
+                let end = b[..100].iter().position(|&c| c == 0).unwrap_or(100);
+                String::from_utf8_lossy(&b[..end]).into_owned()
+            })
+            .collect()
+    }
+
+    fn opt(name: &str, arg: Option<ReplOptionArg>) -> ReplOption {
+        ReplOption { name: name.to_string(), arg }
+    }
+
+    // basebackup.c:2113 basebackup_read_file: a failed pread is an
+    // immediate errcode_for_file_access() ERROR carrying %m. EBADF takes
+    // elog.c:936's default arm (ERRCODE_INTERNAL_ERROR); EIO would be
+    // ERRCODE_IO_ERROR by the same table.
+    #[test]
+    fn read_error_reports_errno_with_file_access_sqlstate() {
+        let _g = setup();
+        let ctx = mcx::MemoryContext::new("b086 read");
+        let mcx = ctx.mcx();
+        let (mut sink, _rec) = make_sink(mcx);
+        let state = BbsinkState::default();
+        let mut failures = 0;
+        let err = read_file_data_into_buffer(
+            &mut sink, &state, "./base/1/1259", -1, 0, types_core::BLCKSZ, 0, false, &mut failures,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.message(),
+            format!("could not read file \"./base/1/1259\": {}", elog::errno::strerror(libc::EBADF))
+        );
+        assert_eq!(err.sqlstate(), types_error::ERRCODE_INTERNAL_ERROR);
+    }
+
+    // basebackup.c:2119 basebackup_read_file brackets the pread with
+    // pgstat_report_wait_start(WAIT_EVENT_BASEBACKUP_READ) / _end.
+    #[test]
+    fn file_read_reports_basebackup_read_wait_event() {
+        let _g = setup();
+        let dir = TempDir::new("waitevent");
+        let file = format!("{}/f", dir.path());
+        std::fs::write(&file, vec![7u8; types_core::BLCKSZ]).unwrap();
+        let ctx = mcx::MemoryContext::new("b086 wait");
+        let mcx = ctx.mcx();
+        let (mut sink, _rec) = make_sink(mcx);
+        let state = BbsinkState::default();
+        let fd = fd::OpenTransientFile(&file, libc::O_RDONLY).unwrap();
+        assert!(fd >= 0);
+        WAIT_EVENTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let mut failures = 0;
+        let n = read_file_data_into_buffer(
+            &mut sink, &state, &file, fd, 0, types_core::BLCKSZ, 0, false, &mut failures,
+        )
+        .unwrap();
+        fd::CloseTransientFile(fd);
+        assert_eq!(n as usize, types_core::BLCKSZ);
+        // wait_event_names.txt WaitEventIO: BASEBACKUP_READ is index 3.
+        const WAIT_EVENT_BASEBACKUP_READ: u32 = 0x0A00_0000 + 3;
+        let events = WAIT_EVENTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(events, vec![WAIT_EVENT_BASEBACKUP_READ, 0]);
+    }
+
+    // basebackup.c:1277 sendDir: CHECK_FOR_INTERRUPTS() at the top of every
+    // directory-entry iteration, before any entry is emitted.
+    #[test]
+    fn send_dir_checks_for_interrupts_before_each_entry() {
+        let _g = setup();
+        let dir = TempDir::new("cfi");
+        std::fs::write(format!("{}/f", dir.path()), b"hello").unwrap();
+        CANCEL.store(true, Relaxed);
+        init_small::globals::SetInterruptPending(true);
+        let (r, bytes) = send_dir_of(dir.path());
+        init_small::globals::SetInterruptPending(false);
+        CANCEL.store(false, Relaxed);
+        let err = r.expect_err("pending cancel must abort the directory walk");
+        assert_eq!(err.sqlstate(), types_error::ERRCODE_QUERY_CANCELED);
+        assert!(bytes.is_empty(), "the cancel is checked before the entry is emitted");
+    }
+
+    // basebackup.c:1282: promotion mid-backup carries the errhint.
+    #[test]
+    fn promotion_during_backup_carries_hint() {
+        let _g = setup();
+        let dir = TempDir::new("promote");
+        std::fs::write(format!("{}/f", dir.path()), b"hello").unwrap();
+        BACKUP_STARTED_IN_RECOVERY.with(|c| c.set(true));
+        let (r, _) = send_dir_of(dir.path());
+        BACKUP_STARTED_IN_RECOVERY.with(|c| c.set(false));
+        let err = r.unwrap_err();
+        assert_eq!(err.sqlstate(), ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE);
+        assert_eq!(err.message(), "the standby was promoted during online backup");
+        assert_eq!(
+            err.hint(),
+            Some(
+                "This means that the backup being taken is corrupt and should not be used. \
+                 Try taking another online backup."
+            )
+        );
+    }
+
+    // basebackup.c:1356: lstat failure is "could not stat file or directory
+    // \"%s\": %m" (EACCES -> ERRCODE_INSUFFICIENT_PRIVILEGE).
+    #[test]
+    fn lstat_failure_message_names_file_or_directory_with_errno() {
+        let _g = setup();
+        // SAFETY: plain libc query.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root bypasses directory search permission
+        }
+        let dir = TempDir::new("lstat");
+        let sub = format!("{}/sub", dir.path());
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(format!("{sub}/f"), b"x").unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (r, _) = send_dir_of(dir.path());
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = r.unwrap_err();
+        assert_eq!(err.sqlstate(), types_error::ERRCODE_INSUFFICIENT_PRIVILEGE);
+        assert_eq!(
+            err.message(),
+            format!("could not stat file or directory \"{sub}/f\": {}", elog::errno::strerror(libc::EACCES))
+        );
+    }
+
+    // basebackup.c:1399: the synthesized pg_wal children are written as
+    // "./pg_wal/archive_status" and "./pg_wal/summaries".
+    #[test]
+    fn pg_wal_children_tar_names_are_dot_prefixed() {
+        let _g = setup();
+        let dir = TempDir::new("pgwal");
+        std::fs::create_dir(format!("{}/pg_wal", dir.path())).unwrap();
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let (r, bytes) = send_dir_of(".");
+        std::env::set_current_dir(saved).unwrap();
+        r.unwrap();
+        assert_eq!(
+            tar_names(&bytes),
+            vec!["pg_wal/", "./pg_wal/archive_status/", "./pg_wal/summaries/"]
+        );
+    }
+
+    // basebackup.c:300: the PROGRESS estimate is a sizeonly walk -- it totals
+    // exactly what the real walk emits, without emitting anything.
+    #[test]
+    fn size_only_walk_totals_without_emitting() {
+        let _g = setup();
+        let dir = TempDir::new("sizeonly");
+        std::fs::create_dir(format!("{}/sub", dir.path())).unwrap();
+        std::fs::write(format!("{}/sub/f", dir.path()), vec![1u8; 700]).unwrap();
+        let ctx = mcx::MemoryContext::new("b086 sizeonly");
+        let mcx = ctx.mcx();
+        let (mut sink, rec) = make_sink(mcx);
+        let mut state = BbsinkState::default();
+        let mut manifest = BackupManifestInfo::zeroed();
+        let d = dir.path();
+        let estimate =
+            sendDir(&mut sink, &mut state, d, d.len() as i32, true, true, &mut manifest, None).unwrap();
+        // sub/ header + f header + 700 bytes padded to the next tar block.
+        assert_eq!(estimate, 512 + 512 + 1024);
+        assert!(rec.borrow().is_empty(), "sizeonly must not emit");
+        let real =
+            sendDir(&mut sink, &mut state, d, d.len() as i32, false, true, &mut manifest, None).unwrap();
+        assert_eq!(real, estimate);
+        assert_eq!(rec.borrow().len() as i64, estimate);
+    }
+
+    // basebackup.c:2126: a short read is an error unless partial_read_ok.
+    #[test]
+    fn short_read_is_an_error_unless_partial_read_ok() {
+        let _g = setup();
+        let dir = TempDir::new("shortread");
+        let file = format!("{}/f", dir.path());
+        std::fs::write(&file, vec![9u8; 100]).unwrap();
+        let fd = fd::OpenTransientFile(&file, libc::O_RDONLY).unwrap();
+        let mut buf = vec![0u8; types_core::BLCKSZ];
+        assert_eq!(basebackup_read_file(fd, &mut buf, 0, &file, true).unwrap(), 100);
+        let err = basebackup_read_file(fd, &mut buf, 0, &file, false).unwrap_err();
+        assert_eq!(
+            err.message(),
+            format!("could not read file \"{file}\": read 100 of {}", types_core::BLCKSZ)
+        );
+        // EOF is never an error, even when a full read was requested.
+        assert_eq!(basebackup_read_file(fd, &mut buf, 100, &file, false).unwrap(), 0);
+        fd::CloseTransientFile(fd);
+    }
+
+    // define.c defGetString/defGetBoolean/defGetInt64 as parse_basebackup_options
+    // (basebackup.c:734) consumes them: an integer LABEL is accepted as its
+    // decimal text; the "requires a ..." messages are C's; defGetBoolean takes
+    // only 0/1/true/false/on/off; defGetInt64 rejects strings.
+    #[test]
+    fn option_values_and_messages_are_define_c_exact() {
+        let _g = setup();
+        let o = parse_basebackup_options(&[opt("label", Some(ReplOptionArg::Int(12345)))]).unwrap();
+        assert_eq!(o.label, "12345");
+
+        let msg = |opts: &[ReplOption]| {
+            let e = match parse_basebackup_options(opts) {
+                Err(e) => e,
+                Ok(_) => panic!("{opts:?}: expected a syntax error"),
+            };
+            assert_eq!(e.sqlstate(), ERRCODE_SYNTAX_ERROR);
+            e.message().to_string()
+        };
+        assert_eq!(msg(&[opt("label", None)]), "label requires a parameter");
+        assert_eq!(msg(&[opt("checkpoint", None)]), "checkpoint requires a parameter");
+        assert_eq!(
+            msg(&[opt("checkpoint", Some(ReplOptionArg::Int(7)))]),
+            "unrecognized checkpoint type: \"7\""
+        );
+        assert_eq!(
+            msg(&[opt("wal", Some(ReplOptionArg::Str("bad".into())))]),
+            "wal requires a Boolean value"
+        );
+        assert_eq!(
+            msg(&[opt("wal", Some(ReplOptionArg::Str("yes".into())))]),
+            "wal requires a Boolean value"
+        );
+        assert_eq!(
+            msg(&[opt("wal", Some(ReplOptionArg::Int(2)))]),
+            "wal requires a Boolean value"
+        );
+        assert_eq!(
+            msg(&[opt("progress", Some(ReplOptionArg::Int(5)))]),
+            "progress requires a Boolean value"
+        );
+        assert_eq!(msg(&[opt("max_rate", None)]), "max_rate requires a numeric value");
+        assert_eq!(
+            msg(&[opt("max_rate", Some(ReplOptionArg::Str("100".into())))]),
+            "max_rate requires a numeric value"
+        );
+        for (name, arg, want) in [
+            ("wal", ReplOptionArg::Int(1), true),
+            ("wal", ReplOptionArg::Int(0), false),
+            ("wal", ReplOptionArg::Str("ON".into()), true),
+            ("wal", ReplOptionArg::Str("off".into()), false),
+            ("wal", ReplOptionArg::Str("true".into()), true),
+            ("wal", ReplOptionArg::Str("False".into()), false),
+        ] {
+            let o = parse_basebackup_options(&[opt(name, Some(arg))]).unwrap();
+            assert_eq!(o.includewal, want);
+        }
+    }
+}

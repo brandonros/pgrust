@@ -1,0 +1,581 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use mcx::{Mcx, MemoryContext};
+use parser_small1::make_parsestate;
+use syscache_seams::{PgOperatorShape, PgProcShape};
+use types_core::catalog::{INT4OID, TEXTOID, UNKNOWNOID};
+use types_core::InvalidOid;
+use types_error::{
+    ERRCODE_FEATURE_NOT_SUPPORTED, ERRCODE_SYNTAX_ERROR, ERRCODE_UNDEFINED_FUNCTION,
+    ERRCODE_UNDEFINED_SCHEMA,
+};
+use types_nodes::{Node, NodeList, String as PgStr};
+
+use crate::{compatible_oper_opid, left_oper, make_op, oper, LookupOperName};
+
+const INT4_PLUS_OP: types_core::Oid = 551;
+const INT4PL_PROC: types_core::Oid = 177;
+const PG_CATALOG: types_core::Oid = 11;
+const INT4_LT: types_core::Oid = 97;
+const INT4_EQ: types_core::Oid = 96;
+const INT4_GT: types_core::Oid = 521;
+const INT4_BTREE_OPCLASS: types_core::Oid = 1978;
+const INT4_HASH_OPCLASS: types_core::Oid = 1979;
+const INT_BTREE_FAM: types_core::Oid = 1976;
+const INT_HASH_FAM: types_core::Oid = 1977;
+const NOSORT_OID: types_core::Oid = 9999;
+const INTERNALOID: types_core::Oid = 2281;
+const INTERNAL_ARG_OP: types_core::Oid = 7101;
+const INTERNAL_ARG_PROC: types_core::Oid = 7102;
+const INTERNAL_RET_OP: types_core::Oid = 7103;
+const INTERNAL_RET_PROC: types_core::Oid = 7104;
+
+static CANDIDATE_PROBES: AtomicUsize = AtomicUsize::new(0);
+
+fn install_fixture() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        miscinit_seams::get_user_id::set(|| 10);
+        // The rig models a live session over pg_catalog-band builtins:
+        // always visible, so error strings stay unqualified (C TypeIsVisible).
+        namespace_seams::type_is_visible::set(|_| Ok(true));
+        pg_inherits_seams::type_inherits_from::set(|_, _| Ok(false));
+        // No schema exists in the rig: every explicit OPERATOR(schema.op)
+        // lookup fails with 3F000 (the make_oper_cache_key errposition arm).
+        syscache_seams::lookup_pg_namespace_oid_by_name::set(|_| Ok(InvalidOid));
+        syscache_seams::lookup_pg_operator_candidates::set(|mcx, name, l, r| {
+            if name == "@@" {
+                CANDIDATE_PROBES.fetch_add(1, Ordering::Relaxed);
+            }
+            let mut v = mcx::vec_with_capacity_in(mcx, 1)?;
+            if (name == "+" || name == "@@") && l == INT4OID && r == INT4OID {
+                v.push((INT4_PLUS_OP, PG_CATALOG));
+            }
+            if name == "@@i" && l == INTERNALOID && r == INT4OID {
+                v.push((INTERNAL_ARG_OP, PG_CATALOG));
+            }
+            if name == "@@r" && l == INT4OID && r == INT4OID {
+                v.push((INTERNAL_RET_OP, PG_CATALOG));
+            }
+            Ok(v)
+        });
+        syscache_seams::lookup_pg_operator_shape::set(|opno| {
+            Ok(match opno {
+                INT4_PLUS_OP => Some(op_shape(INT4OID, INT4OID, INT4OID, INT4PL_PROC)),
+                INTERNAL_ARG_OP => Some(op_shape(INTERNALOID, INT4OID, INT4OID, INTERNAL_ARG_PROC)),
+                INTERNAL_RET_OP => Some(op_shape(INT4OID, INT4OID, INTERNALOID, INTERNAL_RET_PROC)),
+                _ => None,
+            })
+        });
+        syscache_seams::pg_operator_name_candidates_exist::set(|name, oprkind| {
+            Ok(name == "+" && oprkind == b'b' as i8)
+        });
+        syscache_seams::lookup_pg_operator_name_candidates::set(|mcx, name| {
+            let mut v = mcx::vec_with_capacity_in(mcx, 1)?;
+            if name == "+" || name == "@@" {
+                v.push(syscache_seams::PgOperatorNameCandidate {
+                    oid: INT4_PLUS_OP,
+                    oprnamespace: PG_CATALOG,
+                    oprkind: b'b' as i8,
+                    oprleft: INT4OID,
+                    oprright: INT4OID,
+                });
+            }
+            Ok(v)
+        });
+        syscache_seams::lookup_pg_cast_shape::set(|_, _| Ok(None));
+        syscache_seams::pg_type_typrelid::set(|_| Ok(Some(InvalidOid)));
+        syscache_seams::pg_type_element_shape::set(|_| {
+            Ok(Some(syscache_seams::PgTypeElementShape {
+                typelem: InvalidOid,
+                typsubscript: InvalidOid,
+            }))
+        });
+        syscache_seams::lookup_pg_proc_shape::set(|funcid| {
+            Ok(match funcid {
+                INT4PL_PROC | INTERNAL_ARG_PROC => Some(binary_proc_shape(INT4OID)),
+                INTERNAL_RET_PROC => Some(binary_proc_shape(INTERNALOID)),
+                _ => None,
+            })
+        });
+        syscache_seams::pg_type_base_shape::set(|_| {
+            Ok(Some(syscache_seams::PgTypeBaseShape {
+                typtype: b'b' as i8,
+                typbasetype: InvalidOid,
+                typtypmod: -1,
+                typelem: InvalidOid,
+                typsubscript: InvalidOid,
+            }))
+        });
+        syscache_seams::lookup_pg_opclass_shape::set(|opclass| {
+            Ok(match opclass {
+                INT4_BTREE_OPCLASS => Some(syscache_seams::PgOpclassShape {
+                    opcmethod: types_core::BTREE_AM_OID,
+                    opcfamily: INT_BTREE_FAM,
+                    opcintype: INT4OID,
+                    opckeytype: 0,
+                }),
+                INT4_HASH_OPCLASS => Some(syscache_seams::PgOpclassShape {
+                    opcmethod: lsyscache::HASH_AM_OID,
+                    opcfamily: INT_HASH_FAM,
+                    opcintype: INT4OID,
+                    opckeytype: 0,
+                }),
+                _ => None,
+            })
+        });
+        syscache_seams::lookup_pg_amop_by_strategy::set(|opfamily, _l, _r, strategy| {
+            Ok(match (opfamily, strategy) {
+                (INT_BTREE_FAM, 1) => INT4_LT,
+                (INT_BTREE_FAM, 3) => INT4_EQ,
+                (INT_BTREE_FAM, 5) => INT4_GT,
+                (INT_HASH_FAM, 1) => INT4_EQ,
+                _ => InvalidOid,
+            })
+        });
+        syscache_seams::lookup_pg_amproc::set(|opfamily, _l, _r, procnum| {
+            Ok(match (opfamily, procnum) {
+                (INT_BTREE_FAM, 1) => 351,
+                (INT_HASH_FAM, 1) => 450,
+                (INT_HASH_FAM, 2) => 425,
+                _ => InvalidOid,
+            })
+        });
+        syscache_seams::syscache_hash_value_typeoid::set(|typid| Ok(typid.wrapping_mul(31)));
+        indexcmds_seams::get_default_opclass::set(|type_id, am_id| {
+            Ok(match (type_id, am_id) {
+                (INT4OID, types_core::BTREE_AM_OID) => INT4_BTREE_OPCLASS,
+                (INT4OID, _) => INT4_HASH_OPCLASS,
+                _ => InvalidOid,
+            })
+        });
+        syscache_seams::lookup_pg_type_typcache_shape::set(|typid| {
+            let name = match typid {
+                INT4OID => "int4",
+                TEXTOID => "text",
+                NOSORT_OID => "nosort",
+                _ => return Ok(None),
+            };
+            let mut typname = types_tuple::NameData::default();
+            typname.namestrcpy(name);
+            Ok(Some(syscache_seams::PgTypeTypcacheShape {
+                typname,
+                typlen: 4,
+                typbyval: true,
+                typalign: b'i' as i8,
+                typstorage: b'p' as i8,
+                typtype: b'b' as i8,
+                typisdefined: true,
+                typrelid: InvalidOid,
+                typsubscript: InvalidOid,
+                typelem: InvalidOid,
+                typarray: InvalidOid,
+                typcollation: InvalidOid,
+            }))
+        });
+    });
+}
+
+fn op_shape(
+    oprleft: types_core::Oid,
+    oprright: types_core::Oid,
+    oprresult: types_core::Oid,
+    oprcode: types_core::Oid,
+) -> PgOperatorShape {
+    PgOperatorShape {
+        oprnamespace: 11,
+        oprleft,
+        oprright,
+        oprresult,
+        oprcom: INT4_PLUS_OP,
+        oprnegate: InvalidOid,
+        oprcode,
+        oprrest: InvalidOid,
+        oprjoin: InvalidOid,
+        oprcanmerge: false,
+        oprcanhash: false,
+    }
+}
+
+fn binary_proc_shape(prorettype: types_core::Oid) -> PgProcShape {
+    PgProcShape {
+        prolang: 12,
+        prosecdef: false,
+        proconfig_isnull: true,
+        pronamespace: PG_CATALOG,
+        prorettype,
+        provariadic: InvalidOid,
+        prosupport: InvalidOid,
+        pronargs: 2,
+        prokind: b'f' as i8,
+        provolatile: b'i' as i8,
+        proparallel: b's' as i8,
+        proretset: false,
+        proisstrict: true,
+        proleakproof: false,
+    }
+}
+
+fn op_name<'mcx>(mcx: Mcx<'mcx>, name: &'static str) -> NodeList<'mcx> {
+    NodeList::make1(mcx, Node::mk(mcx, PgStr { sval: name }).unwrap()).unwrap()
+}
+
+fn plus_name<'mcx>(mcx: Mcx<'mcx>) -> NodeList<'mcx> {
+    NodeList::make1(mcx, Node::mk(mcx, PgStr { sval: "+" }).unwrap()).unwrap()
+}
+
+fn int4_const<'mcx>(mcx: Mcx<'mcx>, v: i32) -> Node<'mcx> {
+    Node::mk_const(mcx, INT4OID, -1, InvalidOid, 4, datum::Datum::from_i32(v), false, true)
+        .unwrap()
+}
+
+#[test]
+fn exact_match_and_memo_hit() {
+    install_fixture();
+    let ctx = MemoryContext::new("t");
+    let mcx = ctx.mcx();
+    let pstate = make_parsestate(mcx, None);
+    // Dedicated name: CANDIDATE_PROBES counts only "@@" (tests share the
+    // process-global seams, so "+" probes race across test threads).
+    let name = NodeList::make1(mcx, Node::mk(mcx, PgStr { sval: "@@" }).unwrap()).unwrap();
+
+    let op = oper(&pstate, &name, INT4OID, INT4OID, false, -1).unwrap().unwrap();
+    assert_eq!(op.oid, INT4_PLUS_OP);
+    assert_eq!(
+        (op.shape.oprleft, op.shape.oprright, op.shape.oprresult),
+        (INT4OID, INT4OID, INT4OID)
+    );
+    assert_eq!(op.shape.oprcode, INT4PL_PROC);
+
+    let before = CANDIDATE_PROBES.load(Ordering::Relaxed);
+    let op2 = oper(&pstate, &name, INT4OID, INT4OID, false, -1).unwrap().unwrap();
+    assert_eq!(op2.oid, INT4_PLUS_OP);
+    assert_eq!(CANDIDATE_PROBES.load(Ordering::Relaxed), before, "memo hit must skip catalog");
+
+    inval::invalidate::CallSyscacheCallbacks(cache_syscache::cacheinfo::OPERNAMENSP, 0).unwrap();
+    let op3 = oper(&pstate, &name, INT4OID, INT4OID, false, -1).unwrap().unwrap();
+    assert_eq!(op3.oid, INT4_PLUS_OP);
+    assert_eq!(
+        CANDIDATE_PROBES.load(Ordering::Relaxed),
+        before + 1,
+        "invalidation must flush the memo"
+    );
+}
+
+#[test]
+fn unknown_operand_resolves_via_other_side() {
+    install_fixture();
+    let ctx = MemoryContext::new("t");
+    let mcx = ctx.mcx();
+    let pstate = make_parsestate(mcx, None);
+    let name = plus_name(mcx);
+
+    let op = oper(&pstate, &name, UNKNOWNOID, INT4OID, false, -1).unwrap().unwrap();
+    assert_eq!(op.oid, INT4_PLUS_OP);
+}
+
+#[test]
+fn undefined_operator_is_42883() {
+    install_fixture();
+    let ctx = MemoryContext::new("t");
+    let mcx = ctx.mcx();
+    let pstate = make_parsestate(mcx, None);
+    let name = NodeList::make1(mcx, Node::mk(mcx, PgStr { sval: "<%>" }).unwrap()).unwrap();
+
+    let err = oper(&pstate, &name, INT4OID, INT4OID, false, 7).map(|_| ()).unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_UNDEFINED_FUNCTION);
+
+    assert!(oper(&pstate, &name, INT4OID, INT4OID, true, 7).unwrap().is_none());
+
+    // C parse_oper.c op_error via format_type_be: exact message + hint.
+    let err = oper(&pstate, &name, INT4OID, TEXTOID, false, 7).map(|_| ()).unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_UNDEFINED_FUNCTION);
+    assert_eq!(err.message(), "operator does not exist: integer <%> text");
+    assert_eq!(
+        err.hint(),
+        Some(
+            "No operator matches the given name and argument types. \
+             You might need to add explicit type casts."
+        )
+    );
+}
+
+#[test]
+fn inexact_without_coercible_candidate_is_42883() {
+    install_fixture();
+    let ctx = MemoryContext::new("t");
+    let mcx = ctx.mcx();
+    let pstate = make_parsestate(mcx, None);
+    let name = plus_name(mcx);
+    // int4+int4 is the only "+" candidate and text has no cast to int4 in
+    // this fixture, so func_match_argtypes eliminates it (C op_error arm).
+    let err = oper(&pstate, &name, INT4OID, TEXTOID, false, -1).map(|_| ()).unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_UNDEFINED_FUNCTION);
+    assert_eq!(err.message(), "operator does not exist: integer + text");
+}
+
+#[test]
+fn make_op_builds_op_expr() {
+    install_fixture();
+    let ctx = MemoryContext::new("t");
+    let mcx = ctx.mcx();
+    let mut pstate = make_parsestate(mcx, None);
+    let name = plus_name(mcx);
+
+    let out = make_op(
+        mcx,
+        &mut pstate,
+        &name,
+        Some(int4_const(mcx, 1)),
+        Some(int4_const(mcx, 1)),
+        INT4OID,
+        INT4OID,
+        None,
+        9,
+    )
+    .unwrap();
+
+    let op = out.as_op_expr().unwrap();
+    assert_eq!(op.opno, INT4_PLUS_OP);
+    assert_eq!(op.opfuncid, INT4PL_PROC);
+    assert_eq!(op.opresulttype, INT4OID);
+    assert!(!op.opretset);
+    assert_eq!((op.opcollid, op.inputcollid), (InvalidOid, InvalidOid));
+    assert_eq!(op.args.len(), 2);
+    assert_eq!(op.location, 9);
+}
+
+#[test]
+fn postfix_operator_is_syntax_error() {
+    install_fixture();
+    let ctx = MemoryContext::new("t");
+    let mcx = ctx.mcx();
+    let mut pstate = make_parsestate(mcx, None);
+    let name = plus_name(mcx);
+
+    let err = make_op(
+        mcx,
+        &mut pstate,
+        &name,
+        Some(int4_const(mcx, 1)),
+        None,
+        INT4OID,
+        InvalidOid,
+        None,
+        9,
+    )
+    .map(|_| ())
+    .unwrap_err();
+    assert_eq!(err.sqlstate(), types_error::ERRCODE_SYNTAX_ERROR);
+}
+
+#[test]
+fn sort_group_operators_int4() {
+    install_fixture();
+    let ops = crate::get_sort_group_operators(INT4OID, true, true, true, true).unwrap();
+    assert_eq!(
+        (ops.lt_opr, ops.eq_opr, ops.gt_opr, ops.hashable),
+        (INT4_LT, INT4_EQ, INT4_GT, true)
+    );
+}
+
+#[test]
+fn sort_group_operators_missing_is_42883() {
+    install_fixture();
+    let err =
+        crate::get_sort_group_operators(NOSORT_OID, true, true, false, true).unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_UNDEFINED_FUNCTION);
+    assert_eq!(err.message(), "could not identify an ordering operator for type nosort");
+    assert_eq!(err.hint(), Some("Use an explicit ordering operator or modify the query."));
+
+    let err =
+        crate::get_sort_group_operators(NOSORT_OID, false, true, false, true).unwrap_err();
+    assert_eq!(err.message(), "could not identify an equality operator for type nosort");
+    assert_eq!(err.hint(), None);
+}
+
+#[test]
+fn compatible_oper_opid_exact_and_missing() {
+    install_fixture();
+    let ctx = MemoryContext::new("t");
+    let mcx = ctx.mcx();
+    let pstate = make_parsestate(mcx, None);
+
+    let opid =
+        compatible_oper_opid(&pstate, &plus_name(mcx), INT4OID, INT4OID, false).unwrap();
+    assert_eq!(opid, INT4_PLUS_OP);
+
+    let missing = NodeList::make1(mcx, Node::mk(mcx, PgStr { sval: "<%>" }).unwrap()).unwrap();
+    assert_eq!(
+        compatible_oper_opid(&pstate, &missing, INT4OID, INT4OID, true).unwrap(),
+        InvalidOid
+    );
+}
+
+// upstream 54649de65f08 (18.6): operator syntax cannot call functions that take or return internal.
+#[test]
+fn operator_accepting_internal_is_0a000() {
+    install_fixture();
+    let ctx = MemoryContext::new("t");
+    let mcx = ctx.mcx();
+    let mut pstate = make_parsestate(mcx, None);
+    let name = op_name(mcx, "@@i");
+
+    let err = make_op(
+        mcx,
+        &mut pstate,
+        &name,
+        Some(int4_const(mcx, 1)),
+        Some(int4_const(mcx, 1)),
+        INTERNALOID,
+        INT4OID,
+        None,
+        9,
+    )
+    .unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_FEATURE_NOT_SUPPORTED);
+    assert_eq!(err.message(), "functions accepting type \"internal\" cannot be called explicitly");
+}
+
+#[test]
+fn operator_returning_internal_is_0a000() {
+    install_fixture();
+    let ctx = MemoryContext::new("t");
+    let mcx = ctx.mcx();
+    let mut pstate = make_parsestate(mcx, None);
+    let name = op_name(mcx, "@@r");
+
+    let err = make_op(
+        mcx,
+        &mut pstate,
+        &name,
+        Some(int4_const(mcx, 1)),
+        Some(int4_const(mcx, 1)),
+        INT4OID,
+        INT4OID,
+        None,
+        9,
+    )
+    .unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_FEATURE_NOT_SUPPORTED);
+    assert_eq!(err.message(), "functions returning type \"internal\" cannot be called explicitly");
+}
+
+fn str_node<'mcx>(mcx: Mcx<'mcx>, s: &'static str) -> Node<'mcx> {
+    Node::mk(mcx, PgStr { sval: s }).unwrap()
+}
+
+// parse_oper.c:981-983 (audit-18.6 b221): make_oper_cache_key arms the
+// parser errposition callback around LookupExplicitNamespace, so a missing
+// (or USAGE-denied) explicit schema reports the OPERATOR() cursor.
+#[test]
+fn explicit_schema_lookup_error_carries_operator_cursor() {
+    install_fixture();
+    let ctx = MemoryContext::new("t");
+    let mcx = ctx.mcx();
+    let mut pstate = make_parsestate(mcx, None);
+    pstate.p_sourcetext = Some("SELECT 1 OPERATOR(b221_nosuch.+) 2".as_bytes());
+    let name = NodeList::make2(mcx, str_node(mcx, "b221_nosuch"), str_node(mcx, "+")).unwrap();
+
+    // OPERATOR token at byte offset 9: cursor 10 (1-based).
+    let err = oper(&pstate, &name, INT4OID, INT4OID, false, 9).map(|_| ()).unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_UNDEFINED_SCHEMA);
+    assert_eq!(err.message(), "schema \"b221_nosuch\" does not exist");
+    assert_eq!(err.cursor_position(), Some(10));
+
+    // left_oper (prefix form) shares the same cache-key arm.
+    let err = left_oper(&pstate, &name, INT4OID, false, 9).map(|_| ()).unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_UNDEFINED_SCHEMA);
+    assert_eq!(err.cursor_position(), Some(10));
+
+    // location -1 (compatible_oper_opid callers): C's parser_errposition
+    // leaves the cursor alone.
+    let err = oper(&pstate, &name, INT4OID, INT4OID, false, -1).map(|_| ()).unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_UNDEFINED_SCHEMA);
+    assert_eq!(err.cursor_position(), None);
+}
+
+// parse_oper.c:966 -> namespace.c DeconstructQualifiedName (audit-18.6
+// b221): the whole operator name list is deconstructed, so "too many dotted
+// names" lists every element, expression and DDL forms alike, with no
+// cursor (C raises it before arming the errposition callback).
+#[test]
+fn too_many_dotted_names_reports_every_element() {
+    install_fixture();
+    let ctx = MemoryContext::new("t");
+    let mcx = ctx.mcx();
+    let mut pstate = make_parsestate(mcx, None);
+    pstate.p_sourcetext = Some("SELECT 1 OPERATOR(a.b.c.d.e.+) 2".as_bytes());
+    let mut name =
+        NodeList::make3(mcx, str_node(mcx, "a"), str_node(mcx, "b"), str_node(mcx, "c")).unwrap();
+    name.lappend(mcx, str_node(mcx, "d")).unwrap();
+    name.lappend(mcx, str_node(mcx, "e")).unwrap();
+    name.lappend(mcx, str_node(mcx, "+")).unwrap();
+    const MSG: &str = "improper qualified name (too many dotted names): a.b.c.d.e.+";
+
+    let err = oper(&pstate, &name, INT4OID, INT4OID, false, 9).map(|_| ()).unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_SYNTAX_ERROR);
+    assert_eq!(err.message(), MSG);
+    assert_eq!(err.cursor_position(), None);
+
+    let err = left_oper(&pstate, &name, INT4OID, false, 9).map(|_| ()).unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_SYNTAX_ERROR);
+    assert_eq!(err.message(), MSG);
+
+    // DDL lookup (DROP/ALTER OPERATOR): LookupOperName -> OpernameGetOprid.
+    let err = LookupOperName(&name, INT4OID, INT4OID, false).map(|_| ()).unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_SYNTAX_ERROR);
+    assert_eq!(err.message(), MSG);
+}
+
+#[test]
+fn session_operator_cache_teardown_preserves_live_datum() {
+    install_fixture();
+    crate::with_opr_cache(|map| {
+        let value = mcx::alloc_leak_in(*map.allocator(), [7u8; 16384]).unwrap();
+        assert!(std::panic::catch_unwind(crate::clear_opr_cache).is_err());
+        assert_eq!(value[16383], 7);
+    }).unwrap();
+    crate::clear_opr_cache();
+    crate::OPR_CACHE.with(|cell| assert!(cell.borrow().is_none()));
+    crate::with_opr_cache(|map| assert!(map.is_empty())).unwrap();
+    crate::clear_opr_cache();
+}
+
+#[test]
+fn session_operator_cache_invalidation_and_passivation() {
+    install_fixture();
+    let key = crate::OprCacheKey {
+        oprname: [b'+'; 64], left_arg: INT4OID, right_arg: INT4OID,
+        search_path: [PG_CATALOG; 16],
+    };
+    crate::with_opr_cache(|map| map.insert(key, INT4_PLUS_OP)).unwrap();
+    crate::InvalidateOprCacheCallBack(datum::Datum::null(), 0, 0);
+    crate::with_opr_cache(|map| assert!(!map.contains_key(&key))).unwrap();
+    crate::with_opr_cache(|map| map.insert(key, INT4_PLUS_OP)).unwrap();
+    crate::PassivateOprCache();
+    crate::with_opr_cache(|map| assert!(!map.contains_key(&key))).unwrap();
+    crate::clear_opr_cache();
+}
+
+#[test]
+#[ignore = "process-global accounting; run alone with --test-threads=1"]
+fn session_operator_cache_reclaims_complete_context() {
+    crate::clear_opr_cache();
+    let before = mcx::global_footprint::bytes();
+    for _ in 0..64 {
+        let owner = mcx::McxOwned::<crate::OprCacheTy>::try_new(
+            MemoryContext::new("operator ownership test"),
+            |mcx| Ok(crate::OprCache { map: mcx::PgHashMap::with_capacity_in(16, mcx) }),
+        ).unwrap();
+        crate::OPR_CACHE.with(|cell| {
+            *cell.borrow_mut() = Some(core::mem::ManuallyDrop::new(owner));
+        });
+        crate::with_opr_cache(|map| {
+            let _value = mcx::alloc_leak_in(*map.allocator(), [7u8; 32768]).unwrap();
+        }).unwrap();
+        crate::clear_opr_cache();
+        assert_eq!(mcx::global_footprint::bytes(), before);
+    }
+}

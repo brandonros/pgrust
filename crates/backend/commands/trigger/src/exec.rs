@@ -1,0 +1,881 @@
+// ExecCallTriggerFunc + TriggerEnabled (trigger.c), including the WHEN-qual
+// compile-once cache (C ri_TrigWhenExprs) and the tgattr/modifiedCols gate.
+use core::cell::Cell;
+use core::ptr::NonNull;
+
+use mcx::{Mcx, PgBox};
+use types_error::{PgError, PgResult, ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED};
+use types_fmgr::{FmgrInfo, LocalFcinfo, TRACK_FUNC_ALL};
+use types_nodes::Bitmapset;
+use types_nodes::primnodes::{INNER_VAR, OUTER_VAR};
+use types_rel::Relation;
+use types_slot::SlotData;
+use types_trigger::{
+    Trigger, TRIGGER_DISABLED, TRIGGER_EVENT_OPMASK, TRIGGER_EVENT_UPDATE,
+    TRIGGER_FIRES_ON_ORIGIN, TRIGGER_FIRES_ON_REPLICA,
+};
+use types_trigger_call::TriggerData;
+use types_tuple::htup::FirstLowInvalidHeapAttributeNumber;
+use types_tuple::itemptr::ItemPointerData;
+use types_tuple::HeapTupleData;
+
+// Resolve-once carrier for a TriggerDesc's functions (C ri_TrigFunctions).
+#[derive(Default)]
+pub struct TriggerFmgrCache {
+    finfo: Vec<Option<FmgrInfo>>,
+}
+
+impl TriggerFmgrCache {
+    pub fn get(&mut self, tgindx: usize, tgfoid: types_core::Oid) -> PgResult<&mut FmgrInfo> {
+        if self.finfo.len() <= tgindx {
+            self.finfo.resize_with(tgindx + 1, || None);
+        }
+        let slot = &mut self.finfo[tgindx];
+        if slot.is_none() {
+            *slot = Some(fmgr_seams::fmgr_info::call(tgfoid)?);
+        }
+        Ok(slot.as_mut().expect("just filled"))
+    }
+}
+
+// C TriggerEnabled UPDATE-OF: bms_is_member(att, NULL) is false.
+fn update_of_cols_match(tgattr: &[i16], cols: Option<&Bitmapset<'_>>) -> bool {
+    let Some(cols) = cols else {
+        return false;
+    };
+    tgattr
+        .iter()
+        .any(|&a| cols.is_member(a as i32 - FirstLowInvalidHeapAttributeNumber))
+}
+
+// TriggerEnabled's tgenabled gate (trigger.c:3488-3500); tgattr/tgqual are
+// the caller's to handle.
+pub fn TriggerEnabled(t: &Trigger<'_>) -> bool {
+    if (guc_tables::vars::SessionReplicationRole.get().get)()
+        == guc_tables::consts::SESSION_REPLICATION_ROLE_REPLICA
+    {
+        t.tgenabled != TRIGGER_DISABLED && t.tgenabled != TRIGGER_FIRES_ON_ORIGIN
+    } else {
+        t.tgenabled != TRIGGER_DISABLED && t.tgenabled != TRIGGER_FIRES_ON_REPLICA
+    }
+}
+
+// build_generation_expression (rewriteHandler.c:4520), adbin-direct copy
+// (rewrite_handler -> execmain -> trigger crate cycle; nodemodifytable
+// precedent); cookDefault stored a coerced tree, so re-coercion is a no-op.
+fn build_generation_expression<'mcx>(
+    mcx: Mcx<'mcx>,
+    rel: &Relation<'mcx>,
+    attrno: usize,
+) -> PgResult<types_nodes::Node<'mcx>> {
+    let att = rel.rd_att.attr(attrno - 1);
+    let constr = rel.rd_att.constr.as_deref().expect("caller checked");
+    // rewriteHandler.c:4601: elog(ERROR, "no generation expression found
+    // for column number %d of table \"%s\"") — a catchable XX000 on a
+    // catalog whose pg_attrdef row is missing, never a backend abort.
+    let Some(adbin) = constr
+        .defval
+        .iter()
+        .find(|d| d.adnum == attrno as i16)
+        .and_then(|d| d.adbin.as_ref())
+    else {
+        return Err(crate::catalog::internal_error(format!(
+            "no generation expression found for column number {} of table \"{}\"",
+            attrno,
+            String::from_utf8_lossy(rel.rd_rel.relname.name_str())
+        )));
+    };
+    let expr = readfuncs::stringToNode(mcx, adbin.as_str())?;
+    if att.attcollation != 0 && att.attcollation != nodes_core::node_funcs::expr_collation(expr) {
+        return types_nodes::Node::mk(
+            mcx,
+            types_nodes::primnodes::CollateExpr {
+                arg: expr,
+                collOid: att.attcollation,
+                location: -1,
+            },
+        );
+    }
+    Ok(expr)
+}
+
+// expand_generated_columns_in_expr (rewriteHandler.c:4493): Vars naming a
+// virtual generated column of rel at varno become the generation expression
+// (whose Vars are varno 1 == the WHEN qual's OLD position, matching C where
+// expansion runs before ChangeVarNodes).
+fn expand_generated_columns_in_expr<'mcx>(
+    mcx: Mcx<'mcx>,
+    node: types_nodes::Node<'mcx>,
+    rel: &Relation<'mcx>,
+    varno: i32,
+) -> PgResult<Option<types_nodes::Node<'mcx>>> {
+    const VIRTUAL_GEN: i8 = types_core::catalog::ATTRIBUTE_GENERATED_VIRTUAL as i8;
+    if !rel.rd_att.constr.as_deref().is_some_and(|c| c.has_generated_virtual) {
+        return Ok(None);
+    }
+    if let Some(v) = node.as_var() {
+        if v.varlevelsup != 0 || v.varno != varno {
+            return Ok(None);
+        }
+        if v.varattno == 0 {
+            // ReplaceVarsFromTargetList whole-row arm (rewriteManip.c:1801):
+            // a named-rowtype whole-row Var becomes a RowExpr over per-field
+            // Vars (dropped columns as NULL int4 consts, expandRTE shape),
+            // each field then replaced so virtual columns expand.
+            let mut args = types_nodes::list::NodeList::nil();
+            for i in 0..rel.rd_att.natts as usize {
+                let att = rel.rd_att.attr(i);
+                let field = if att.attisdropped {
+                    types_nodes::Node::mk_const(
+                        mcx,
+                        types_core::catalog::INT4OID,
+                        -1,
+                        0,
+                        4,
+                        datum::Datum::null(),
+                        true,
+                        true,
+                    )?
+                } else if att.attgenerated == VIRTUAL_GEN {
+                    let e = build_generation_expression(mcx, rel, i + 1)?;
+                    if varno != 1 {
+                        rewrite_manip::ChangeVarNodes(mcx, e, 1, varno, 0)?;
+                    }
+                    e
+                } else {
+                    types_nodes::Node::mk_var(
+                        mcx,
+                        varno,
+                        (i + 1) as i16,
+                        att.atttypid,
+                        att.atttypmod,
+                        att.attcollation,
+                        0,
+                    )?
+                };
+                args.lappend(mcx, field)?;
+            }
+            return Ok(Some(types_nodes::Node::mk(
+                mcx,
+                types_nodes::RowExpr {
+                    args,
+                    row_typeid: v.vartype,
+                    row_format: types_nodes::CoercionForm::COERCE_IMPLICIT_CAST,
+                    colnames: types_nodes::list::NodeList::nil(),
+                    location: v.location,
+                },
+            )?));
+        }
+        // rewriteManip.c:1858-1873 (ReplaceVarsFromTargetList_callback):
+        // a system column (varattno < 0) has no targetlist entry, and the
+        // REPLACEVARS_CHANGE_VARNO arm leaves the Var alone.
+        if v.varattno < 0 || rel.rd_att.attr(v.varattno as usize - 1).attgenerated != VIRTUAL_GEN
+        {
+            return Ok(None);
+        }
+        let e = build_generation_expression(mcx, rel, v.varattno as usize)?;
+        let e = if varno != 1 {
+            rewrite_manip::ChangeVarNodes(mcx, e, 1, varno, 0)?;
+            e
+        } else {
+            e
+        };
+        return Ok(Some(e));
+    }
+    clauses::walker::expression_tree_mutator(mcx, node, &mut |n| {
+        expand_generated_columns_in_expr(mcx, n, rel, varno)
+    })
+}
+
+// C ri_TrigWhenExprs: one compiled tgqual per trigdesc index, per query.
+// Scratch slots serve the tuple-based AFTER save path (C evaluates against
+// the executor's trigger slots; the queue only has fetched tuples).
+#[derive(Default)]
+pub struct TriggerWhenCache<'mcx> {
+    states: Vec<Option<PgBox<'mcx, execexpr::ExprState<'mcx>>>>,
+    scratch_old: Option<SlotData<'mcx>>,
+    scratch_new: Option<SlotData<'mcx>>,
+    // C ri_PartitionCheckExpr for ExecBRInsertTriggers' tgisclone re-verify
+    // (trigger.c:2527-2536): compiled once per relation, like the WHEN
+    // states above.
+    partition_check: Option<PgBox<'mcx, execexpr::ExprState<'mcx>>>,
+}
+
+// The WHEN/UPDATE-OF half of C TriggerEnabled; borrows of the estate the
+// caller owns (slots, updatedCols, query mcx).
+pub struct TriggerWhenEval<'a, 'mcx> {
+    pub mcx: Mcx<'mcx>,
+    pub cache: &'a mut TriggerWhenCache<'mcx>,
+    pub modified_cols: Option<&'a Bitmapset<'mcx>>,
+}
+
+impl<'a, 'mcx> TriggerWhenEval<'a, 'mcx> {
+    fn attr_gate(&self, trigger: &Trigger<'_>, event: u32) -> bool {
+        if trigger.tgnattr > 0 && event & TRIGGER_EVENT_OPMASK == TRIGGER_EVENT_UPDATE {
+            return update_of_cols_match(trigger.tgattr.as_slice(), self.modified_cols);
+        }
+        true
+    }
+
+    fn compile(&mut self, idx: usize, trigger: &Trigger<'_>, rel: &Relation<'mcx>) -> PgResult<()> {
+        if self.cache.states.len() <= idx {
+            self.cache.states.resize_with(idx + 1, || None);
+        }
+        if self.cache.states[idx].is_some() {
+            return Ok(());
+        }
+        let tgqual = trigger.tgqual.as_ref().expect("caller checked tgqual");
+        let mut qual = readfuncs::stringToNode(self.mcx, tgqual.as_str())?;
+        // trigger.c:3553-3554: virtual generated Vars in the WHEN qual expand
+        // to their generation expressions for both OLD and NEW references.
+        qual = expand_generated_columns_in_expr(self.mcx, qual, rel, 1)?.unwrap_or(qual);
+        qual = expand_generated_columns_in_expr(self.mcx, qual, rel, 2)?.unwrap_or(qual);
+        rewrite_manip::ChangeVarNodes(self.mcx, qual, 1, INNER_VAR, 0)?;
+        rewrite_manip::ChangeVarNodes(self.mcx, qual, 2, OUTER_VAR, 0)?;
+        let implicit = clauses::make_ands_implicit(self.mcx, Some(qual))?;
+        // ExecPrepareQual: expression_planner on each arm (named-argument
+        // calls are only reordered here).
+        let mut planned = types_nodes::list::NodeList::nil();
+        for e in implicit.iter() {
+            let folded = clauses::eval_const_expressions(self.mcx, e)?;
+            nodes_core::fix_opfuncids(folded)?;
+            planned.lappend(self.mcx, folded)?;
+        }
+        self.cache.states[idx] =
+            execexpr::exec_init_qual(self.mcx, &planned, execexpr::ParamBind::NONE)?;
+        Ok(())
+    }
+
+    pub fn check(
+        &mut self,
+        idx: usize,
+        trigger: &Trigger<'_>,
+        rel: &Relation<'mcx>,
+        event: u32,
+        old_slot: Option<&mut SlotData<'mcx>>,
+        new_slot: Option<&mut SlotData<'mcx>>,
+    ) -> PgResult<bool> {
+        if !self.attr_gate(trigger, event) {
+            return Ok(false);
+        }
+        if trigger.tgqual.is_none() {
+            return Ok(true);
+        }
+        self.compile(idx, trigger, rel)?;
+        let mut slots = execexpr::EvalSlots { scan: None, inner: old_slot, outer: new_slot };
+        execexpr::exec_qual(self.cache.states[idx].as_deref_mut(), &mut slots)
+    }
+
+    // The AFTER-save-path variant: tuples fetched by ctid, staged in scratch
+    // heap slots for the qual (borrowed store, cleared before return).
+    pub fn check_tuples(
+        &mut self,
+        idx: usize,
+        trigger: &Trigger<'_>,
+        rel: &Relation<'mcx>,
+        event: u32,
+        old_tup: Option<&HeapTupleData<'_>>,
+        new_tup: Option<&HeapTupleData<'_>>,
+    ) -> PgResult<bool> {
+        if !self.attr_gate(trigger, event) {
+            return Ok(false);
+        }
+        if trigger.tgqual.is_none() {
+            return Ok(true);
+        }
+        self.compile(idx, trigger, rel)?;
+        let mcx = self.mcx;
+        let stage = |slot: &mut Option<SlotData<'mcx>>, tup: Option<&HeapTupleData<'_>>| {
+            let Some(tup) = tup else { return Ok::<_, Box<PgError>>(None) };
+            let s = slot.get_or_insert_with(|| {
+                exectuples::make_tuple_table_slot(
+                    mcx,
+                    types_slot::TupleSlotKind::HeapTuple,
+                    Some(rel.rd_att.clone()),
+                )
+            });
+            // SAFETY: the image outlives this evaluation; the slot is cleared
+            // before the caller's tuple borrow ends.
+            let staged = unsafe {
+                types_tuple::HeapTupleData::from_raw_parts(
+                    tup.header_ptr(),
+                    tup.t_len,
+                    tup.t_self,
+                    tup.t_tableOid,
+                )
+            };
+            exectuples::exec_store_heap_tuple(s, mcx, staged);
+            Ok(Some(()))
+        };
+        let TriggerWhenCache { states, scratch_old, scratch_new, .. } = &mut *self.cache;
+        stage(scratch_old, old_tup)?;
+        stage(scratch_new, new_tup)?;
+        let mut slots = execexpr::EvalSlots {
+            scan: None,
+            inner: if old_tup.is_some() { scratch_old.as_mut() } else { None },
+            outer: if new_tup.is_some() { scratch_new.as_mut() } else { None },
+        };
+        let ok = execexpr::exec_qual(states[idx].as_deref_mut(), &mut slots)?;
+        if let Some(s) = scratch_old.as_mut() {
+            exectuples::exec_clear_tuple(s, mcx);
+        }
+        if let Some(s) = scratch_new.as_mut() {
+            exectuples::exec_clear_tuple(s, mcx);
+        }
+        Ok(ok)
+    }
+}
+
+// ExecBSInsertTriggers (trigger.c), standalone-caller form (COPY FROM); the
+// executor's INSERT path fires through nodemodifytable's exec_bs_triggers.
+pub fn ExecBSInsertTriggers<'mcx>(
+    mcx: Mcx<'mcx>,
+    rel: &Relation<'mcx>,
+    trigdesc: &types_trigger::TriggerDesc<'static>,
+    fmgr: &mut TriggerFmgrCache,
+    when: &mut TriggerWhenEval<'_, 'mcx>,
+) -> PgResult<()> {
+    use types_trigger::{
+        TRIGGER_EVENT_BEFORE, TRIGGER_EVENT_INSERT, TRIGGER_TYPE_BEFORE, TRIGGER_TYPE_INSERT,
+        TRIGGER_TYPE_LEVEL_MASK, TRIGGER_TYPE_STATEMENT, TRIGGER_TYPE_TIMING_MASK,
+    };
+    if !trigdesc.trig_insert_before_statement {
+        return Ok(());
+    }
+    let tg_event = TRIGGER_EVENT_INSERT | TRIGGER_EVENT_BEFORE;
+    for (i, trigger) in trigdesc.triggers.iter().enumerate() {
+        if trigger.tgtype & (TRIGGER_TYPE_LEVEL_MASK | TRIGGER_TYPE_TIMING_MASK | TRIGGER_TYPE_INSERT)
+            != TRIGGER_TYPE_STATEMENT | TRIGGER_TYPE_BEFORE | TRIGGER_TYPE_INSERT
+        {
+            continue;
+        }
+        if !TriggerEnabled(trigger) {
+            continue;
+        }
+        if !when.check(i, trigger, rel, tg_event, None, None)? {
+            continue;
+        }
+        let finfo = fmgr.get(i, trigger.tgfoid)?;
+        let mut tdata = TriggerData::new(tg_event, rel, None, None, trigger);
+        if ExecCallTriggerFunc(mcx, &mut tdata, finfo, None)?.is_some() {
+            return Err(Box::new(
+                PgError::error("BEFORE STATEMENT trigger cannot return a value".to_string())
+                    .with_sqlstate(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ExecBSTruncateTriggers (trigger.c); ExecAS lives with the queue.
+pub fn ExecBSTruncateTriggers<'mcx>(
+    mcx: Mcx<'mcx>,
+    rel: &Relation<'mcx>,
+    trigdesc: &types_trigger::TriggerDesc<'static>,
+    fmgr: &mut TriggerFmgrCache,
+    when: &mut TriggerWhenEval<'_, 'mcx>,
+) -> PgResult<()> {
+    use types_trigger::{
+        TRIGGER_EVENT_BEFORE, TRIGGER_EVENT_TRUNCATE, TRIGGER_TYPE_BEFORE,
+        TRIGGER_TYPE_LEVEL_MASK, TRIGGER_TYPE_STATEMENT, TRIGGER_TYPE_TIMING_MASK,
+        TRIGGER_TYPE_TRUNCATE,
+    };
+    if !trigdesc.trig_truncate_before_statement {
+        return Ok(());
+    }
+    let tg_event = TRIGGER_EVENT_TRUNCATE | TRIGGER_EVENT_BEFORE;
+    for (i, trigger) in trigdesc.triggers.iter().enumerate() {
+        if trigger.tgtype
+            & (TRIGGER_TYPE_LEVEL_MASK | TRIGGER_TYPE_TIMING_MASK | TRIGGER_TYPE_TRUNCATE)
+            != TRIGGER_TYPE_STATEMENT | TRIGGER_TYPE_BEFORE | TRIGGER_TYPE_TRUNCATE
+        {
+            continue;
+        }
+        if !TriggerEnabled(trigger) {
+            continue;
+        }
+        if !when.check(i, trigger, rel, tg_event, None, None)? {
+            continue;
+        }
+        let finfo = fmgr.get(i, trigger.tgfoid)?;
+        let mut tdata = TriggerData::new(tg_event, rel, None, None, trigger);
+        if ExecCallTriggerFunc(mcx, &mut tdata, finfo, None)?.is_some() {
+            return Err(Box::new(
+                PgError::error("BEFORE STATEMENT trigger cannot return a value".to_string())
+                    .with_sqlstate(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ExecBRInsertTriggers (trigger.c), standalone-caller form (COPY FROM); the
+// executor's INSERT path fires through nodemodifytable's br_row_triggers.
+// false = a trigger returned NULL, suppressing the row.
+pub fn ExecBRInsertTriggers<'mcx>(
+    mcx: Mcx<'mcx>,
+    rel: &Relation<'mcx>,
+    trigdesc: &types_trigger::TriggerDesc<'static>,
+    fmgr: &mut TriggerFmgrCache,
+    when: &mut TriggerWhenEval<'_, 'mcx>,
+    slot: &mut SlotData<'mcx>,
+) -> PgResult<bool> {
+    insert_row_triggers(mcx, rel, trigdesc, fmgr, when, slot, false)
+}
+
+// ExecIRInsertTriggers (trigger.c), standalone-caller form (COPY FROM into a
+// view with an INSTEAD OF INSERT row trigger).
+pub fn ExecIRInsertTriggers<'mcx>(
+    mcx: Mcx<'mcx>,
+    rel: &Relation<'mcx>,
+    trigdesc: &types_trigger::TriggerDesc<'static>,
+    fmgr: &mut TriggerFmgrCache,
+    when: &mut TriggerWhenEval<'_, 'mcx>,
+    slot: &mut SlotData<'mcx>,
+) -> PgResult<bool> {
+    insert_row_triggers(mcx, rel, trigdesc, fmgr, when, slot, true)
+}
+
+fn insert_row_triggers<'mcx>(
+    mcx: Mcx<'mcx>,
+    rel: &Relation<'mcx>,
+    trigdesc: &types_trigger::TriggerDesc<'static>,
+    fmgr: &mut TriggerFmgrCache,
+    when: &mut TriggerWhenEval<'_, 'mcx>,
+    slot: &mut SlotData<'mcx>,
+    instead: bool,
+) -> PgResult<bool> {
+    use types_trigger::{
+        TRIGGER_EVENT_BEFORE, TRIGGER_EVENT_INSERT, TRIGGER_EVENT_INSTEAD, TRIGGER_EVENT_ROW,
+        TRIGGER_TYPE_BEFORE, TRIGGER_TYPE_INSERT, TRIGGER_TYPE_INSTEAD, TRIGGER_TYPE_LEVEL_MASK,
+        TRIGGER_TYPE_ROW, TRIGGER_TYPE_TIMING_MASK,
+    };
+    let (type_timing, event_timing) = if instead {
+        (TRIGGER_TYPE_INSTEAD, TRIGGER_EVENT_INSTEAD)
+    } else {
+        (TRIGGER_TYPE_BEFORE, TRIGGER_EVENT_BEFORE)
+    };
+    let tg_event = TRIGGER_EVENT_INSERT | TRIGGER_EVENT_ROW | event_timing;
+    for (i, trigger) in trigdesc.triggers.iter().enumerate() {
+        if trigger.tgtype & (TRIGGER_TYPE_LEVEL_MASK | TRIGGER_TYPE_TIMING_MASK | TRIGGER_TYPE_INSERT)
+            != TRIGGER_TYPE_ROW | type_timing | TRIGGER_TYPE_INSERT
+        {
+            continue;
+        }
+        if !TriggerEnabled(trigger) {
+            continue;
+        }
+        if !when.check(i, trigger, rel, tg_event, None, Some(slot))? {
+            continue;
+        }
+        // C should_free_trig discipline (trigger.c): a Copied fetch owns the
+        // image and must outlive the trigger call; freed after (end of
+        // iteration), never before.
+        let (img, len, tid, toid, _trig_owned) = {
+            let fetched = exectuples::exec_fetch_slot_heap_tuple(slot, true, mcx, mcx)?;
+            match fetched {
+                exectuples::FetchedHeapTuple::Slot(t) => {
+                    (t.header_ptr(), t.t_len, t.t_self, t.t_tableOid, None)
+                }
+                exectuples::FetchedHeapTuple::Copied(t) => {
+                    (t.header_ptr(), t.t_len, t.t_self, t.t_tableOid, Some(t))
+                }
+            }
+        };
+        // SAFETY: a materialized query-context image; the slot is not written
+        // while this handle lives within this iteration.
+        let mut cur = unsafe { HeapTupleData::from_raw_parts(img, len, tid, toid) };
+        let cur_nn = NonNull::from(&mut cur);
+        let finfo = fmgr.get(i, trigger.tgfoid)?;
+        let mut tdata =
+            types_trigger_call::TriggerData::from_raw(tg_event, rel, Some(cur_nn), None, trigger);
+        let ret = ExecCallTriggerFunc(mcx, &mut tdata, finfo, None)?;
+        match ret {
+            None => return Ok(false),
+            Some(p) if p == cur_nn => {}
+            Some(p) => {
+                // SAFETY: the trigger's returned tuple, live in the per-call
+                // context; copied into the slot before reuse.
+                let returned = unsafe { p.as_ref() };
+                let nulled = check_modified_virtual_generated(mcx, rel, returned)?;
+                let returned = nulled.as_ref().map_or(returned, |t| t.as_tuple());
+                let img = unsafe {
+                    core::slice::from_raw_parts(returned.header_ptr(), returned.t_len as usize)
+                };
+                let mut buf = mcx::vec_with_capacity_in(mcx, img.len())?;
+                mcx::vec_append_bytes(&mut buf, img).map_err(|_| mcx.oom(img.len()))?;
+                let ptr = buf.as_ptr();
+                core::mem::forget(buf);
+                // SAFETY: fresh query-context copy of the returned image.
+                let copy = unsafe {
+                    HeapTupleData::from_raw_parts(
+                        ptr,
+                        returned.t_len,
+                        returned.t_self,
+                        returned.t_tableOid,
+                    )
+                };
+                exectuples::exec_force_store_heap_tuple(copy, slot, mcx)?;
+                // trigger.c:2527-2536: after a cloned trigger replaced the
+                // tuple, the row may no longer fit the partition it was
+                // routed to (or COPYed into directly). ExecPartitionCheck
+                // with emitError=false, then the FEATURE_NOT_SUPPORTED
+                // error; ExecIRInsertTriggers has no such arm.
+                if !instead
+                    && trigger.tgisclone
+                    && !execpartition::exec_partition_check(
+                        mcx,
+                        &mut when.cache.partition_check,
+                        rel,
+                        slot,
+                    )?
+                {
+                    return Err(moved_row_before_trigger(mcx, trigger, rel));
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+// ExecBRInsertTriggers (trigger.c:2529-2536): the replacement tuple of a
+// cloned trigger failed the partition constraint re-verify.
+#[track_caller]
+#[cold]
+#[inline(never)]
+fn moved_row_before_trigger<'mcx>(
+    mcx: Mcx<'mcx>,
+    trigger: &Trigger<'_>,
+    rel: &Relation<'mcx>,
+) -> Box<PgError> {
+    let nspname = lsyscache::misc::get_namespace_name(mcx, rel.rd_rel.relnamespace)
+        .ok()
+        .flatten()
+        .map(|s| s.as_str().to_string())
+        .unwrap_or_default();
+    Box::new(
+        PgError::error(
+            "moving row to another partition during a BEFORE FOR EACH ROW trigger is not \
+             supported"
+                .to_string(),
+        )
+        .with_sqlstate(types_error::ERRCODE_FEATURE_NOT_SUPPORTED)
+        .with_detail(format!(
+            "Before executing trigger \"{}\", the row was to be in partition \"{}.{}\".",
+            trigger.tgname.as_str(),
+            nspname,
+            rel.name()
+        )),
+    )
+}
+
+// ExecFetchSlotHeapTuple(slot, true, &should_free) as raw parts plus the
+// Copied owner: C's should_free discipline — a Copied image must outlive the
+// trigger calls that see it and is freed after them, never before.
+type RawTuple = (*const u8, u32, ItemPointerData, types_core::Oid);
+fn fetch_raw<'mcx>(
+    mcx: Mcx<'mcx>,
+    slot: &mut SlotData<'mcx>,
+) -> PgResult<(RawTuple, Option<heaptuple::HeapTuple<'mcx>>)> {
+    let fetched = exectuples::exec_fetch_slot_heap_tuple(slot, true, mcx, mcx)?;
+    Ok(match fetched {
+        exectuples::FetchedHeapTuple::Slot(t) => {
+            ((t.header_ptr(), t.t_len, t.t_self, t.t_tableOid), None)
+        }
+        exectuples::FetchedHeapTuple::Copied(t) => {
+            ((t.header_ptr(), t.t_len, t.t_self, t.t_tableOid), Some(t))
+        }
+    })
+}
+
+// ExecForceStoreHeapTuple of a trigger-returned tuple (trigger.c:3108): the
+// returned image (live in the per-call context) is copied into the query
+// context and stored into `slot`, after check_modified_virtual_generated.
+fn store_returned_tuple<'mcx>(
+    mcx: Mcx<'mcx>,
+    rel: &Relation<'mcx>,
+    returned: &HeapTupleData<'_>,
+    slot: &mut SlotData<'mcx>,
+) -> PgResult<()> {
+    let nulled = check_modified_virtual_generated(mcx, rel, returned)?;
+    let returned = nulled.as_ref().map_or(returned, |t| t.as_tuple());
+    // SAFETY: the returned tuple is a live heap-tuple image of t_len bytes.
+    let img = unsafe { core::slice::from_raw_parts(returned.header_ptr(), returned.t_len as usize) };
+    let mut buf = mcx::vec_with_capacity_in(mcx, img.len())?;
+    mcx::vec_append_bytes(&mut buf, img).map_err(|_| mcx.oom(img.len()))?;
+    let ptr = buf.as_ptr();
+    core::mem::forget(buf);
+    // SAFETY: fresh query-context copy of the returned image.
+    let copy = unsafe {
+        HeapTupleData::from_raw_parts(ptr, returned.t_len, returned.t_self, returned.t_tableOid)
+    };
+    exectuples::exec_force_store_heap_tuple(copy, slot, mcx)
+}
+
+// ExecBRDeleteTriggers (trigger.c:2707), standalone-caller form (logical
+// replication apply, execReplication.c:753). The row being deleted is already
+// locked and fetched into `oldslot` — C's GetTupleForTrigger(tid) leg — so no
+// EPQ recheck arises. false = a trigger returned NULL: suppress the delete.
+pub fn ExecBRDeleteTriggers<'mcx>(
+    mcx: Mcx<'mcx>,
+    rel: &Relation<'mcx>,
+    trigdesc: &types_trigger::TriggerDesc<'static>,
+    fmgr: &mut TriggerFmgrCache,
+    when: &mut TriggerWhenEval<'_, 'mcx>,
+    oldslot: &mut SlotData<'mcx>,
+) -> PgResult<bool> {
+    use types_trigger::{
+        TRIGGER_EVENT_BEFORE, TRIGGER_EVENT_DELETE, TRIGGER_EVENT_ROW, TRIGGER_TYPE_BEFORE,
+        TRIGGER_TYPE_DELETE, TRIGGER_TYPE_LEVEL_MASK, TRIGGER_TYPE_ROW, TRIGGER_TYPE_TIMING_MASK,
+    };
+    let tg_event = TRIGGER_EVENT_DELETE | TRIGGER_EVENT_ROW | TRIGGER_EVENT_BEFORE;
+    // trigtuple = ExecFetchSlotHeapTuple(slot, true, &should_free).
+    let ((img, len, tid, toid), _trig_owned) = fetch_raw(mcx, oldslot)?;
+    for (i, trigger) in trigdesc.triggers.iter().enumerate() {
+        if trigger.tgtype & (TRIGGER_TYPE_LEVEL_MASK | TRIGGER_TYPE_TIMING_MASK | TRIGGER_TYPE_DELETE)
+            != TRIGGER_TYPE_ROW | TRIGGER_TYPE_BEFORE | TRIGGER_TYPE_DELETE
+        {
+            continue;
+        }
+        if !TriggerEnabled(trigger) {
+            continue;
+        }
+        if !when.check(i, trigger, rel, tg_event, Some(oldslot), None)? {
+            continue;
+        }
+        // SAFETY: a materialized query-context image; the slot is not written
+        // while this handle lives within this iteration.
+        let mut trigtuple = unsafe { HeapTupleData::from_raw_parts(img, len, tid, toid) };
+        let trig_nn = NonNull::from(&mut trigtuple);
+        let finfo = fmgr.get(i, trigger.tgfoid)?;
+        let mut tdata = TriggerData::from_raw(tg_event, rel, Some(trig_nn), None, trigger);
+        if ExecCallTriggerFunc(mcx, &mut tdata, finfo, None)?.is_none() {
+            return Ok(false); // tell caller to suppress delete
+        }
+        // A returned tuple other than trigtuple is context-owned here
+        // (C heap_freetuple(newtuple)).
+    }
+    Ok(true)
+}
+
+// ExecBRUpdateTriggers (trigger.c:2977), standalone-caller form (logical
+// replication apply, execReplication.c:685). `oldslot` holds the locked,
+// fetched old row (GetTupleForTrigger leg, no EPQ recheck); `newslot` the
+// replacement row, rewritten in place when a trigger returns a different
+// tuple (ExecForceStoreHeapTuple). `updated_cols` is C's
+// ExecGetAllUpdatedCols, handed to the triggers as tg_updatedcols. false = a
+// trigger returned NULL: "do nothing".
+#[allow(clippy::too_many_arguments)]
+pub fn ExecBRUpdateTriggers<'mcx>(
+    mcx: Mcx<'mcx>,
+    rel: &Relation<'mcx>,
+    trigdesc: &types_trigger::TriggerDesc<'static>,
+    fmgr: &mut TriggerFmgrCache,
+    when: &mut TriggerWhenEval<'_, 'mcx>,
+    oldslot: &mut SlotData<'mcx>,
+    newslot: &mut SlotData<'mcx>,
+    updated_cols: Option<&Bitmapset<'mcx>>,
+) -> PgResult<bool> {
+    use types_trigger::{
+        TRIGGER_EVENT_BEFORE, TRIGGER_EVENT_ROW, TRIGGER_TYPE_BEFORE, TRIGGER_TYPE_LEVEL_MASK,
+        TRIGGER_TYPE_ROW, TRIGGER_TYPE_TIMING_MASK, TRIGGER_TYPE_UPDATE,
+    };
+    let tg_event = TRIGGER_EVENT_UPDATE | TRIGGER_EVENT_ROW | TRIGGER_EVENT_BEFORE;
+    // Here we convert oldslot to a materialized slot holding trigtuple.
+    let ((oimg, olen, otid, otoid), _trig_owned) = fetch_raw(mcx, oldslot)?;
+    // Stable across the calls: the caller's bitmapset outlives this function.
+    let updatedcols_ptr = updated_cols.map_or(0usize, |b| b as *const _ as usize);
+    let mut new_raw: Option<RawTuple> = None;
+    let mut _new_owned: Option<heaptuple::HeapTuple<'mcx>> = None;
+    for (i, trigger) in trigdesc.triggers.iter().enumerate() {
+        if trigger.tgtype & (TRIGGER_TYPE_LEVEL_MASK | TRIGGER_TYPE_TIMING_MASK | TRIGGER_TYPE_UPDATE)
+            != TRIGGER_TYPE_ROW | TRIGGER_TYPE_BEFORE | TRIGGER_TYPE_UPDATE
+        {
+            continue;
+        }
+        if !TriggerEnabled(trigger) {
+            continue;
+        }
+        if !when.check(i, trigger, rel, tg_event, Some(oldslot), Some(newslot))? {
+            continue;
+        }
+        // newtuple = ExecFetchSlotHeapTuple(newslot, true, &should_free_new),
+        // fetched once and refreshed after a replacement.
+        let (nimg, nlen, ntid, ntoid) = match new_raw {
+            Some(r) => r,
+            None => {
+                let (r, owned) = fetch_raw(mcx, newslot)?;
+                new_raw = Some(r);
+                _new_owned = owned;
+                r
+            }
+        };
+        // SAFETY (both): materialized query-context images; the slots are
+        // not written while these handles live within this iteration.
+        let mut trigtuple = unsafe { HeapTupleData::from_raw_parts(oimg, olen, otid, otoid) };
+        let mut newtuple = unsafe { HeapTupleData::from_raw_parts(nimg, nlen, ntid, ntoid) };
+        let trig_nn = NonNull::from(&mut trigtuple);
+        let new_nn = NonNull::from(&mut newtuple);
+        let finfo = fmgr.get(i, trigger.tgfoid)?;
+        let mut tdata =
+            TriggerData::from_raw(tg_event, rel, Some(trig_nn), Some(new_nn), trigger);
+        tdata.tg_updatedcols = updatedcols_ptr;
+        match ExecCallTriggerFunc(mcx, &mut tdata, finfo, None)? {
+            None => return Ok(false), // "do nothing"
+            Some(p) if p == new_nn => {}
+            Some(p) => {
+                // SAFETY: the trigger's returned tuple, live in the per-call
+                // context; copied into the slot before reuse.
+                let returned = unsafe { p.as_ref() };
+                store_returned_tuple(mcx, rel, returned, newslot)?;
+                let (r, owned) = fetch_raw(mcx, newslot)?;
+                new_raw = Some(r);
+                _new_owned = owned;
+            }
+        }
+    }
+    Ok(true)
+}
+
+// check_modified_virtual_generated (trigger.c:6735): a trigger-returned tuple
+// must not carry a non-null value in a virtual generated column; offending
+// columns revert to null. None means the tuple was already clean.
+fn check_modified_virtual_generated<'mcx>(
+    mcx: Mcx<'mcx>,
+    rel: &Relation<'mcx>,
+    tuple: &HeapTupleData<'_>,
+) -> PgResult<Option<heaptuple::HeapTuple<'mcx>>> {
+    const VIRTUAL_GEN: i8 = types_core::catalog::ATTRIBUTE_GENERATED_VIRTUAL as i8;
+    let tupdesc = &*rel.rd_att;
+    if !tupdesc.constr.as_deref().is_some_and(|c| c.has_generated_virtual) {
+        return Ok(None);
+    }
+    let mut cols: mcx::PgVec<'_, i32> = mcx::PgVec::new_in(mcx);
+    for i in 0..tupdesc.natts as usize {
+        if tupdesc.attr(i).attgenerated == VIRTUAL_GEN
+            && !types_tuple::heap_attisnull(tuple, i as i32 + 1, Some(tupdesc))
+        {
+            cols.push(i as i32 + 1);
+        }
+    }
+    if cols.is_empty() {
+        return Ok(None);
+    }
+    let mut values: mcx::PgVec<'_, datum::Datum> = mcx::vec_with_capacity_in(mcx, cols.len())?;
+    let mut isnull: mcx::PgVec<'_, bool> = mcx::vec_with_capacity_in(mcx, cols.len())?;
+    for _ in 0..cols.len() {
+        values.push(datum::Datum::null());
+        isnull.push(true);
+    }
+    heaptuple::heap_modify_tuple_by_cols(mcx, tuple, tupdesc, &cols, &values, &isnull).map(Some)
+}
+
+thread_local! {
+    static TRIGGER_DEPTH: Cell<i32> = const { Cell::new(0) };
+}
+
+pub fn trigger_depth() -> i32 {
+    TRIGGER_DEPTH.with(|c| c.get())
+}
+
+// C: MyTriggerDepth++ / MyTriggerDepth-- around FunctionCallInvoke, the
+// latter in PG_FINALLY so it runs even when the call errors; Drop gives the
+// same guarantee across both the `?` early-return and the panic-unwind path.
+pub(crate) struct TriggerDepthGuard;
+
+impl TriggerDepthGuard {
+    pub(crate) fn enter() -> Self {
+        TRIGGER_DEPTH.with(|c| c.set(c.get() + 1));
+        TriggerDepthGuard
+    }
+}
+
+impl Drop for TriggerDepthGuard {
+    fn drop(&mut self) {
+        TRIGGER_DEPTH.with(|c| c.set(c.get() - 1));
+    }
+}
+
+// The returned pointer's image lives in per_tuple_mcx: the 'a in the return
+// type overstates validity — it dies at the per-tuple reset, and callers must
+// consume or copy it before then (C: SPI trigger returns palloc'd in the
+// per-tuple context).
+// `instr` is the caller's ri_TrigInstrument + tgindx (trigger.c:2318,
+// :2352/:2400 InstrStartNode/InstrStopNode(1)); None outside EXPLAIN ANALYZE
+// and from the after-trigger queue, which brackets the whole event itself.
+pub fn ExecCallTriggerFunc<'a, 'mcx>(
+    per_tuple_mcx: Mcx<'_>,
+    trigdata: &mut TriggerData<'a, 'mcx>,
+    finfo: &mut FmgrInfo,
+    mut instr: Option<&mut types_core::instrument::Instrumentation>,
+) -> PgResult<Option<NonNull<HeapTupleData<'a>>>> {
+    debug_assert_eq!(finfo.fn_oid, trigdata.tg_trigger.tgfoid);
+    if let Some(i) = instr.as_deref_mut() {
+        ::instrument::instr_start_node(i);
+    }
+    let mut fcinfo = LocalFcinfo::<0>::fresh(types_core::InvalidOid);
+    fcinfo.context = trigdata.fm_node_ptr();
+    // SAFETY: the scratch context outlives this single invocation.
+    unsafe { fcinfo.set_result_mcx(per_tuple_mcx) };
+    // C: pgstat_init_function_usage's `pgstat_track_functions <= fn_stats`
+    // early-out, hoisted to the caller as the crate's API requires.
+    let fcu = if finfo.fn_stats < TRACK_FUNC_ALL
+        && ::pgstat::function::pgstat_track_functions() > finfo.fn_stats as i32
+    {
+        Some(::pgstat::function::pgstat_init_function_usage(finfo.fn_oid)?)
+    } else {
+        None
+    };
+    let depth_guard = TriggerDepthGuard::enter();
+    let result = finfo.invoke(&mut fcinfo)?;
+    drop(depth_guard);
+    if let Some(fcu) = &fcu {
+        ::pgstat::function::pgstat_end_function_usage(fcu, true);
+    }
+    if let Some(i) = instr {
+        ::instrument::instr_stop_node(i, 1.0);
+    }
+    if fcinfo.isnull {
+        return Err(returned_null(finfo.fn_oid));
+    }
+    Ok(NonNull::new(result.as_usize() as *mut HeapTupleData<'a>))
+}
+
+#[track_caller]
+#[cold]
+#[inline(never)]
+fn returned_null(fn_oid: types_core::Oid) -> Box<PgError> {
+    Box::new(
+        PgError::error(format!("trigger function {fn_oid} returned null value"))
+            .with_sqlstate(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Born-RED: the old attr_gate `.expect("UPDATE trigger firing path
+    // supplies modifiedCols")` panicked here. C TriggerEnabled with
+    // modifiedCols=NULL skips the UPDATE OF trigger (bms_is_member is false).
+    #[test]
+    fn update_of_null_modified_cols_skips() {
+        assert!(!update_of_cols_match(&[1, 2], None));
+    }
+
+    #[test]
+    fn update_of_empty_set_skips() {
+        let cols = Bitmapset::empty();
+        assert!(!update_of_cols_match(&[1], Some(&cols)));
+    }
+
+    #[test]
+    fn update_of_matching_col_fires() {
+        let ctx = mcx::MemoryContext::new("t");
+        let mcx = ctx.mcx();
+        let mut cols = Bitmapset::empty();
+        cols.add_member(mcx, 1 - FirstLowInvalidHeapAttributeNumber).unwrap();
+        assert!(update_of_cols_match(&[1], Some(&cols)));
+        assert!(!update_of_cols_match(&[2], Some(&cols)));
+    }
+}

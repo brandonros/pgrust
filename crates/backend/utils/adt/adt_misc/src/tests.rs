@@ -1,0 +1,349 @@
+use datum::Datum;
+use mcx::{Mcx, MemoryContext};
+use types_core::TEXTOID;
+use types_error::PgResult;
+use types_fmgr::{FmgrInfo, LocalFcinfo};
+
+use crate::builtins::fc_parse_ident;
+
+#[test]
+fn pg_postmaster_start_time_reads_the_seam() {
+    if !postmaster_seams::pg_start_time::is_installed() {
+        postmaster_seams::pg_start_time::set(|| 123_456_789);
+    }
+    let ctx = MemoryContext::new("t");
+    let mut fcinfo = LocalFcinfo::<0>::new(0);
+    // SAFETY: mcx outlives the call.
+    unsafe { fcinfo.set_result_mcx(ctx.mcx()) };
+    let d = crate::builtins::fc_pg_postmaster_start_time(None, &mut fcinfo).unwrap();
+    assert_eq!(d.as_i64(), postmaster_seams::pg_start_time::call());
+}
+
+#[test]
+fn pg_collation_for_no_argtype_is_null() {
+    let ctx = MemoryContext::new("t");
+    let mut fcinfo = LocalFcinfo::<1>::new(0);
+    // SAFETY: mcx outlives the call.
+    unsafe { fcinfo.set_result_mcx(ctx.mcx()) };
+    fcinfo.set_arg(0, Datum::null());
+    // No fn_expr installed: C's get_fn_expr_argtype returns InvalidOid.
+    let mut flinfo = FmgrInfo::new(crate::fc_pg_collation_for, 3162, 1, false, false);
+    crate::fc_pg_collation_for(Some(&mut flinfo), &mut fcinfo).unwrap();
+    assert!(fcinfo.isnull);
+}
+
+fn run(mcx: Mcx<'_>, input: &str, strict: bool) -> PgResult<Vec<String>> {
+    // construct_array resolves the element type shape through the syscache
+    // seam on current main (varlena tests' install_text_type_shape pattern).
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        syscache_seams::lookup_pg_type_shape::set(|typid| {
+            Ok((typid == TEXTOID).then_some(types_tuple::tupdesc::PgTypeShape {
+                typlen: -1,
+                typbyval: false,
+                typalign: b'i' as i8,
+                typstorage: b'x' as i8,
+                typcollation: 100,
+            }))
+        });
+    });
+    let mut fcinfo = LocalFcinfo::<2>::new(0);
+    // SAFETY: mcx outlives the call.
+    unsafe { fcinfo.set_result_mcx(mcx) };
+    let text = varlena::cstring_to_text(mcx, input.as_bytes()).unwrap();
+    fcinfo.set_arg(0, Datum::from_usize(text.as_bytes().as_ptr() as usize));
+    fcinfo.set_arg(1, Datum::from_bool(strict));
+    let d = fc_parse_ident(None, &mut fcinfo)?;
+    let p = d.as_usize() as *const u8;
+    let img = unsafe { core::slice::from_raw_parts(p, arrayfuncs::foundation::varsize_any(p)) };
+    let (elems, nulls) = arrayfuncs::deconstruct_array_builtin(mcx, img, TEXTOID, true).unwrap();
+    Ok(elems
+        .iter()
+        .zip(nulls.iter())
+        .map(|(&e, &isnull)| {
+            assert!(!isnull);
+            let p = e.as_usize() as *const u8;
+            let bytes = unsafe {
+                core::slice::from_raw_parts(p.add(4), arrayfuncs::foundation::varsize_any(p) - 4)
+            };
+            String::from_utf8(bytes.to_vec()).unwrap()
+        })
+        .collect())
+}
+
+#[test]
+fn parse_ident_unquoted_downcases() {
+    let ctx = MemoryContext::new("t");
+    let parts = run(ctx.mcx(), "Foo.Bar", true).unwrap();
+    assert_eq!(parts, vec!["foo", "bar"]);
+}
+
+#[test]
+fn parse_ident_quoted_preserves_case() {
+    let ctx = MemoryContext::new("t");
+    let parts = run(ctx.mcx(), "\"MixedCase\"", true).unwrap();
+    assert_eq!(parts, vec!["MixedCase"]);
+}
+
+#[test]
+fn parse_ident_strict_trailing_garbage_errors() {
+    let ctx = MemoryContext::new("t");
+    let err = run(ctx.mcx(), "foo.bar!", true).unwrap_err();
+    assert_eq!(err.message, "string is not a valid identifier: \"foo.bar!\"");
+}
+
+#[test]
+fn parse_ident_nonstrict_tolerates_trailing_garbage() {
+    let ctx = MemoryContext::new("t");
+    let parts = run(ctx.mcx(), "foo.bar!", false).unwrap();
+    assert_eq!(parts, vec!["foo", "bar"]);
+}
+
+#[test]
+fn parse_ident_invalid_after_dot_message() {
+    let ctx = MemoryContext::new("t");
+    let err = run(ctx.mcx(), "foo.", true).unwrap_err();
+    assert_eq!(err.message, "string is not a valid identifier: \"foo.\"");
+    assert_eq!(err.detail.as_deref(), Some("No valid identifier after \".\"."));
+}
+
+#[test]
+fn atooid_strtoul_semantics() {
+    assert_eq!(crate::builtins::atooid("16384"), 16384);
+    assert_eq!(crate::builtins::atooid("123abc"), 123);
+    assert_eq!(crate::builtins::atooid("."), 0);
+    assert_eq!(crate::builtins::atooid("pgsql_tmp"), 0);
+    // strtoul: sign and whitespace accepted, unsigned long then truncated to Oid.
+    assert_eq!(crate::builtins::atooid("4294967297"), 1);
+    assert_eq!(crate::builtins::atooid(" +5"), 5);
+    assert_eq!(crate::builtins::atooid("-1"), 4294967295);
+    assert_eq!(crate::builtins::atooid("99999999999999999999"), 4294967295);
+    assert_eq!(crate::builtins::atooid("+"), 0);
+}
+
+#[test]
+fn sys_fk_relationships_matches_generated_header() {
+    let rows = crate::catalog_fk::SYS_FK_RELATIONSHIPS;
+    assert_eq!(rows.len(), 219);
+    assert_eq!(rows[0], (1255, 2615, "{pronamespace}", "{oid}", false, false));
+    assert_eq!(rows[218], (6102, 1259, "{srrelid}", "{oid}", false, false));
+    for (fk, pk, fkc, pkc, _, _) in rows {
+        assert_ne!(*fk, 0);
+        assert_ne!(*pk, 0);
+        for cols in [fkc, pkc] {
+            let inner = cols.strip_prefix('{').unwrap().strip_suffix('}').unwrap();
+            assert!(!inner.is_empty() && !inner.contains(['"', ' ']));
+        }
+    }
+}
+
+fn install_jit_guc() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static JIT_GUC: AtomicBool = AtomicBool::new(true);
+    guc_tables::vars::jit_enabled.install_if_absent(guc_tables::GucVarAccessors {
+        get: || JIT_GUC.load(Ordering::Relaxed),
+        set: |v| JIT_GUC.store(v, Ordering::Relaxed),
+    });
+}
+
+fn jit_available() -> bool {
+    let mut fcinfo = LocalFcinfo::<0>::new(0);
+    crate::builtins::fc_pg_jit_available(None, &mut fcinfo).unwrap().as_bool()
+}
+
+#[test]
+fn pg_jit_available_is_false_without_a_provider_shlib() {
+    install_jit_guc();
+    let dir = std::env::temp_dir().join(format!("pgrust-jit-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut buf = [0u8; types_core::MAXPGPATH];
+    let s = dir.to_str().unwrap().as_bytes();
+    buf[..s.len()].copy_from_slice(s);
+    init_small::globals::set_pkglib_path(buf);
+
+    guc_tables::vars::jit_enabled.write(false);
+    assert!(!jit_available(), "jit=off short-circuits, C provider_init()");
+    guc_tables::vars::jit_enabled.write(true);
+    assert!(!jit_available(), "no llvmjit.so in pkglib_path");
+    // provider_failed_loading latches: a provider appearing later stays false.
+    std::fs::write(dir.join("llvmjit.so"), b"").unwrap();
+    assert!(!jit_available(), "failed probe is cached, C provider_failed_loading");
+    let _ = std::fs::remove_dir_all(&dir);
+    guc_tables::vars::jit_enabled.write(true);
+}
+
+#[test]
+fn pg_trigger_depth_reads_the_executor_seam() {
+    if !trigger_seams::my_trigger_depth::is_installed() {
+        trigger_seams::my_trigger_depth::set(|| 2);
+    }
+    let mut fcinfo = LocalFcinfo::<0>::new(0);
+    let d = crate::builtins::fc_pg_trigger_depth(None, &mut fcinfo).unwrap();
+    assert_eq!(d.as_i32(), trigger_seams::my_trigger_depth::call());
+}
+
+#[test]
+fn recovery_control_fns_error_outside_recovery() {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static XLOG_BUFFERS: AtomicI32 = AtomicI32::new(64);
+    guc_tables::vars::XLOGbuffers.install_if_absent(guc_tables::GucVarAccessors {
+        get: || XLOG_BUFFERS.load(Ordering::Relaxed),
+        set: |v| XLOG_BUFFERS.store(v, Ordering::Relaxed),
+    });
+    transam_xlog::XLOGShmemInit();
+    transam_xlog::ctl::XLogCtl()
+        .SharedRecoveryState
+        .store(transam_xlog::RECOVERY_STATE_DONE, std::sync::atomic::Ordering::Relaxed);
+    for f in [
+        crate::builtins::fc_pg_wal_replay_pause,
+        crate::builtins::fc_pg_wal_replay_resume,
+        crate::builtins::fc_pg_is_wal_replay_paused,
+        crate::builtins::fc_pg_get_wal_replay_pause_state,
+    ] {
+        let mut fcinfo = LocalFcinfo::<0>::new(0);
+        let e = f(None, &mut fcinfo).unwrap_err();
+        assert_eq!(
+            e.sqlstate(),
+            types_error::make_sqlstate(*b"55000"),
+            "ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE"
+        );
+        assert_eq!(e.message(), "recovery is not in progress");
+        assert_eq!(
+            e.hint(),
+            Some("Recovery control functions can only be executed during recovery.")
+        );
+    }
+}
+
+#[test]
+fn version_string_default_is_postgres_first() {
+    // dl-verstring ruling 2026-08-06: the default rendering leads with the
+    // PostgreSQL compatibility version, pgrust identity parenthesized. The
+    // GUC's TLS backing cell boots postgres_first in every thread; the
+    // reader goes through guc_tables::backing, so no install is needed.
+    // The literals here are the intentional test-side pin of the banner.
+    assert_eq!(
+        crate::introspect::pg_version_str(),
+        format!(
+            "PostgreSQL 18.6 (pgrust 0.3) on {}, 64-bit",
+            env!("PGRUST_TARGET_TRIPLE")
+        )
+    );
+}
+
+#[test]
+fn version_string_pgrust_first_renders_the_legacy_form() {
+    // pgrust_first must reproduce the pre-ruling banner byte-for-byte.
+    guc_tables::backing::set_pgrust_version_string_style(
+        guc_tables::consts::VERSION_STRING_PGRUST_FIRST,
+    );
+    let s = crate::introspect::pg_version_str();
+    // TLS cell: restore this thread's default before asserting.
+    guc_tables::backing::set_pgrust_version_string_style(
+        guc_tables::consts::VERSION_STRING_POSTGRES_FIRST,
+    );
+    assert_eq!(
+        s,
+        format!(
+            "pgrust 0.3 (PostgreSQL 18.6 compatible) on {}, 64-bit",
+            env!("PGRUST_TARGET_TRIPLE")
+        )
+    );
+}
+
+#[test]
+fn default_version_first_digit_run_is_the_pg_major() {
+    // THE load-bearing ecosystem contract (dl-verstring ruling 2026-08-06):
+    // clients like duckdb-postgres take the FIRST digit run in version() as
+    // the PostgreSQL version. Under the default style that must be the
+    // compatibility major ("18"), never pgrust's own leading "0" — parsing
+    // "0.3" downgraded such clients to pre-8.3 stubs (no enum introspection,
+    // no parallel ctid scans). If this test breaks, that regression is back.
+    let s = crate::introspect::pg_version_str();
+    let first_run: String = s
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    assert_eq!(first_run, "18");
+}
+
+#[test]
+fn pg_nextoid_row_matches_canonical() {
+    let row = crate::builtins::MISC_BUILTINS
+        .iter()
+        .find(|b| b.foid == 275)
+        .expect("pg_nextoid registered");
+    fmgr_core::assert_rows_match_canonical(core::slice::from_ref(row));
+}
+
+#[test]
+fn current_logfiles_reads_like_fgets_maxpgpath() {
+    use crate::builtins::current_logfiles_entry;
+    let long = |n: usize| format!("stderr {}\n", "x".repeat(n)).into_bytes();
+    // 'stderr ' + 1015 x + LF fits fgets' 1023-byte read; one more splits the line.
+    assert_eq!(current_logfiles_entry(&long(1015), Some(b"stderr")).unwrap().unwrap().len(), 1015);
+    assert_eq!(
+        current_logfiles_entry(&long(1016), Some(b"stderr")).unwrap_err().message(),
+        "missing newline character in \"current_logfiles\""
+    );
+    // A later valid line does not rescue the split first line.
+    let mut two = long(1016);
+    two.extend_from_slice(b"csvlog log/a.csv\n");
+    assert!(current_logfiles_entry(&two, Some(b"csvlog")).is_err());
+    let nospace = format!("{} stderr\n", "x".repeat(1030)).into_bytes();
+    assert_eq!(
+        current_logfiles_entry(&nospace, None).unwrap_err().message(),
+        "missing space character in \"current_logfiles\""
+    );
+    // strchr stops at an embedded NUL.
+    assert!(current_logfiles_entry(b"stderr\0 log/a.log\n", None).is_err());
+    assert_eq!(
+        current_logfiles_entry(b"stderr log/a.log\ncsvlog log/a.csv\n", Some(b"csvlog")).unwrap(),
+        Some(&b"log/a.csv"[..])
+    );
+    assert_eq!(current_logfiles_entry(b"stderr log/a.log\n", Some(b"csvlog")).unwrap(), None);
+}
+
+// xlogfuncs.c:717: `WAITS_PER_SECOND * wait_seconds` is int arithmetic under
+// -fwrapv, so a huge wait_seconds wraps negative and the wait loop runs zero
+// times (WARNING + false), never a crash.
+#[test]
+fn pg_promote_wait_loop_bound_wraps_like_c() {
+    assert_eq!(crate::builtins::promote_wait_iterations(300), 3000);
+    assert_eq!(crate::builtins::promote_wait_iterations(300_000_000), 3_000_000_000u32 as i32);
+    assert!(crate::builtins::promote_wait_iterations(i32::MAX) < 0);
+}
+
+// pg_input_is_valid_common (misc.c:792-794) hands text_to_cstring(typname)
+// to parseTypeString verbatim. pgrust's parser takes &str, so a typname that
+// is not UTF-8 (only reachable in a SQL_ASCII database) is the UTF-8-only
+// carve's typed refusal (docs/design/carve-ratifications.md §11, the tcop
+// gate's non_utf8_query_error bytes), never a lossy U+FFFD substitution.
+#[test]
+fn input_is_valid_non_utf8_typname_is_the_ratified_refusal() {
+    let ctx = MemoryContext::new("t");
+    let mut fcinfo = LocalFcinfo::<2>::new(0);
+    // SAFETY: mcx outlives the call.
+    unsafe { fcinfo.set_result_mcx(ctx.mcx()) };
+    let val = varlena::cstring_to_text(ctx.mcx(), b"1").unwrap();
+    let typ = varlena::cstring_to_text(ctx.mcx(), b"\"zz\xe9\"").unwrap();
+    fcinfo.set_arg(0, Datum::from_usize(val.as_bytes().as_ptr() as usize));
+    fcinfo.set_arg(1, Datum::from_usize(typ.as_bytes().as_ptr() as usize));
+    let mut flinfo = FmgrInfo::new(crate::fc_pg_input_is_valid, 8050, 2, true, false);
+    let e = crate::fc_pg_input_is_valid(Some(&mut flinfo), &mut fcinfo).unwrap_err();
+    assert_eq!(
+        e.sqlstate(),
+        types_error::make_sqlstate(*b"0A000"),
+        "ERRCODE_FEATURE_NOT_SUPPORTED"
+    );
+    assert_eq!(
+        e.message(),
+        format!(
+            "query strings with non-ASCII characters are not supported yet in databases \
+             with encoding \"{}\"",
+            mbutils::GetDatabaseEncodingName()
+        )
+    );
+    assert_eq!(e.hint(), Some("Use a database with encoding \"UTF8\"."));
+}

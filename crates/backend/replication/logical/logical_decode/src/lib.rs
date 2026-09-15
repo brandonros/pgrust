@@ -1,0 +1,1935 @@
+#![allow(non_snake_case)]
+#![allow(non_upper_case_globals)]
+#![allow(non_camel_case_types)]
+
+use elog::{elog, ereport};
+use logical::{filter_by_origin_cb_wrapper, LogicalDecodingContext};
+use mcx::{Mcx, MemoryContext, PgVec};
+use reorderbuffer::{ReorderBufferChange, ReorderBufferChangeData, ReorderBufferChangeType};
+use snapbuild::SnapBuildState;
+use types_core::{
+    InvalidOid, Oid, RepOriginId, TimestampTz, TransactionId, TransactionIdIsValid, XLogRecPtr,
+};
+use types_error::{ErrorLocation, PgError, PgResult, ERRCODE_DATA_CORRUPTED, ERROR, FATAL};
+use types_storage::{RelFileLocator, SharedInvalidationMessage};
+use types_tuple::{BlockIdData, ItemPointerData, SizeofHeapTupleHeader};
+use xact::{
+    parse_abort_record, parse_commit_record, XACT_XINFO_HAS_ORIGIN, XLOG_XACT_ABORT,
+    XLOG_XACT_ABORT_PREPARED, XLOG_XACT_ASSIGNMENT, XLOG_XACT_COMMIT, XLOG_XACT_COMMIT_PREPARED,
+    XLOG_XACT_INVALIDATIONS, XLOG_XACT_OPMASK, XLOG_XACT_PREPARE,
+};
+use xlogreader::LocalPageRead;
+
+const InvalidXLogRecPtr: XLogRecPtr = 0;
+
+const RM_XLOG_ID: u8 = 0;
+const RM_XACT_ID: u8 = 1;
+const RM_STANDBY_ID: u8 = 8;
+const RM_HEAP2_ID: u8 = 9;
+const RM_HEAP_ID: u8 = 10;
+const RM_LOGICALMSG_ID: u8 = 21;
+
+const XLR_INFO_MASK: u8 = 0x0F;
+
+// heapam_xlog.h layout constants (private in the heapam_xlog crate).
+const XLOG_HEAP_OPMASK: u8 = 0x70;
+const XLOG_HEAP_INSERT: u8 = 0x00;
+const XLOG_HEAP_DELETE: u8 = 0x10;
+const XLOG_HEAP_UPDATE: u8 = 0x20;
+const XLOG_HEAP_TRUNCATE: u8 = 0x30;
+const XLOG_HEAP_HOT_UPDATE: u8 = 0x40;
+const XLOG_HEAP_CONFIRM: u8 = 0x50;
+const XLOG_HEAP_LOCK: u8 = 0x60;
+const XLOG_HEAP_INPLACE: u8 = 0x70;
+const XLOG_HEAP2_REWRITE: u8 = 0x00;
+const XLOG_HEAP2_PRUNE_ON_ACCESS: u8 = 0x10;
+const XLOG_HEAP2_PRUNE_VACUUM_SCAN: u8 = 0x20;
+const XLOG_HEAP2_PRUNE_VACUUM_CLEANUP: u8 = 0x30;
+const XLOG_HEAP2_VISIBLE: u8 = 0x40;
+const XLOG_HEAP2_MULTI_INSERT: u8 = 0x50;
+const XLOG_HEAP2_LOCK_UPDATED: u8 = 0x60;
+const XLOG_HEAP2_NEW_CID: u8 = 0x70;
+
+const XLH_INSERT_LAST_IN_MULTI: u8 = 1 << 1;
+const XLH_INSERT_IS_SPECULATIVE: u8 = 1 << 2;
+const XLH_INSERT_CONTAINS_NEW_TUPLE: u8 = 1 << 3;
+const XLH_INSERT_ON_TOAST_RELATION: u8 = 1 << 4;
+const XLH_UPDATE_CONTAINS_OLD_TUPLE: u8 = 1 << 2;
+const XLH_UPDATE_CONTAINS_OLD_KEY: u8 = 1 << 3;
+const XLH_UPDATE_CONTAINS_NEW_TUPLE: u8 = 1 << 4;
+const XLH_DELETE_CONTAINS_OLD_TUPLE: u8 = 1 << 1;
+const XLH_DELETE_CONTAINS_OLD_KEY: u8 = 1 << 2;
+const XLH_DELETE_IS_SUPER: u8 = 1 << 3;
+const XLH_TRUNCATE_CASCADE: u8 = 1 << 0;
+const XLH_TRUNCATE_RESTART_SEQS: u8 = 1 << 1;
+
+const SizeOfHeapInsert: usize = 3;
+const SizeOfHeapDelete: usize = 8;
+const SizeOfHeapUpdate: usize = 14;
+const SizeOfHeapHeader: usize = 5;
+const SizeOfHeapTruncate: usize = 12;
+// xl_heap_multi_insert: offsetof(offsets) == flags(1) + pad(1) + ntuples(2).
+const SizeOfHeapMultiInsert: usize = 4;
+const SizeOfMultiInsertTuple: usize = 7;
+
+const XLOG_LOGICAL_MESSAGE: u8 = 0x00;
+const XLOG_STANDBY_LOCK: u8 = 0x00;
+const XLOG_RUNNING_XACTS: u8 = 0x10;
+const XLOG_INVALIDATIONS: u8 = 0x20;
+
+// decode.c:175: the catchable ERROR raised when a standby decoding WAL sees
+// the primary's wal_level drop below logical.
+#[cold]
+#[inline(never)]
+fn wal_level_below_logical_on_primary() -> Box<types_error::PgError> {
+    Box::new(
+        types_error::PgError::error(
+            "logical decoding on standby requires \"wal_level\" >= \"logical\" on the primary"
+                .to_string(),
+        )
+        .with_sqlstate(types_error::ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+    )
+}
+
+thread_local! {
+    // Truncate relid arrays outlive the decode call inside ReorderBuffer changes.
+    static DECODE_CTX: &'static MemoryContext =
+        ::mcx::session_root("LogicalDecode");
+}
+
+fn decode_mcx() -> Mcx<'static> {
+    DECODE_CTX.with(|c| c.mcx())
+}
+
+#[derive(Clone, Copy)]
+struct XLogRecordBuffer {
+    origptr: XLogRecPtr,
+    endptr: XLogRecPtr,
+}
+
+fn here(function: &'static str) -> ErrorLocation {
+    ErrorLocation::new(file!(), line!() as i32, function)
+}
+
+fn u16_at(data: &[u8], off: usize) -> u16 {
+    u16::from_ne_bytes(data[off..off + 2].try_into().expect("in bounds"))
+}
+
+fn u32_at(data: &[u8], off: usize) -> u32 {
+    u32::from_ne_bytes(data[off..off + 4].try_into().expect("in bounds"))
+}
+
+fn u64_at(data: &[u8], off: usize) -> u64 {
+    u64::from_ne_bytes(data[off..off + 8].try_into().expect("in bounds"))
+}
+
+pub fn LogicalDecodingProcessRecord(ctx: &mut LogicalDecodingContext) -> PgResult<()> {
+    let buf = XLogRecordBuffer {
+        origptr: ctx.reader.v.ReadRecPtr,
+        endptr: ctx.reader.v.EndRecPtr,
+    };
+
+    // Mirror ReorderBufferCanStartStreaming's decoding-context half into the
+    // buffer before dispatch (reorderbuffer.c:4285): a consistent snapshot
+    // that does not skip the record being decoded. Eviction mid-record reads
+    // this instead of reaching the builder across the crate boundary.
+    ctx.reorder.streaming_ready = ctx.snapshot_builder.current_state()
+        == snapbuild::SnapBuildState::Consistent
+        && !ctx.snapshot_builder.xact_needs_skip(buf.origptr);
+
+    let txid = ctx.reader.XLogRecGetTopXid();
+    if TransactionIdIsValid(txid) {
+        let xid = ctx.reader.XLogRecGetXid();
+        ctx.reorder.assign_child(txid, xid, buf.origptr);
+    }
+
+    // C 18.3 dispatches via the rmgr table's rm_decode; matching on rmid here
+    // avoids an rmgr -> logical_decode dependency inversion.
+    match ctx.reader.XLogRecGetRmid() {
+        RM_XLOG_ID => xlog_decode(ctx, buf),
+        RM_XACT_ID => xact_decode(ctx, buf),
+        RM_STANDBY_ID => standby_decode(ctx, buf),
+        RM_HEAP2_ID => heap2_decode(ctx, buf),
+        RM_HEAP_ID => heap_decode(ctx, buf),
+        RM_LOGICALMSG_ID => logicalmsg_decode(ctx, buf),
+        _ => {
+            let xid = ctx.reader.XLogRecGetXid();
+            ctx.reorder.process_xid(xid, buf.origptr);
+            Ok(())
+        }
+    }
+}
+
+// xlog_internal.h: xl_parameter_change lays five leading ints (MaxConnections,
+// max_worker_processes, max_wal_senders, max_prepared_xacts, max_locks_per_xact)
+// ahead of wal_level, so wal_level (int) sits at offset 20. Reading it requires
+// the record body to hold at least offset(wal_level) + sizeof(int) bytes.
+const OFFSET_OF_XL_PARAMETER_CHANGE_WAL_LEVEL: usize = 20;
+const MIN_SIZE_OF_XL_PARAMETER_CHANGE: usize = OFFSET_OF_XL_PARAMETER_CHANGE_WAL_LEVEL + 4;
+
+// Ensure the record body holds xl_parameter_change through its wal_level field
+// before reading at a fixed offset. The record body is attacker-controlled WAL
+// content under the hostile-WAL trust boundary, so a short record must become a
+// catchable ERROR rather than an out-of-bounds slice panic (xlog_internal.h).
+fn validate_parameter_change_len(data_len: usize) -> PgResult<()> {
+    if data_len < MIN_SIZE_OF_XL_PARAMETER_CHANGE {
+        return Err(ereport(ERROR)
+            .errcode(ERRCODE_DATA_CORRUPTED)
+            .errmsg(format!(
+                "XLOG_PARAMETER_CHANGE record with main data length {data_len} is too short"
+            ))
+            .finish(here("xlog_decode"))
+            .err()
+            .unwrap());
+    }
+    Ok(())
+}
+
+fn xlog_decode(ctx: &mut LogicalDecodingContext, buf: XLogRecordBuffer) -> PgResult<()> {
+    let info = ctx.reader.XLogRecGetInfo() & !XLR_INFO_MASK;
+    let xid = ctx.reader.XLogRecGetXid();
+    ctx.reorder.process_xid(xid, buf.origptr);
+
+    match info {
+        transam_xlog::XLOG_CHECKPOINT_SHUTDOWN | transam_xlog::XLOG_END_OF_RECOVERY => {
+            ctx.snapshot_builder
+                .serialization_point(&mut ctx.reorder, buf.origptr)?;
+        }
+        transam_xlog::XLOG_CHECKPOINT_ONLINE => {}
+        transam_xlog::XLOG_PARAMETER_CHANGE => {
+            // xl_parameter_change.wal_level is at offset 20. If wal_level on
+            // the primary is reduced to less than logical, prevent existing
+            // logical slots from being used (decode.c:167-177). Validate the
+            // record body is large enough for the fixed struct through wal_level
+            // before the fixed-offset read, so hostile short WAL raises a
+            // catchable ERROR instead of an out-of-bounds slice panic.
+            let data = ctx.reader.XLogRecGetData();
+            validate_parameter_change_len(data.len())?;
+            let wal_level = u32_at(data, OFFSET_OF_XL_PARAMETER_CHANGE_WAL_LEVEL) as i32;
+            if wal_level < transam_xlog::WAL_LEVEL_LOGICAL {
+                // This can occur only on a standby: a primary would not allow
+                // a restart with wal_level < logical while a pre-existing
+                // logical slot exists.
+                debug_assert!(transam_xlog::RecoveryInProgress());
+                return Err(wal_level_below_logical_on_primary());
+            }
+        }
+        transam_xlog::XLOG_NOOP
+        | transam_xlog::XLOG_NEXTOID
+        | transam_xlog::XLOG_SWITCH
+        | transam_xlog::XLOG_BACKUP_END
+        | transam_xlog::XLOG_RESTORE_POINT
+        | transam_xlog::XLOG_FPW_CHANGE
+        | transam_xlog::XLOG_FPI_FOR_HINT
+        | transam_xlog::XLOG_FPI
+        | transam_xlog::XLOG_OVERWRITE_CONTRECORD
+        | transam_xlog::XLOG_CHECKPOINT_REDO => {}
+        _ => return elog(ERROR, format!("unexpected RM_XLOG_ID record type: {info}")),
+    }
+    Ok(())
+}
+
+fn xact_decode(ctx: &mut LogicalDecodingContext, buf: XLogRecordBuffer) -> PgResult<()> {
+    let info = ctx.reader.XLogRecGetInfo() & XLOG_XACT_OPMASK;
+
+    if ctx.snapshot_builder.current_state() < SnapBuildState::FullSnapshot {
+        return Ok(());
+    }
+
+    match info {
+        XLOG_XACT_COMMIT | XLOG_XACT_COMMIT_PREPARED => {
+            let parsed =
+                parse_commit_record(ctx.reader.XLogRecGetInfo(), ctx.reader.XLogRecGetData())?;
+            let xid = if !TransactionIdIsValid(parsed.twophase_xid) {
+                ctx.reader.XLogRecGetXid()
+            } else {
+                parsed.twophase_xid
+            };
+            let two_phase = if info == XLOG_XACT_COMMIT_PREPARED {
+                !FilterPrepare(ctx, xid, &parsed.twophase_gid)?
+            } else {
+                false
+            };
+            DecodeCommit(ctx, buf, &parsed, xid, two_phase)?;
+        }
+        XLOG_XACT_ABORT | XLOG_XACT_ABORT_PREPARED => {
+            let parsed =
+                parse_abort_record(ctx.reader.XLogRecGetInfo(), ctx.reader.XLogRecGetData())?;
+            let xid = if !TransactionIdIsValid(parsed.twophase_xid) {
+                ctx.reader.XLogRecGetXid()
+            } else {
+                parsed.twophase_xid
+            };
+            let two_phase = if info == XLOG_XACT_ABORT_PREPARED {
+                !FilterPrepare(ctx, xid, &parsed.twophase_gid)?
+            } else {
+                false
+            };
+            DecodeAbort(ctx, buf, &parsed, xid, two_phase)?;
+        }
+        XLOG_XACT_ASSIGNMENT => {}
+        XLOG_XACT_INVALIDATIONS => {
+            let xid = ctx.reader.XLogRecGetXid();
+            let msgs = parse_xact_invals(ctx.reader.XLogRecGetData())?;
+            if TransactionIdIsValid(xid) {
+                if !ctx.fast_forward {
+                    ctx.reorder.add_invalidations(xid, buf.origptr, &msgs)?;
+                }
+                ctx.reorder.xid_set_catalog_changes(xid, buf.origptr);
+            } else if !ctx.fast_forward {
+                ctx.reorder.immediate_invalidation(&msgs)?;
+            }
+        }
+        XLOG_XACT_PREPARE => {
+            let parsed =
+                xact::parse_prepare_record(ctx.reader.XLogRecGetInfo(), ctx.reader.XLogRecGetData())?;
+
+            // Process the transaction in a two-phase manner iff the output
+            // plugin supports two-phase commits and doesn't filter the
+            // transaction at prepare time.
+            if FilterPrepare(ctx, parsed.twophase_xid, &parsed.twophase_gid)? {
+                ctx.reorder.process_xid(parsed.twophase_xid, buf.origptr);
+            } else {
+                DecodePrepare(ctx, buf, &parsed)?;
+            }
+        }
+        _ => return elog(ERROR, format!("unexpected RM_XACT_ID record type: {info}")),
+    }
+    Ok(())
+}
+
+// xl_xact_invals: int nmsgs; SharedInvalidationMessage msgs[]. The fixed
+// header is a single 4-byte int ahead of the flexible msgs[] array.
+const SIZE_OF_XACT_INVALS: usize = 4;
+
+// Bound the attacker-controlled nmsgs against the record body before allocating
+// or looping. The record body is attacker-controlled WAL content under the
+// hostile-WAL trust boundary: validate it holds the fixed header (so the nmsgs
+// read is in bounds), then that the declared nmsgs SharedInvalidationMessage
+// entries actually fit in the remaining bytes, using checked arithmetic so a
+// huge count cannot wrap past the bound. A violation becomes a catchable
+// ERROR instead of a huge allocation or an out-of-bounds slice panic
+// (xact.h xl_xact_invals). Returns the validated nmsgs on success.
+fn validate_xact_invals(data_len: usize, nmsgs: usize) -> PgResult<()> {
+    const MSG_SIZE: usize = types_storage::SHARED_INVALIDATION_MESSAGE_SIZE;
+    let fits = nmsgs
+        .checked_mul(MSG_SIZE)
+        .and_then(|n| n.checked_add(SIZE_OF_XACT_INVALS))
+        .is_some_and(|needed| needed <= data_len);
+    if !fits {
+        return Err(ereport(ERROR)
+            .errcode(ERRCODE_DATA_CORRUPTED)
+            .errmsg(format!(
+                "XLOG_XACT_INVALIDATIONS record declares nmsgs={nmsgs} \
+                 but main data length {data_len} is too short"
+            ))
+            .finish(here("xact_decode"))
+            .err()
+            .unwrap());
+    }
+    Ok(())
+}
+
+// xl_xact_invals: int nmsgs; SharedInvalidationMessage msgs[].
+fn parse_xact_invals(data: &[u8]) -> PgResult<Vec<SharedInvalidationMessage>> {
+    const MSG_SIZE: usize = types_storage::SHARED_INVALIDATION_MESSAGE_SIZE;
+    // Validate the record body holds the fixed header before reading nmsgs, then
+    // bound the declared count against the remaining body, before allocating or
+    // looping. Both checks turn hostile WAL into a catchable ERROR.
+    if data.len() < SIZE_OF_XACT_INVALS {
+        return Err(ereport(ERROR)
+            .errcode(ERRCODE_DATA_CORRUPTED)
+            .errmsg(format!(
+                "XLOG_XACT_INVALIDATIONS record with main data length {} is too short",
+                data.len()
+            ))
+            .finish(here("xact_decode"))
+            .err()
+            .unwrap());
+    }
+    let nmsgs = u32_at(data, 0) as usize;
+    validate_xact_invals(data.len(), nmsgs)?;
+
+    // nmsgs is now bounded by the record body, so the reservation is bounded;
+    // use try_reserve so an allocation failure is a catchable ERROR rather than
+    // a deterministic allocator abort.
+    let mut msgs: Vec<SharedInvalidationMessage> = Vec::new();
+    msgs.try_reserve(nmsgs).map_err(|_| {
+        ereport(ERROR)
+            .errcode(ERRCODE_DATA_CORRUPTED)
+            .errmsg(format!(
+                "XLOG_XACT_INVALIDATIONS record with nmsgs={nmsgs} could not be allocated"
+            ))
+            .finish(here("xact_decode"))
+            .err()
+            .unwrap()
+    })?;
+    let mut off = SIZE_OF_XACT_INVALS;
+    for _ in 0..nmsgs {
+        let bytes: [u8; MSG_SIZE] = data[off..off + MSG_SIZE].try_into().expect("in bounds");
+        // C stores the message array verbatim at decode; an unrecognized id
+        // only trips elog(FATAL, "unrecognized SI message ID: %d") when the
+        // message is later executed (inval.c LocalExecuteInvalidationMessage).
+        // pgrust parses eagerly, so match that FATAL here rather than panicking
+        // with a Rust unwind on hostile/corrupt WAL.
+        let msg = match SharedInvalidationMessage::from_wire_bytes(bytes) {
+            Some(msg) => msg,
+            None => {
+                return Err(Box::new(PgError::new(
+                    FATAL,
+                    format!("unrecognized SI message ID: {}", bytes[0] as i8),
+                )))
+            }
+        };
+        msgs.push(msg);
+        off += MSG_SIZE;
+    }
+    Ok(msgs)
+}
+
+// standbydefs.h: the fixed xl_running_xacts header ends where the xids[]
+// flexible array begins, offsetof(xl_running_xacts, xids) == 24.
+const MIN_SIZE_OF_XL_RUNNING_XACTS: usize = 24;
+
+// Ensure the record body holds the fixed xl_running_xacts header, returning the
+// maximum number of TransactionId (4-byte) entries the remaining body can hold.
+fn validate_running_xacts_header(data_len: usize) -> PgResult<usize> {
+    if data_len < MIN_SIZE_OF_XL_RUNNING_XACTS {
+        return Err(ereport(ERROR)
+            .errcode(ERRCODE_DATA_CORRUPTED)
+            .errmsg(format!(
+                "XLOG_RUNNING_XACTS record with main data length {data_len} is too short"
+            ))
+            .finish(here("standby_decode"))
+            .err().unwrap());
+    }
+    Ok((data_len - MIN_SIZE_OF_XL_RUNNING_XACTS) / 4)
+}
+
+// Bound the attacker-controlled xcnt/subxcnt against the record body using
+// checked arithmetic; returns the validated total xid count (xcnt + subxcnt).
+fn validate_running_xacts_total(
+    data_len: usize,
+    max_xids: usize,
+    xcnt: u32,
+    subxcnt: u32,
+) -> PgResult<usize> {
+    match (xcnt as usize).checked_add(subxcnt as usize) {
+        Some(total) if total <= max_xids => Ok(total),
+        _ => Err(ereport(ERROR)
+            .errcode(ERRCODE_DATA_CORRUPTED)
+            .errmsg(format!(
+                "XLOG_RUNNING_XACTS record declares xcnt={xcnt} subxcnt={subxcnt} \
+                 but main data length {data_len} holds at most {max_xids} xids"
+            ))
+            .finish(here("standby_decode"))
+            .err().unwrap()),
+    }
+}
+
+fn standby_decode(ctx: &mut LogicalDecodingContext, buf: XLogRecordBuffer) -> PgResult<()> {
+    let info = ctx.reader.XLogRecGetInfo() & !XLR_INFO_MASK;
+    let xid = ctx.reader.XLogRecGetXid();
+    ctx.reorder.process_xid(xid, buf.origptr);
+
+    match info {
+        XLOG_RUNNING_XACTS => {
+            // xl_running_xacts main-data layout (standbydefs.h). The fixed
+            // header ends where the xids[] flexible array begins:
+            // offsetof(xl_running_xacts, xids) == 24 (MinSizeOfXlRunningXacts).
+            let data = ctx.reader.XLogRecGetData();
+            // The xcnt/subxcnt counters are attacker-controlled WAL content
+            // under the hostile-WAL trust boundary. Validate the record body is
+            // large enough for the fixed header, and that the declared xid
+            // arrays actually fit in the remaining bytes, before allocating or
+            // reading anything sized by those counts. This mirrors C reading a
+            // fixed xl_running_xacts and bounds the counts against the record
+            // size, turning malformed WAL into a catchable ERROR instead of a
+            // huge allocation, an out-of-bounds read, or an arithmetic panic.
+            // Require the full fixed header (>= 24 bytes) up front so every
+            // subsequent fixed-offset read below is in bounds; then bound the
+            // declared xid counts against the record body.
+            let max_xids = validate_running_xacts_header(data.len())?;
+            let xcnt = u32_at(data, 0);
+            let subxcnt = u32_at(data, 4);
+            let total = validate_running_xacts_total(data.len(), max_xids, xcnt, subxcnt)?;
+            let subxid_overflow = data[8] != 0;
+            let next_xid = u32_at(data, 12);
+            let oldest_running_xid = u32_at(data, 16);
+            let latest_completed_xid = u32_at(data, 20);
+            let mut xids: Vec<TransactionId> = Vec::with_capacity(total);
+            for i in 0..total {
+                xids.push(u32_at(data, 24 + i * 4));
+            }
+            let running = snapbuild::XlRunningXacts {
+                xcnt,
+                subxcnt,
+                subxid_overflow,
+                next_xid,
+                oldest_running_xid,
+                latest_completed_xid,
+                xids: &xids,
+            };
+            ctx.snapshot_builder
+                .process_running_xacts(&mut ctx.reorder, buf.origptr, &running)?;
+            ctx.reorder.abort_old(oldest_running_xid)?;
+        }
+        XLOG_STANDBY_LOCK => {}
+        XLOG_INVALIDATIONS => {}
+        _ => {
+            return elog(
+                ERROR,
+                format!("unexpected RM_STANDBY_ID record type: {info}"),
+            )
+        }
+    }
+    Ok(())
+}
+
+fn heap2_decode(ctx: &mut LogicalDecodingContext, buf: XLogRecordBuffer) -> PgResult<()> {
+    let info = ctx.reader.XLogRecGetInfo() & XLOG_HEAP_OPMASK;
+    let xid = ctx.reader.XLogRecGetXid();
+    ctx.reorder.process_xid(xid, buf.origptr);
+
+    if ctx.snapshot_builder.current_state() < SnapBuildState::FullSnapshot {
+        return Ok(());
+    }
+
+    match info {
+        XLOG_HEAP2_MULTI_INSERT => {
+            if ctx
+                .snapshot_builder
+                .process_change(&mut ctx.reorder, xid, buf.origptr)
+                && !ctx.fast_forward
+            {
+                DecodeMultiInsert(ctx, buf)?;
+            }
+        }
+        XLOG_HEAP2_NEW_CID => {
+            if !ctx.fast_forward {
+                // parse_new_cid reads xl_heap_new_cid at fixed offsets through
+                // its target_tid field. The record body is attacker-controlled
+                // WAL content under the hostile-WAL trust boundary, so validate
+                // it holds the full fixed struct before the fixed-offset reads,
+                // turning a short record into a catchable ERROR instead of an
+                // out-of-bounds slice panic (heapam_xlog.h xl_heap_new_cid).
+                let data = ctx.reader.XLogRecGetData();
+                validate_new_cid_len(data.len())?;
+                let xlrec = parse_new_cid(data);
+                ctx.snapshot_builder
+                    .process_new_cid(&mut ctx.reorder, xid, buf.origptr, &xlrec)?;
+            }
+        }
+        XLOG_HEAP2_REWRITE
+        | XLOG_HEAP2_PRUNE_ON_ACCESS
+        | XLOG_HEAP2_PRUNE_VACUUM_SCAN
+        | XLOG_HEAP2_PRUNE_VACUUM_CLEANUP
+        | XLOG_HEAP2_VISIBLE
+        | XLOG_HEAP2_LOCK_UPDATED => {}
+        _ => return elog(ERROR, format!("unexpected RM_HEAP2_ID record type: {info}")),
+    }
+    Ok(())
+}
+
+// heapam_xlog.h: SizeOfHeapNewCid == offsetof(xl_heap_new_cid, target_tid) +
+// sizeof(ItemPointerData). The fixed struct is top_xid(4) + cmin(4) + cmax(4) +
+// combocid(4) + target_locator(12) + target_tid(6) == 34 bytes, unpadded on
+// disk. parse_new_cid reads through target_tid at fixed offsets, so the record
+// body must hold at least this many bytes.
+const SIZE_OF_HEAP_NEW_CID: usize = 34;
+
+// Ensure the record body holds the fixed xl_heap_new_cid struct before reading
+// at fixed offsets. The record body is attacker-controlled WAL content under
+// the hostile-WAL trust boundary, so a short record must become a catchable
+// ERROR rather than an out-of-bounds slice panic (heapam_xlog.h).
+fn validate_new_cid_len(data_len: usize) -> PgResult<()> {
+    if data_len < SIZE_OF_HEAP_NEW_CID {
+        return Err(ereport(ERROR)
+            .errcode(ERRCODE_DATA_CORRUPTED)
+            .errmsg(format!(
+                "XLOG_HEAP2_NEW_CID record with main data length {data_len} is too short"
+            ))
+            .finish(here("heap2_decode"))
+            .err()
+            .unwrap());
+    }
+    Ok(())
+}
+
+// xl_heap_new_cid main-data layout (34 bytes, unpadded on disk).
+fn parse_new_cid(data: &[u8]) -> heapam_xlog::XlHeapNewCid {
+    heapam_xlog::XlHeapNewCid {
+        top_xid: u32_at(data, 0),
+        cmin: u32_at(data, 4),
+        cmax: u32_at(data, 8),
+        combocid: u32_at(data, 12),
+        target_locator: RelFileLocator {
+            spcOid: u32_at(data, 16),
+            dbOid: u32_at(data, 20),
+            relNumber: u32_at(data, 24),
+        },
+        target_tid: ItemPointerData {
+            ip_blkid: BlockIdData {
+                bi_hi: u16_at(data, 28),
+                bi_lo: u16_at(data, 30),
+            },
+            ip_posid: u16_at(data, 32),
+        },
+    }
+}
+
+fn heap_decode(ctx: &mut LogicalDecodingContext, buf: XLogRecordBuffer) -> PgResult<()> {
+    let info = ctx.reader.XLogRecGetInfo() & XLOG_HEAP_OPMASK;
+    let xid = ctx.reader.XLogRecGetXid();
+    ctx.reorder.process_xid(xid, buf.origptr);
+
+    if ctx.snapshot_builder.current_state() < SnapBuildState::FullSnapshot {
+        return Ok(());
+    }
+
+    match info {
+        XLOG_HEAP_INSERT => {
+            if ctx
+                .snapshot_builder
+                .process_change(&mut ctx.reorder, xid, buf.origptr)
+                && !ctx.fast_forward
+            {
+                DecodeInsert(ctx, buf)?;
+            }
+        }
+        XLOG_HEAP_HOT_UPDATE | XLOG_HEAP_UPDATE => {
+            if ctx
+                .snapshot_builder
+                .process_change(&mut ctx.reorder, xid, buf.origptr)
+                && !ctx.fast_forward
+            {
+                DecodeUpdate(ctx, buf)?;
+            }
+        }
+        XLOG_HEAP_DELETE => {
+            if ctx
+                .snapshot_builder
+                .process_change(&mut ctx.reorder, xid, buf.origptr)
+                && !ctx.fast_forward
+            {
+                DecodeDelete(ctx, buf)?;
+            }
+        }
+        XLOG_HEAP_TRUNCATE => {
+            if ctx
+                .snapshot_builder
+                .process_change(&mut ctx.reorder, xid, buf.origptr)
+                && !ctx.fast_forward
+            {
+                DecodeTruncate(ctx, buf)?;
+            }
+        }
+        XLOG_HEAP_INPLACE => {}
+        XLOG_HEAP_CONFIRM => {
+            if ctx
+                .snapshot_builder
+                .process_change(&mut ctx.reorder, xid, buf.origptr)
+                && !ctx.fast_forward
+            {
+                DecodeSpecConfirm(ctx, buf)?;
+            }
+        }
+        XLOG_HEAP_LOCK => {}
+        _ => return elog(ERROR, format!("unexpected RM_HEAP_ID record type: {info}")),
+    }
+    Ok(())
+}
+
+// Ask the output plugin whether we want to skip this PREPARE and send this
+// transaction as a regular commit later (decode.c:551).
+fn FilterPrepare(
+    ctx: &mut LogicalDecodingContext,
+    xid: TransactionId,
+    gid: &[u8],
+) -> PgResult<bool> {
+    // Skip if decoding of two-phase transactions at PREPARE time is not
+    // enabled. In that case, all two-phase transactions are considered
+    // filtered out and will be applied as regular transactions at COMMIT
+    // PREPARED.
+    if !ctx.opc().twophase {
+        return Ok(true);
+    }
+
+    // The filter_prepare callback is optional. When not supplied, all
+    // prepared transactions should go through.
+    if ctx.opc().callbacks.filter_prepare_cb.is_none() {
+        return Ok(false);
+    }
+
+    let gid = String::from_utf8_lossy(gid).into_owned();
+    logical::filter_prepare_cb_wrapper(ctx.opc(), xid, &gid)
+}
+
+fn FilterByOrigin(ctx: &mut LogicalDecodingContext, origin_id: RepOriginId) -> PgResult<bool> {
+    if ctx.opc().callbacks.filter_by_origin_cb.is_none() {
+        return Ok(false);
+    }
+    filter_by_origin_cb_wrapper(ctx.opc(), origin_id)
+}
+
+// message.h: SizeOfLogicalMessage == offsetof(xl_logical_message, message).
+// The fixed header is dbId(4) + transactional(1) + 3 bytes padding to align
+// Size + prefix_size(8) + message_size(8) == 24 bytes, laid out unpadded at
+// the front of the record body. logicalmsg_decode reads dbId/transactional and
+// the two Size lengths at fixed offsets, so the record body must hold at least
+// this many bytes.
+const SIZE_OF_LOGICAL_MESSAGE: usize = 24;
+
+// Ensure the record body holds the fixed xl_logical_message header before any
+// fixed-offset read. The record body is attacker-controlled WAL content under
+// the hostile-WAL trust boundary, so a short record must become a catchable
+// ERROR rather than an out-of-bounds slice panic (message.h xl_logical_message).
+fn validate_logical_message_header(data_len: usize) -> PgResult<()> {
+    if data_len < SIZE_OF_LOGICAL_MESSAGE {
+        return Err(ereport(ERROR)
+            .errcode(ERRCODE_DATA_CORRUPTED)
+            .errmsg(format!(
+                "XLOG_LOGICAL_MESSAGE record with main data length {data_len} is too short"
+            ))
+            .finish(here("logicalmsg_decode"))
+            .err()
+            .unwrap());
+    }
+    Ok(())
+}
+
+// Bound the attacker-controlled prefix_size/message_size against the record
+// body before slicing the payload. The prefix is a NUL-terminated string, so
+// prefix_size must be at least 1, and the fixed header plus the prefix and
+// message bytes must fit within the record body. All additions are overflow
+// checked so a declared length near usize::MAX cannot wrap to a small value and
+// slip past the bound; a violation becomes a catchable ERROR instead of an
+// out-of-bounds slice or arithmetic-underflow panic (message.h
+// xl_logical_message).
+fn validate_logical_message_payload(
+    data_len: usize,
+    prefix_size: usize,
+    message_size: usize,
+) -> PgResult<()> {
+    let fits = prefix_size >= 1
+        && SIZE_OF_LOGICAL_MESSAGE
+            .checked_add(prefix_size)
+            .and_then(|n| n.checked_add(message_size))
+            .is_some_and(|needed| needed <= data_len);
+    if !fits {
+        return Err(ereport(ERROR)
+            .errcode(ERRCODE_DATA_CORRUPTED)
+            .errmsg(format!(
+                "XLOG_LOGICAL_MESSAGE record declares prefix_size={prefix_size} \
+                 message_size={message_size} but main data length {data_len} is too short"
+            ))
+            .finish(here("logicalmsg_decode"))
+            .err()
+            .unwrap());
+    }
+    Ok(())
+}
+
+fn logicalmsg_decode(ctx: &mut LogicalDecodingContext, buf: XLogRecordBuffer) -> PgResult<()> {
+    let info = ctx.reader.XLogRecGetInfo() & !XLR_INFO_MASK;
+    if info != XLOG_LOGICAL_MESSAGE {
+        return elog(
+            ERROR,
+            format!("unexpected RM_LOGICALMSG_ID record type: {info}"),
+        );
+    }
+
+    let xid = ctx.reader.XLogRecGetXid();
+    let origin_id = ctx.reader.XLogRecGetOrigin();
+    ctx.reorder.process_xid(xid, buf.origptr);
+
+    if ctx.snapshot_builder.current_state() < SnapBuildState::FullSnapshot {
+        return Ok(());
+    }
+
+    // xl_logical_message: dbId@0, transactional@4, prefix_size@8,
+    // message_size@16, payload@24 (NUL-terminated prefix, then message bytes).
+    // The record body is attacker-controlled WAL content under the hostile-WAL
+    // trust boundary. Validate it holds the fixed header before the fixed-offset
+    // reads, then that the declared prefix/message lengths fit in the remaining
+    // bytes, so malformed WAL raises a catchable ERROR instead of an
+    // out-of-bounds slice or arithmetic panic (message.h xl_logical_message).
+    let data = ctx.reader.XLogRecGetData();
+    validate_logical_message_header(data.len())?;
+    let db_id = u32_at(data, 0);
+    let transactional = data[4] != 0;
+    let prefix_size = u64_at(data, 8) as usize;
+    let message_size = u64_at(data, 16) as usize;
+    validate_logical_message_payload(data.len(), prefix_size, message_size)?;
+
+    if db_id != unsafe { ctx.slot.data.get() }.database || FilterByOrigin(ctx, origin_id)? {
+        return Ok(());
+    }
+
+    if transactional {
+        if !ctx
+            .snapshot_builder
+            .process_change(&mut ctx.reorder, xid, buf.origptr)
+        {
+            return Ok(());
+        }
+    } else if ctx.snapshot_builder.current_state() != SnapBuildState::Consistent
+        || ctx.snapshot_builder.xact_needs_skip(buf.origptr)
+    {
+        return Ok(());
+    }
+
+    if ctx.fast_forward {
+        if !transactional {
+            ctx.processing_required = true;
+        }
+        return Ok(());
+    }
+
+    let snapshot = if !transactional {
+        Some(ctx.snapshot_builder.get_or_build_snapshot())
+    } else {
+        None
+    };
+
+    // Lengths were bounds-checked above, so these ranges are in-bounds; use
+    // checked slicing (.get) to make that guarantee explicit and panic-free.
+    // The prefix is an arbitrary NUL-terminated string in C (decode.c:652),
+    // copied verbatim with no encoding check: a non-UTF-8 prefix (SQL_ASCII /
+    // single-byte databases) is data, never a panic.
+    let data = ctx.reader.XLogRecGetData();
+    let prefix = data
+        .get(24..24 + prefix_size - 1)
+        .expect("prefix bytes validated")
+        .to_vec();
+    let message = data
+        .get(24 + prefix_size..24 + prefix_size + message_size)
+        .expect("message bytes validated")
+        .to_vec();
+    ctx.reorder
+        .queue_message(xid, snapshot, buf.endptr, transactional, &prefix, &message)
+}
+
+fn DecodeCommit(
+    ctx: &mut LogicalDecodingContext,
+    buf: XLogRecordBuffer,
+    parsed: &xact::ParsedCommit,
+    xid: TransactionId,
+    two_phase: bool,
+) -> PgResult<()> {
+    let mut origin_lsn = InvalidXLogRecPtr;
+    let mut commit_time: TimestampTz = parsed.xact_time;
+    let origin_id = ctx.reader.XLogRecGetOrigin();
+
+    if parsed.xinfo & XACT_XINFO_HAS_ORIGIN != 0 {
+        origin_lsn = parsed.origin_lsn;
+        commit_time = parsed.origin_timestamp;
+    }
+
+    ctx.snapshot_builder.commit_txn(
+        &mut ctx.reorder,
+        buf.origptr,
+        xid,
+        &parsed.subxacts,
+        parsed.xinfo,
+    )?;
+
+    if DecodeTXNNeedSkip(ctx, buf, parsed.db_id, origin_id)? {
+        for &subxid in &parsed.subxacts {
+            ctx.reorder.forget(subxid, buf.origptr)?;
+        }
+        ctx.reorder.forget(xid, buf.origptr)?;
+        return Ok(());
+    }
+
+    for &subxid in &parsed.subxacts {
+        ctx.reorder
+            .commit_child(xid, subxid, buf.origptr, buf.endptr);
+    }
+
+    // Send the final commit record if the transaction data is already
+    // decoded, otherwise process the entire transaction.
+    if two_phase {
+        let two_phase_at = ctx.snapshot_builder.get_two_phase_at();
+        let gid = String::from_utf8_lossy(&parsed.twophase_gid).into_owned();
+        ctx.reorder.finish_prepared(
+            xid,
+            buf.origptr,
+            buf.endptr,
+            two_phase_at,
+            commit_time,
+            origin_id,
+            origin_lsn,
+            &gid,
+            true,
+        )?;
+    } else {
+        ctx.reorder.commit(
+            xid,
+            buf.origptr,
+            buf.endptr,
+            commit_time,
+            origin_id,
+            origin_lsn,
+        )?;
+    }
+
+    logical::UpdateDecodingStats(ctx);
+    Ok(())
+}
+
+// Decode PREPARE record (decode.c:763). Similar logic as in DecodeCommit.
+//
+// Note that we don't skip prepare even if we have detected a concurrent
+// abort, because we may have already sent some changes that the subscriber
+// must be able to roll back via prepare + rollback prepared.
+fn DecodePrepare(
+    ctx: &mut LogicalDecodingContext,
+    buf: XLogRecordBuffer,
+    parsed: &xact::ParsedPrepare,
+) -> PgResult<()> {
+    let origin_lsn = parsed.origin_lsn;
+    let mut prepare_time: TimestampTz = parsed.xact_time;
+    let origin_id = ctx.reader.XLogRecGetOrigin();
+    let xid = parsed.twophase_xid;
+
+    if parsed.origin_timestamp != 0 {
+        prepare_time = parsed.origin_timestamp;
+    }
+
+    // Remember the prepare info for the txn so that it can be used later in
+    // commit prepared if required. See ReorderBufferFinishPrepared.
+    if !ctx.reorder.remember_prepare_info(
+        xid,
+        buf.origptr,
+        buf.endptr,
+        prepare_time,
+        origin_id,
+        origin_lsn,
+    ) {
+        return Ok(());
+    }
+
+    // We can't start streaming unless a consistent state is reached.
+    if ctx.snapshot_builder.current_state() < SnapBuildState::Consistent {
+        ctx.reorder.skip_prepare(xid);
+        return Ok(());
+    }
+
+    // Check whether we need to process this transaction. We can't call
+    // ReorderBufferForget as in DecodeCommit: the txn hasn't committed yet
+    // and removing it early could produce an incorrect restart_lsn (see
+    // SnapBuildProcessRunningXacts) — but cache invalidations must run.
+    if DecodeTXNNeedSkip(ctx, buf, parsed.db_id, origin_id)? {
+        ctx.reorder.skip_prepare(xid);
+        ctx.reorder.invalidate(xid, buf.origptr)?;
+        return Ok(());
+    }
+
+    // Tell the reorderbuffer about the surviving subtransactions.
+    for &subxid in &parsed.subxacts {
+        ctx.reorder
+            .commit_child(xid, subxid, buf.origptr, buf.endptr);
+    }
+
+    // Replay actions of all transaction + subtransactions in order.
+    let gid = String::from_utf8_lossy(&parsed.twophase_gid).into_owned();
+    ctx.reorder.prepare(xid, &gid)?;
+
+    logical::UpdateDecodingStats(ctx);
+    Ok(())
+}
+
+fn DecodeAbort(
+    ctx: &mut LogicalDecodingContext,
+    buf: XLogRecordBuffer,
+    parsed: &xact::ParsedAbort,
+    xid: TransactionId,
+    two_phase: bool,
+) -> PgResult<()> {
+    let mut origin_lsn = InvalidXLogRecPtr;
+    let mut abort_time: TimestampTz = parsed.xact_time;
+    let origin_id = ctx.reader.XLogRecGetOrigin();
+
+    if parsed.xinfo & XACT_XINFO_HAS_ORIGIN != 0 {
+        origin_lsn = parsed.origin_lsn;
+        abort_time = parsed.origin_timestamp;
+    }
+
+    let skip_xact = DecodeTXNNeedSkip(ctx, buf, parsed.db_id, origin_id)?;
+
+    // Send the final rollback record for a prepared transaction unless we
+    // need to skip it. For non-two-phase xacts, simply forget the xact.
+    if two_phase && !skip_xact {
+        let gid = String::from_utf8_lossy(&parsed.twophase_gid).into_owned();
+        ctx.reorder.finish_prepared(
+            xid,
+            buf.origptr,
+            buf.endptr,
+            InvalidXLogRecPtr,
+            abort_time,
+            origin_id,
+            origin_lsn,
+            &gid,
+            false,
+        )?;
+    } else {
+        let end = ctx.reader.v.EndRecPtr;
+        for &subxid in &parsed.subxacts {
+            ctx.reorder.abort(subxid, end, abort_time)?;
+        }
+        ctx.reorder.abort(xid, end, abort_time)?;
+    }
+
+    logical::UpdateDecodingStats(ctx);
+    Ok(())
+}
+
+// Build a catchable ERRCODE_DATA_CORRUPTED error for a malformed heap record.
+// The heap decode arms read per-opcode record shapes (fixed struct sizes,
+// attached block 0, self-consistent multi-insert tuple offsets) out of
+// attacker-controlled WAL content under the hostile-WAL trust boundary, so a
+// violation must raise a catchable ERROR rather than panic on an out-of-bounds
+// slice or an arithmetic underflow (heapam_xlog.h struct layouts).
+fn heap_data_corrupted(function: &'static str, msg: String) -> Box<types_error::PgError> {
+    ereport(ERROR)
+        .errcode(ERRCODE_DATA_CORRUPTED)
+        .errmsg(msg)
+        .finish(here(function))
+        .err()
+        .unwrap()
+}
+
+// Verify the record main data holds at least the opcode's fixed struct before
+// any fixed-offset read into it (heapam_xlog.h).
+fn validate_heap_main_data_len(
+    data_len: usize,
+    min_len: usize,
+    record: &'static str,
+    function: &'static str,
+) -> PgResult<()> {
+    if data_len < min_len {
+        return Err(heap_data_corrupted(
+            function,
+            format!("{record} record with main data length {data_len} is too short"),
+        ));
+    }
+    Ok(())
+}
+
+// Verify the attached block 0 data holds at least a xl_heap_header before the
+// tuplelen = block_len - SizeOfHeapHeader subtraction (heapam_xlog.h).
+fn validate_heap_block_header_len(
+    block_len: usize,
+    record: &'static str,
+    function: &'static str,
+) -> PgResult<()> {
+    if block_len < SizeOfHeapHeader {
+        return Err(heap_data_corrupted(
+            function,
+            format!(
+                "{record} record block 0 data length {block_len} is too short for a tuple header"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+// Bound the attacker-controlled nrelids against the record body: the fixed
+// header plus nrelids Oids (4 bytes each) must fit, using checked arithmetic so
+// a huge count cannot wrap past the bound (heapam_xlog.h xl_heap_truncate).
+fn validate_truncate_relids(
+    data_len: usize,
+    nrelids: usize,
+    function: &'static str,
+) -> PgResult<()> {
+    let fits = nrelids
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(SizeOfHeapTruncate))
+        .is_some_and(|needed| needed <= data_len);
+    if !fits {
+        return Err(heap_data_corrupted(
+            function,
+            format!(
+                "XLOG_HEAP_TRUNCATE record declares nrelids={nrelids} \
+                 but main data length {data_len} is too short"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+// Verify a xl_multi_insert_tuple header at `off` lies within the attached block
+// data before reading its fixed fields; returns the payload start offset
+// (off + SizeOfMultiInsertTuple). Uses checked arithmetic so a near-max offset
+// cannot wrap (heapam_xlog.h xl_multi_insert_tuple).
+fn validate_multi_insert_header_in_bounds(
+    off: usize,
+    tuplelen: usize,
+    function: &'static str,
+) -> PgResult<usize> {
+    match off.checked_add(SizeOfMultiInsertTuple) {
+        Some(payload_start) if payload_start <= tuplelen => Ok(payload_start),
+        _ => Err(heap_data_corrupted(
+            function,
+            format!(
+                "XLOG_HEAP2_MULTI_INSERT tuple header at offset {off} \
+                 exceeds block 0 data length {tuplelen}"
+            ),
+        )),
+    }
+}
+
+// Verify a xl_multi_insert_tuple payload of `datalen` bytes stays within the
+// attached block data before slicing; returns the payload end offset. Uses
+// checked arithmetic so a near-max datalen cannot wrap past the bound.
+fn validate_multi_insert_payload_in_bounds(
+    payload_start: usize,
+    datalen: usize,
+    tuplelen: usize,
+    function: &'static str,
+) -> PgResult<usize> {
+    match payload_start.checked_add(datalen) {
+        Some(payload_end) if payload_end <= tuplelen => Ok(payload_end),
+        _ => Err(heap_data_corrupted(
+            function,
+            format!(
+                "XLOG_HEAP2_MULTI_INSERT tuple at offset {payload_start} with datalen {datalen} \
+                 exceeds block 0 data length {tuplelen}"
+            ),
+        )),
+    }
+}
+
+// XLogRecGetBlockTag(r, 0, ...) in C Asserts the block reference exists. Under
+// the hostile-WAL trust boundary a heap record may lack block 0, so return a
+// catchable ERROR instead of panicking on the missing reference.
+fn block0_locator(
+    ctx: &LogicalDecodingContext,
+    function: &'static str,
+) -> PgResult<RelFileLocator> {
+    match ctx.reader.XLogRecGetBlockTagExtended(0) {
+        Some((locator, _, _, _)) => Ok(locator),
+        None => Err(heap_data_corrupted(
+            function,
+            "heap record is missing the required block 0 reference".to_string(),
+        )),
+    }
+}
+
+// XLogRecGetBlockData(r, 0, &len) may return NULL when block 0 has no attached
+// data. C's heap decoders assume it is present; under the hostile-WAL trust
+// boundary validate it before use and return its length, raising a catchable
+// ERROR rather than panicking on the missing data.
+fn require_block0_data_len(
+    ctx: &LogicalDecodingContext,
+    function: &'static str,
+) -> PgResult<usize> {
+    match ctx.reader.XLogRecGetBlockData(0) {
+        Some(data) => Ok(data.len()),
+        None => Err(heap_data_corrupted(
+            function,
+            "heap record is missing the required block 0 data".to_string(),
+        )),
+    }
+}
+
+fn DecodeInsert(ctx: &mut LogicalDecodingContext, buf: XLogRecordBuffer) -> PgResult<()> {
+    // xl_heap_insert.flags is at offset 2; validate the record body holds the
+    // fixed struct before the fixed-offset read.
+    let data = ctx.reader.XLogRecGetData();
+    validate_heap_main_data_len(data.len(), SizeOfHeapInsert, "XLOG_HEAP_INSERT", "DecodeInsert")?;
+    let flags = data[2];
+
+    if flags & XLH_INSERT_CONTAINS_NEW_TUPLE == 0 {
+        return Ok(());
+    }
+
+    let target_locator = block0_locator(ctx, "DecodeInsert")?;
+    if target_locator.dbOid != unsafe { ctx.slot.data.get() }.database {
+        return Ok(());
+    }
+
+    let origin = ctx.reader.XLogRecGetOrigin();
+    if FilterByOrigin(ctx, origin)? {
+        return Ok(());
+    }
+
+    let action = if flags & XLH_INSERT_IS_SPECULATIVE == 0 {
+        ReorderBufferChangeType::Insert
+    } else {
+        ReorderBufferChangeType::InternalSpecInsert
+    };
+
+    // Block 0 must carry data holding at least a xl_heap_header before the
+    // tuplelen subtraction.
+    let datalen = require_block0_data_len(ctx, "DecodeInsert")?;
+    validate_heap_block_header_len(datalen, "XLOG_HEAP_INSERT", "DecodeInsert")?;
+    let tuplelen = datalen - SizeOfHeapHeader;
+
+    let mut newtuple = ctx.reorder.alloc_tuple_buf(tuplelen)?;
+    let tupledata = ctx
+        .reader
+        .XLogRecGetBlockData(0)
+        .expect("insert block data present");
+    DecodeXLogTuple(tupledata, &mut newtuple);
+
+    let mut change = ReorderBufferChange::new(
+        action,
+        ReorderBufferChangeData::Tp {
+            rlocator: target_locator,
+            clear_toast_afterwards: true,
+            oldtuple: None,
+            newtuple: Some(newtuple),
+        },
+    );
+    change.origin_id = origin;
+
+    let xid = ctx.reader.XLogRecGetXid();
+    ctx.reorder.queue_change(
+        xid,
+        buf.origptr,
+        change,
+        flags & XLH_INSERT_ON_TOAST_RELATION != 0,
+    )
+}
+
+fn DecodeUpdate(ctx: &mut LogicalDecodingContext, buf: XLogRecordBuffer) -> PgResult<()> {
+    // xl_heap_update.flags is at offset 7; validate the record body holds the
+    // fixed struct before the fixed-offset read.
+    let data = ctx.reader.XLogRecGetData();
+    validate_heap_main_data_len(data.len(), SizeOfHeapUpdate, "XLOG_HEAP_UPDATE", "DecodeUpdate")?;
+    let flags = data[7];
+
+    let target_locator = block0_locator(ctx, "DecodeUpdate")?;
+    if target_locator.dbOid != unsafe { ctx.slot.data.get() }.database {
+        return Ok(());
+    }
+
+    let origin = ctx.reader.XLogRecGetOrigin();
+    if FilterByOrigin(ctx, origin)? {
+        return Ok(());
+    }
+
+    let mut newtuple = None;
+    if flags & XLH_UPDATE_CONTAINS_NEW_TUPLE != 0 {
+        let datalen = require_block0_data_len(ctx, "DecodeUpdate")?;
+        validate_heap_block_header_len(datalen, "XLOG_HEAP_UPDATE", "DecodeUpdate")?;
+        let mut t = ctx.reorder.alloc_tuple_buf(datalen - SizeOfHeapHeader)?;
+        let data = ctx
+            .reader
+            .XLogRecGetBlockData(0)
+            .expect("update block data present");
+        DecodeXLogTuple(data, &mut t);
+        newtuple = Some(t);
+    }
+
+    let mut oldtuple = None;
+    if flags & (XLH_UPDATE_CONTAINS_OLD_TUPLE | XLH_UPDATE_CONTAINS_OLD_KEY) != 0 {
+        // The old tuple follows the fixed struct in the main data: it must hold
+        // xl_heap_update + a xl_heap_header before the subtractions below.
+        let rec_len = ctx.reader.XLogRecGetDataLen() as usize;
+        validate_heap_main_data_len(
+            rec_len,
+            SizeOfHeapUpdate + SizeOfHeapHeader,
+            "XLOG_HEAP_UPDATE",
+            "DecodeUpdate",
+        )?;
+        let datalen = rec_len - SizeOfHeapUpdate;
+        let mut t = ctx.reorder.alloc_tuple_buf(datalen - SizeOfHeapHeader)?;
+        let rec = ctx.reader.XLogRecGetData();
+        DecodeXLogTuple(&rec[SizeOfHeapUpdate..], &mut t);
+        oldtuple = Some(t);
+    }
+
+    let mut change = ReorderBufferChange::new(
+        ReorderBufferChangeType::Update,
+        ReorderBufferChangeData::Tp {
+            rlocator: target_locator,
+            clear_toast_afterwards: true,
+            oldtuple,
+            newtuple,
+        },
+    );
+    change.origin_id = origin;
+
+    let xid = ctx.reader.XLogRecGetXid();
+    ctx.reorder.queue_change(xid, buf.origptr, change, false)
+}
+
+fn DecodeDelete(ctx: &mut LogicalDecodingContext, buf: XLogRecordBuffer) -> PgResult<()> {
+    // xl_heap_delete.flags is at offset 7; validate the record body holds the
+    // fixed struct before the fixed-offset read.
+    let data = ctx.reader.XLogRecGetData();
+    validate_heap_main_data_len(data.len(), SizeOfHeapDelete, "XLOG_HEAP_DELETE", "DecodeDelete")?;
+    let flags = data[7];
+
+    let target_locator = block0_locator(ctx, "DecodeDelete")?;
+    if target_locator.dbOid != unsafe { ctx.slot.data.get() }.database {
+        return Ok(());
+    }
+
+    let origin = ctx.reader.XLogRecGetOrigin();
+    if FilterByOrigin(ctx, origin)? {
+        return Ok(());
+    }
+
+    let action = if flags & XLH_DELETE_IS_SUPER != 0 {
+        ReorderBufferChangeType::InternalSpecAbort
+    } else {
+        ReorderBufferChangeType::Delete
+    };
+
+    let mut oldtuple = None;
+    if flags & (XLH_DELETE_CONTAINS_OLD_TUPLE | XLH_DELETE_CONTAINS_OLD_KEY) != 0 {
+        // The old tuple follows the fixed struct in the main data: it must hold
+        // xl_heap_delete + a xl_heap_header before the subtractions below (C
+        // asserts XLogRecGetDataLen > SizeOfHeapDelete + SizeOfHeapHeader).
+        let rec_len = ctx.reader.XLogRecGetDataLen() as usize;
+        validate_heap_main_data_len(
+            rec_len,
+            SizeOfHeapDelete + SizeOfHeapHeader,
+            "XLOG_HEAP_DELETE",
+            "DecodeDelete",
+        )?;
+        let datalen = rec_len - SizeOfHeapDelete;
+        let mut t = ctx.reorder.alloc_tuple_buf(datalen - SizeOfHeapHeader)?;
+        let rec = ctx.reader.XLogRecGetData();
+        DecodeXLogTuple(&rec[SizeOfHeapDelete..], &mut t);
+        oldtuple = Some(t);
+    }
+
+    let mut change = ReorderBufferChange::new(
+        action,
+        ReorderBufferChangeData::Tp {
+            rlocator: target_locator,
+            clear_toast_afterwards: true,
+            oldtuple,
+            newtuple: None,
+        },
+    );
+    change.origin_id = origin;
+
+    let xid = ctx.reader.XLogRecGetXid();
+    ctx.reorder.queue_change(xid, buf.origptr, change, false)
+}
+
+fn DecodeTruncate(ctx: &mut LogicalDecodingContext, buf: XLogRecordBuffer) -> PgResult<()> {
+    // xl_heap_truncate: dbId@0, nrelids@4, flags@8, relids@12. Validate the
+    // record body holds the fixed struct before the fixed-offset reads.
+    let data = ctx.reader.XLogRecGetData();
+    validate_heap_main_data_len(
+        data.len(),
+        SizeOfHeapTruncate,
+        "XLOG_HEAP_TRUNCATE",
+        "DecodeTruncate",
+    )?;
+    let db_id = u32_at(data, 0);
+    let nrelids = u32_at(data, 4) as usize;
+    let flags = data[8];
+
+    if db_id != unsafe { ctx.slot.data.get() }.database {
+        return Ok(());
+    }
+
+    let origin = ctx.reader.XLogRecGetOrigin();
+    if FilterByOrigin(ctx, origin)? {
+        return Ok(());
+    }
+
+    // The attacker-controlled nrelids must fit in the remaining body before we
+    // read the relids array at fixed offsets.
+    let data = ctx.reader.XLogRecGetData();
+    validate_truncate_relids(data.len(), nrelids, "DecodeTruncate")?;
+    let mut relids: PgVec<'static, Oid> = PgVec::new_in(decode_mcx());
+    for i in 0..nrelids {
+        relids.push(u32_at(data, SizeOfHeapTruncate + i * 4));
+    }
+
+    let mut change = ReorderBufferChange::new(
+        ReorderBufferChangeType::Truncate,
+        ReorderBufferChangeData::Truncate {
+            cascade: flags & XLH_TRUNCATE_CASCADE != 0,
+            restart_seqs: flags & XLH_TRUNCATE_RESTART_SEQS != 0,
+            relids,
+        },
+    );
+    change.origin_id = origin;
+
+    let xid = ctx.reader.XLogRecGetXid();
+    ctx.reorder.queue_change(xid, buf.origptr, change, false)
+}
+
+fn DecodeMultiInsert(ctx: &mut LogicalDecodingContext, buf: XLogRecordBuffer) -> PgResult<()> {
+    // xl_heap_multi_insert: flags@0, ntuples@2. Validate the record body holds
+    // the fixed struct before the fixed-offset reads.
+    let rec = ctx.reader.XLogRecGetData();
+    validate_heap_main_data_len(
+        rec.len(),
+        SizeOfHeapMultiInsert,
+        "XLOG_HEAP2_MULTI_INSERT",
+        "DecodeMultiInsert",
+    )?;
+    let flags = rec[0];
+    let ntuples = u16_at(rec, 2) as usize;
+
+    if flags & XLH_INSERT_CONTAINS_NEW_TUPLE == 0 {
+        return Ok(());
+    }
+
+    let rlocator = block0_locator(ctx, "DecodeMultiInsert")?;
+    if rlocator.dbOid != unsafe { ctx.slot.data.get() }.database {
+        return Ok(());
+    }
+
+    let origin = ctx.reader.XLogRecGetOrigin();
+    if FilterByOrigin(ctx, origin)? {
+        return Ok(());
+    }
+
+    let xid = ctx.reader.XLogRecGetXid();
+    let tuplelen = require_block0_data_len(ctx, "DecodeMultiInsert")?;
+
+    let mut off = 0usize;
+    for i in 0..ntuples {
+        // xl_multi_insert_tuple entries are SHORTALIGNed relative to the
+        // block-data start. Validate the header lies within the attached block
+        // data before reading its fixed fields.
+        off = (off + 1) & !1;
+        let payload_start =
+            validate_multi_insert_header_in_bounds(off, tuplelen, "DecodeMultiInsert")?;
+        let tupledata = ctx
+            .reader
+            .XLogRecGetBlockData(0)
+            .expect("multi-insert block data present");
+        let datalen = u16_at(tupledata, off) as usize;
+        let t_infomask2 = u16_at(tupledata, off + 2);
+        let t_infomask = u16_at(tupledata, off + 4);
+        let t_hoff = tupledata[off + 6];
+        // The declared payload must stay within the attached block data before
+        // slicing it.
+        let payload_end = validate_multi_insert_payload_in_bounds(
+            payload_start,
+            datalen,
+            tuplelen,
+            "DecodeMultiInsert",
+        )?;
+
+        let mut tuple = ctx.reorder.alloc_tuple_buf(datalen)?;
+        {
+            let tupledata = ctx
+                .reader
+                .XLogRecGetBlockData(0)
+                .expect("multi-insert block data present");
+            tuple.t_self = ItemPointerData::default();
+            tuple.t_tableOid = InvalidOid;
+            tuple.image_mut()[SizeofHeapTupleHeader..]
+                .copy_from_slice(&tupledata[payload_start..payload_end]);
+            let hdr = tuple.t_data_mut();
+            hdr.t_infomask = t_infomask;
+            hdr.t_infomask2 = t_infomask2;
+            hdr.t_hoff = t_hoff;
+        }
+
+        let clear_toast_afterwards = flags & XLH_INSERT_LAST_IN_MULTI != 0 && (i + 1) == ntuples;
+
+        let mut change = ReorderBufferChange::new(
+            ReorderBufferChangeType::Insert,
+            ReorderBufferChangeData::Tp {
+                rlocator,
+                clear_toast_afterwards,
+                oldtuple: None,
+                newtuple: Some(tuple),
+            },
+        );
+        change.origin_id = origin;
+        ctx.reorder.queue_change(xid, buf.origptr, change, false)?;
+
+        off = payload_end;
+    }
+    debug_assert_eq!(off, tuplelen);
+    Ok(())
+}
+
+fn DecodeSpecConfirm(ctx: &mut LogicalDecodingContext, buf: XLogRecordBuffer) -> PgResult<()> {
+    let target_locator = block0_locator(ctx, "DecodeSpecConfirm")?;
+    if target_locator.dbOid != unsafe { ctx.slot.data.get() }.database {
+        return Ok(());
+    }
+
+    let origin = ctx.reader.XLogRecGetOrigin();
+    if FilterByOrigin(ctx, origin)? {
+        return Ok(());
+    }
+
+    let mut change = ReorderBufferChange::new(
+        ReorderBufferChangeType::InternalSpecConfirm,
+        ReorderBufferChangeData::Tp {
+            rlocator: target_locator,
+            clear_toast_afterwards: true,
+            oldtuple: None,
+            newtuple: None,
+        },
+    );
+    change.origin_id = origin;
+
+    let xid = ctx.reader.XLogRecGetXid();
+    ctx.reorder.queue_change(xid, buf.origptr, change, false)
+}
+
+// `data` covers xl_heap_header followed by the tuple payload.
+fn DecodeXLogTuple(data: &[u8], tuple: &mut heaptuple::HeapTuple<'static>) {
+    let datalen = data.len() - SizeOfHeapHeader;
+    debug_assert_eq!(tuple.t_len as usize, datalen + SizeofHeapTupleHeader);
+
+    let t_infomask2 = u16_at(data, 0);
+    let t_infomask = u16_at(data, 2);
+    let t_hoff = data[4];
+
+    tuple.t_self = ItemPointerData::default();
+    tuple.t_tableOid = InvalidOid;
+    tuple.image_mut()[SizeofHeapTupleHeader..].copy_from_slice(&data[SizeOfHeapHeader..]);
+    let hdr = tuple.t_data_mut();
+    hdr.t_infomask = t_infomask;
+    hdr.t_infomask2 = t_infomask2;
+    hdr.t_hoff = t_hoff;
+}
+
+fn DecodeTXNNeedSkip(
+    ctx: &mut LogicalDecodingContext,
+    buf: XLogRecordBuffer,
+    txn_dbid: Oid,
+    origin_id: RepOriginId,
+) -> PgResult<bool> {
+    if ctx.snapshot_builder.xact_needs_skip(buf.origptr)
+        || (txn_dbid != InvalidOid && txn_dbid != unsafe { ctx.slot.data.get() }.database)
+        || FilterByOrigin(ctx, origin_id)?
+    {
+        return Ok(true);
+    }
+
+    if ctx.fast_forward {
+        ctx.processing_required = true;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+// C keeps this in logical.c; it lives here because it drives the record loop
+// through LogicalDecodingProcessRecord (avoids a logical <-> logical_decode
+// dependency cycle).
+pub fn DecodingContextFindStartpoint(ctx: &mut LogicalDecodingContext) -> PgResult<()> {
+    DecodingContextFindStartpointWith(ctx, &mut LocalPageRead { wait_for_wal: true })
+}
+
+// The page reader is the context's (logical.c:723 ctx->reader): the SQL
+// slot functions read locally, the walsender's CreateReplicationSlot reads
+// through logical_read_xlog_page so its WAL wait keeps servicing the client
+// socket (walsender.c:1320).
+pub fn DecodingContextFindStartpointWith<R: xlogreader::XLogReaderRoutine>(
+    ctx: &mut LogicalDecodingContext,
+    routine: &mut R,
+) -> PgResult<()> {
+    let slot = ctx.slot;
+
+    ctx.reader.XLogBeginRead(unsafe { slot.data.get() }.restart_lsn);
+
+    loop {
+        let record = ctx.reader.XLogReadRecord(routine)?;
+        if record.is_none() {
+            return match ctx.reader.errormsg() {
+                Some(err) => elog(
+                    ERROR,
+                    format!("could not find logical decoding starting point: {err}"),
+                ),
+                None => elog(ERROR, "could not find logical decoding starting point"),
+            };
+        }
+
+        LogicalDecodingProcessRecord(ctx)?;
+
+        // Only continue till we found a consistent spot.
+        if logical::DecodingContextReady(ctx) {
+            break;
+        }
+
+        // logical.c:731: the search stays cancellable.
+        postgres_seams::check_for_interrupts::call()?;
+    }
+
+    let end = ctx.reader.v.EndRecPtr;
+    slot.with_mutex(|| {
+        let mut d = unsafe { slot.data.get() };
+        d.confirmed_flush = end;
+        if d.two_phase {
+            d.two_phase_at = end;
+        }
+        unsafe { slot.data.set(d) };
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    // xlog_decode's XLOG_PARAMETER_CHANGE arm (decode.c:167-177): the standby
+    // guard is a catchable ERROR with SQLSTATE 55000 and C's exact message.
+    #[test]
+    fn param_change_wal_level_error_shape() {
+        let e = super::wal_level_below_logical_on_primary();
+        assert_eq!(
+            e.sqlstate(),
+            types_error::ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE
+        );
+        assert_eq!(
+            e.message(),
+            "logical decoding on standby requires \"wal_level\" >= \"logical\" on the primary"
+        );
+    }
+
+    // XLOG_RUNNING_XACTS decode must reject records whose declared xcnt/subxcnt
+    // do not fit the record body, as a catchable ERRCODE_DATA_CORRUPTED, before
+    // allocating or reading any xid arrays (standbydefs.h xl_running_xacts).
+    #[test]
+    fn running_xacts_short_header_is_data_corrupted() {
+        for len in [0usize, 8, 23] {
+            let e = super::validate_running_xacts_header(len).err().unwrap();
+            assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+        }
+    }
+
+    #[test]
+    fn running_xacts_valid_counts_accepted() {
+        // 24-byte header + room for exactly 3 xids.
+        let data_len = super::MIN_SIZE_OF_XL_RUNNING_XACTS + 3 * 4;
+        let max_xids = super::validate_running_xacts_header(data_len).unwrap();
+        assert_eq!(max_xids, 3);
+        assert_eq!(
+            super::validate_running_xacts_total(data_len, max_xids, 2, 1).unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn running_xacts_counts_exceeding_body_rejected() {
+        let data_len = super::MIN_SIZE_OF_XL_RUNNING_XACTS + 3 * 4;
+        let max_xids = super::validate_running_xacts_header(data_len).unwrap();
+        // Declares more xids than the body holds.
+        let e = super::validate_running_xacts_total(data_len, max_xids, 3, 1)
+            .err()
+            .unwrap();
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+    }
+
+    #[test]
+    fn running_xacts_wrapping_counts_rejected() {
+        let data_len = super::MIN_SIZE_OF_XL_RUNNING_XACTS + 3 * 4;
+        let max_xids = super::validate_running_xacts_header(data_len).unwrap();
+        // xcnt + subxcnt overflows u32 (would wrap to a small value without
+        // checked arithmetic); must be rejected, not silently truncated.
+        let e = super::validate_running_xacts_total(data_len, max_xids, u32::MAX, 16)
+            .err()
+            .unwrap();
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+    }
+
+    // XLOG_PARAMETER_CHANGE decode reads wal_level at a fixed offset (20) in the
+    // record body. A hostile record shorter than the xl_parameter_change fixed
+    // layout (e.g. empty main data) must be rejected as a catchable
+    // ERRCODE_DATA_CORRUPTED before the fixed-offset read, not panic on an
+    // out-of-bounds slice (xlog_internal.h xl_parameter_change).
+    #[test]
+    fn parameter_change_short_body_is_data_corrupted() {
+        for len in [0usize, 4, 20, 23] {
+            let e = super::validate_parameter_change_len(len).err().unwrap();
+            assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+        }
+    }
+
+    // XLOG_HEAP2_NEW_CID decode reads xl_heap_new_cid at fixed offsets through
+    // target_tid (offset 32..34). A hostile record shorter than the 34-byte
+    // fixed struct must be rejected as a catchable ERRCODE_DATA_CORRUPTED before
+    // the fixed-offset reads, not panic on an out-of-bounds slice
+    // (heapam_xlog.h xl_heap_new_cid / SizeOfHeapNewCid).
+    #[test]
+    fn new_cid_short_body_is_data_corrupted() {
+        for len in [0usize, 16, 28, 33] {
+            let e = super::validate_new_cid_len(len).err().unwrap();
+            assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+        }
+    }
+
+    #[test]
+    fn new_cid_full_body_accepted() {
+        assert!(super::validate_new_cid_len(super::SIZE_OF_HEAP_NEW_CID).is_ok());
+        assert!(super::validate_new_cid_len(super::SIZE_OF_HEAP_NEW_CID + 8).is_ok());
+    }
+
+    // XLOG_LOGICAL_MESSAGE decode reads xl_logical_message at fixed offsets
+    // through message_size (offset 16..24). A hostile record shorter than the
+    // 24-byte fixed header must be rejected as a catchable ERRCODE_DATA_CORRUPTED
+    // before the fixed-offset reads, not panic on an out-of-bounds slice
+    // (message.h xl_logical_message / SizeOfLogicalMessage).
+    #[test]
+    fn logical_message_short_header_is_data_corrupted() {
+        for len in [0usize, 4, 8, 16, 23] {
+            let e = super::validate_logical_message_header(len).err().unwrap();
+            assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+        }
+    }
+
+    #[test]
+    fn logical_message_full_header_accepted() {
+        assert!(super::validate_logical_message_header(super::SIZE_OF_LOGICAL_MESSAGE).is_ok());
+        assert!(super::validate_logical_message_header(super::SIZE_OF_LOGICAL_MESSAGE + 8).is_ok());
+    }
+
+    // The declared prefix_size/message_size must fit in the record body past the
+    // 24-byte fixed header, and prefix_size must be >= 1 (NUL-terminated prefix).
+    #[test]
+    fn logical_message_valid_payload_accepted() {
+        // 24-byte header + 5-byte prefix + 3-byte message.
+        let data_len = super::SIZE_OF_LOGICAL_MESSAGE + 5 + 3;
+        assert!(super::validate_logical_message_payload(data_len, 5, 3).is_ok());
+        // Exactly filling the body is fine.
+        assert!(super::validate_logical_message_payload(super::SIZE_OF_LOGICAL_MESSAGE + 1, 1, 0).is_ok());
+    }
+
+    #[test]
+    fn logical_message_zero_prefix_rejected() {
+        // prefix_size == 0 would underflow `24 + prefix_size - 1`; reject it.
+        let data_len = super::SIZE_OF_LOGICAL_MESSAGE + 8;
+        let e = super::validate_logical_message_payload(data_len, 0, 0)
+            .err()
+            .unwrap();
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+    }
+
+    #[test]
+    fn logical_message_payload_exceeding_body_rejected() {
+        let data_len = super::SIZE_OF_LOGICAL_MESSAGE + 4;
+        // prefix + message declare more than the 4 payload bytes available.
+        let e = super::validate_logical_message_payload(data_len, 3, 5)
+            .err()
+            .unwrap();
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+    }
+
+    #[test]
+    fn logical_message_wrapping_payload_rejected() {
+        let data_len = super::SIZE_OF_LOGICAL_MESSAGE + 16;
+        // prefix_size + message_size overflows usize (would wrap to a small
+        // value without checked arithmetic); must be rejected, not accepted.
+        let e = super::validate_logical_message_payload(data_len, usize::MAX, 8)
+            .err()
+            .unwrap();
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+    }
+
+    #[test]
+    fn parameter_change_full_body_accepted() {
+        // A body holding the fixed struct through wal_level (offset 20 + 4) is
+        // large enough for the fixed-offset read to be in bounds.
+        assert!(super::validate_parameter_change_len(super::MIN_SIZE_OF_XL_PARAMETER_CHANGE).is_ok());
+        assert!(super::validate_parameter_change_len(super::MIN_SIZE_OF_XL_PARAMETER_CHANGE + 8).is_ok());
+    }
+
+    // The heap decode arms read per-opcode fixed structs at fixed offsets. A
+    // record shorter than the opcode's fixed struct must be rejected as a
+    // catchable ERRCODE_DATA_CORRUPTED before the fixed-offset reads, not panic
+    // on an out-of-bounds slice (heapam_xlog.h).
+    #[test]
+    fn heap_main_data_short_is_data_corrupted() {
+        for (len, min) in [
+            (0usize, super::SizeOfHeapInsert),
+            (2, super::SizeOfHeapInsert),
+            (7, super::SizeOfHeapDelete),
+            (13, super::SizeOfHeapUpdate),
+            (3, super::SizeOfHeapMultiInsert),
+            (11, super::SizeOfHeapTruncate),
+        ] {
+            let e = super::validate_heap_main_data_len(len, min, "REC", "fn")
+                .err()
+                .unwrap();
+            assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+        }
+    }
+
+    #[test]
+    fn heap_main_data_full_body_accepted() {
+        assert!(super::validate_heap_main_data_len(
+            super::SizeOfHeapInsert,
+            super::SizeOfHeapInsert,
+            "REC",
+            "fn"
+        )
+        .is_ok());
+        assert!(super::validate_heap_main_data_len(64, super::SizeOfHeapUpdate, "REC", "fn").is_ok());
+    }
+
+    // Block-0 tuple data must hold at least a xl_heap_header before the
+    // tuplelen = block_len - SizeOfHeapHeader subtraction.
+    #[test]
+    fn heap_block_header_short_is_data_corrupted() {
+        for len in [0usize, 1, 4] {
+            let e = super::validate_heap_block_header_len(len, "REC", "fn")
+                .err()
+                .unwrap();
+            assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+        }
+    }
+
+    #[test]
+    fn heap_block_header_full_accepted() {
+        assert!(super::validate_heap_block_header_len(super::SizeOfHeapHeader, "REC", "fn").is_ok());
+        assert!(super::validate_heap_block_header_len(super::SizeOfHeapHeader + 9, "REC", "fn").is_ok());
+    }
+
+    // xl_heap_truncate declares nrelids; the fixed header + nrelids*4 Oids must
+    // fit in the record body, with checked arithmetic against wrap-around.
+    #[test]
+    fn truncate_relids_fit_accepted() {
+        let data_len = super::SizeOfHeapTruncate + 3 * 4;
+        assert!(super::validate_truncate_relids(data_len, 3, "fn").is_ok());
+        assert!(super::validate_truncate_relids(super::SizeOfHeapTruncate, 0, "fn").is_ok());
+    }
+
+    #[test]
+    fn truncate_relids_exceeding_body_rejected() {
+        let data_len = super::SizeOfHeapTruncate + 3 * 4;
+        let e = super::validate_truncate_relids(data_len, 4, "fn").err().unwrap();
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+    }
+
+    #[test]
+    fn truncate_relids_wrapping_rejected() {
+        // nrelids * 4 overflows usize; must be rejected, not wrap to a small
+        // value that slips past the bound.
+        let e = super::validate_truncate_relids(64, usize::MAX / 2, "fn")
+            .err()
+            .unwrap();
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+    }
+
+    // Multi-insert per-tuple offsets must stay within the attached block data:
+    // both the fixed xl_multi_insert_tuple header and the declared payload.
+    #[test]
+    fn multi_insert_header_in_bounds_accepted() {
+        // off 0, block holds header + room.
+        assert_eq!(
+            super::validate_multi_insert_header_in_bounds(0, 64, "fn").unwrap(),
+            super::SizeOfMultiInsertTuple
+        );
+        // Exactly filling the block with just a header is fine.
+        assert_eq!(
+            super::validate_multi_insert_header_in_bounds(0, super::SizeOfMultiInsertTuple, "fn")
+                .unwrap(),
+            super::SizeOfMultiInsertTuple
+        );
+    }
+
+    #[test]
+    fn multi_insert_header_exceeding_block_rejected() {
+        // Header would run past the block data.
+        let e = super::validate_multi_insert_header_in_bounds(4, super::SizeOfMultiInsertTuple, "fn")
+            .err()
+            .unwrap();
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+        // Near-max offset must not wrap.
+        let e = super::validate_multi_insert_header_in_bounds(usize::MAX, 64, "fn")
+            .err()
+            .unwrap();
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+    }
+
+    #[test]
+    fn multi_insert_payload_in_bounds_accepted() {
+        // payload_start 7, datalen 10, block len 17.
+        assert_eq!(
+            super::validate_multi_insert_payload_in_bounds(7, 10, 17, "fn").unwrap(),
+            17
+        );
+    }
+
+    #[test]
+    fn multi_insert_payload_exceeding_block_rejected() {
+        let e = super::validate_multi_insert_payload_in_bounds(7, 11, 17, "fn")
+            .err()
+            .unwrap();
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+        // Near-max datalen must not wrap.
+        let e = super::validate_multi_insert_payload_in_bounds(7, usize::MAX, 17, "fn")
+            .err()
+            .unwrap();
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+    }
+
+    // XLOG_XACT_INVALIDATIONS declares nmsgs; the fixed 4-byte header + nmsgs
+    // SharedInvalidationMessage entries must fit in the record body, with
+    // checked arithmetic against wrap-around, before allocating or looping
+    // (xact.h xl_xact_invals).
+    #[test]
+    fn xact_invals_fit_accepted() {
+        const MSG_SIZE: usize = types_storage::SHARED_INVALIDATION_MESSAGE_SIZE;
+        let data_len = super::SIZE_OF_XACT_INVALS + 3 * MSG_SIZE;
+        assert!(super::validate_xact_invals(data_len, 3).is_ok());
+        // Zero messages: just the header is enough.
+        assert!(super::validate_xact_invals(super::SIZE_OF_XACT_INVALS, 0).is_ok());
+    }
+
+    #[test]
+    fn xact_invals_exceeding_body_rejected() {
+        const MSG_SIZE: usize = types_storage::SHARED_INVALIDATION_MESSAGE_SIZE;
+        let data_len = super::SIZE_OF_XACT_INVALS + 3 * MSG_SIZE;
+        // Declares one more message than the body holds.
+        let e = super::validate_xact_invals(data_len, 4).err().unwrap();
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+    }
+
+    #[test]
+    fn xact_invals_wrapping_rejected() {
+        // nmsgs * MSG_SIZE overflows usize; must be rejected, not wrap to a
+        // small value that slips past the bound.
+        let e = super::validate_xact_invals(64, usize::MAX / 2 + 1)
+            .err()
+            .unwrap();
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+    }
+
+    #[test]
+    fn xact_invals_short_header_is_data_corrupted() {
+        // Fewer than 4 bytes cannot even hold nmsgs; parse must reject before
+        // reading it, as a catchable ERRCODE_DATA_CORRUPTED.
+        for len in [0usize, 1, 3] {
+            let e = super::parse_xact_invals(&vec![0u8; len]).err().unwrap();
+            assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+        }
+    }
+
+    #[test]
+    fn xact_invals_huge_nmsgs_rejected_not_aborted() {
+        // A 4-byte body declaring a huge nmsgs must become a catchable ERROR
+        // rather than attempting a huge allocation or slicing out of bounds.
+        let data = u32::MAX.to_ne_bytes();
+        let e = super::parse_xact_invals(&data).err().unwrap();
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_CORRUPTED);
+    }
+
+    // An unrecognized SI message id in the record body must become a
+    // structured FATAL error ("unrecognized SI message ID: %d", inval.c) — as
+    // C reaches when the message is executed — never a Rust unwind panic (row
+    // a186-candidate-fp-logical-decode-9266fabec18947cc0899-1).
+    #[test]
+    fn xact_invals_unrecognized_id_is_fatal_not_panic() {
+        const MSG_SIZE: usize = types_storage::SHARED_INVALIDATION_MESSAGE_SIZE;
+        let mut data = vec![0u8; super::SIZE_OF_XACT_INVALS + MSG_SIZE];
+        // nmsgs = 1.
+        data[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        // One message whose id byte (0x80 => -128 as i8) is a negative id
+        // outside the recognized -1..-? set, so from_wire_bytes returns None.
+        data[super::SIZE_OF_XACT_INVALS] = 0x80;
+        let e = super::parse_xact_invals(&data).err().unwrap();
+        assert_eq!(e.level(), types_error::FATAL);
+        assert_eq!(e.message(), "unrecognized SI message ID: -128");
+    }
+}

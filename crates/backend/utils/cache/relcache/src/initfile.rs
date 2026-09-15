@@ -1,0 +1,1545 @@
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+use mcx::{Mcx, MemoryContext, PgString, PgVec};
+use types_core::{InvalidSubTransactionId, Oid, RECORDOID};
+use types_error::{
+    ErrorLevel, ErrorLocation, PgError, PgResult, ERRCODE_DATA_CORRUPTED, ERRCODE_INTERNAL_ERROR,
+    ERRCODE_UNDEFINED_OBJECT, ERROR, FATAL, LOG, PANIC, WARNING,
+};
+use types_rel::{FormData_pg_class, FormData_pg_index, RelationData, RELKIND_INDEX};
+use types_rel::{
+    AutoVacOpts, BTOptions, BrinOptions, GinOptions, GistOptions, HashOptions, RdOptions,
+    SpGistOptions, StdRdOptions, ViewOptions, GIST_OPTION_BUFFERING_AUTO,
+    GIST_OPTION_BUFFERING_OFF, GIST_OPTION_BUFFERING_ON,
+    STDRD_OPTION_VACUUM_INDEX_CLEANUP_AUTO, STDRD_OPTION_VACUUM_INDEX_CLEANUP_OFF,
+    STDRD_OPTION_VACUUM_INDEX_CLEANUP_ON, VIEW_OPTION_CHECK_OPTION_CASCADED,
+    VIEW_OPTION_CHECK_OPTION_LOCAL, VIEW_OPTION_CHECK_OPTION_NOT_SET,
+};
+use types_tuple::{
+    FormData_pg_attribute, NameData, TupleConstr, TYPALIGN_CHAR, TYPALIGN_DOUBLE, TYPALIGN_INT,
+    TYPALIGN_SHORT,
+};
+
+use crate::schemapg::{
+    ACCESS_METHOD_PROCEDURE_INDEX_ID, ACCESS_METHOD_PROCEDURE_RELATION_ID,
+    ATTRIBUTE_RELID_NUM_INDEX_ID, AUTH_ID_OID_INDEX_ID, AUTH_ID_ROLNAME_INDEX_ID,
+    AUTH_MEM_MEM_ROLE_INDEX_ID, CAT_PG_SHSECLABEL, CLASS_OID_INDEX_ID, DATABASE_NAME_INDEX_ID,
+    DATABASE_OID_INDEX_ID, INDEX_RELID_INDEX_ID, LOCAL_BOOTSTRAP_CATALOGS,
+    OPCLASS_OID_INDEX_ID, OPERATOR_CLASS_RELATION_ID, REWRITE_RELATION_ID,
+    REWRITE_REL_RULENAME_INDEX_ID, SHARED_BOOTSTRAP_CATALOGS, SHARED_SEC_LABEL_OBJECT_INDEX_ID,
+    TRIGGER_RELATION_ID, TRIGGER_RELID_NAME_INDEX_ID,
+};
+use crate::{build, store, with_state};
+use types_rel::AccessShareLock;
+
+// Divergence from C: our file is a different on-disk format, so it lives under
+// a different name; C 18.3 writes/reads its own pg_internal.init in the same
+// datadir and neither binary ever opens the other's file. Our unlink paths
+// remove BOTH names so a later C boot cannot trust a file our DDL made stale.
+// The name keeps C's `pg_internal.init` as its PREFIX on purpose: every C
+// tool that walks a data directory skips that prefix (pg_checksums,
+// pg_basebackup, pg_rewind, pg_combinebackup, pg_verifybackup — all
+// match_prefix entries), so our cache file is skipped exactly like C's own.
+// The old `pgrust_internal.init` name made `pg_checksums --check` fail with
+// "invalid segment number 0 in file name" (src/bin/pg_checksums 002_actions).
+pub const RELCACHE_INIT_FILENAME: &str = "pg_internal.init.pgrust";
+pub const C_RELCACHE_INIT_FILENAME: &str = "pg_internal.init";
+pub const RELCACHE_INIT_FILEMAGIC: i32 = 0x573266;
+// Bump whenever the entry codec below changes shape; a mismatch rejects the file.
+pub const RELCACHE_INIT_FORMAT: u32 = 2;
+const TABLESPACE_VERSION_DIRECTORY: &str = "PG_18_202506291";
+const PG_TBLSPC_DIR: &str = "pg_tblspc";
+// BUILTIN_TRANCHE_NAMES[16] == "RelCacheInit"; pinned by a test.
+const RELCACHE_INIT_LOCK_OFFSET: usize = 16;
+
+const NUM_CRITICAL_SHARED_RELS: usize = SHARED_BOOTSTRAP_CATALOGS.len();
+const NUM_CRITICAL_LOCAL_RELS: usize = LOCAL_BOOTSTRAP_CATALOGS.len();
+const NUM_CRITICAL_LOCAL_INDEXES: usize = 7;
+const NUM_CRITICAL_SHARED_INDEXES: usize = 6;
+
+const BTREE_AM_OID: Oid = 403;
+const HASH_AM_OID: Oid = 405;
+const MAX_ATTS: usize = 1600;
+
+
+// PGRUST_GATHER_TRACE sub-attribution of RelationCacheInitializePhase3's
+// cost (the §2 table's 2.1ms line): which of file-load / critical-index /
+// finish / warm+write burns it decides the P-share-lite retention shape.
+fn gtrace_us(label: &str, t0: std::time::Instant) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("PGRUST_GATHER_TRACE").is_some()) {
+        return;
+    }
+    eprintln!("GTRACE relcache3.{label} dt_us={}", t0.elapsed().as_micros());
+}
+
+pub fn RelationCacheInitialize() {
+    // The hash table is created eagerly by the state cell (INITRELCACHESIZE).
+    with_state(|_| ());
+    relmapper_seams::relation_map_initialize::call();
+}
+
+pub fn RelationCacheInitializePhase2() -> PgResult<()> {
+    relmapper_seams::relation_map_initialize_phase2::call()?;
+    if miscinit_seams::is_bootstrap_processing_mode::call() {
+        return Ok(());
+    }
+    if !load_relcache_init_file(true)? {
+        for cat in SHARED_BOOTSTRAP_CATALOGS {
+            build::formrdesc(cat)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn RelationCacheInitializePhase3() -> PgResult<()> {
+    let mut need_new_cache_file = !with_state(|st| st.critical_shared_relcaches_built);
+    relmapper_seams::relation_map_initialize_phase3::call()?;
+
+    let bootstrap = miscinit_seams::is_bootstrap_processing_mode::call();
+    let t0 = std::time::Instant::now();
+    if bootstrap || !load_relcache_init_file(false)? {
+        need_new_cache_file = true;
+        for cat in LOCAL_BOOTSTRAP_CATALOGS {
+            build::formrdesc(cat)?;
+        }
+        gtrace_us("formrdesc", t0);
+    } else {
+        gtrace_us("initfile_load", t0);
+    }
+    if bootstrap {
+        return Ok(());
+    }
+    let t0 = std::time::Instant::now();
+
+    // Critical indexes break the relcache-load recursion: until they're
+    // nailed, ScanPgRelation heapscans (criticalRelcachesBuilt gates index_ok).
+    if !crate::criticalRelcachesBuilt() {
+        load_critical_index(CLASS_OID_INDEX_ID, types_core::RELATION_RELATION_ID)?;
+        load_critical_index(ATTRIBUTE_RELID_NUM_INDEX_ID, types_core::ATTRIBUTE_RELATION_ID)?;
+        load_critical_index(INDEX_RELID_INDEX_ID, types_core::INDEX_RELATION_ID)?;
+        load_critical_index(OPCLASS_OID_INDEX_ID, OPERATOR_CLASS_RELATION_ID)?;
+        load_critical_index(ACCESS_METHOD_PROCEDURE_INDEX_ID, ACCESS_METHOD_PROCEDURE_RELATION_ID)?;
+        load_critical_index(REWRITE_REL_RULENAME_INDEX_ID, REWRITE_RELATION_ID)?;
+        load_critical_index(TRIGGER_RELID_NAME_INDEX_ID, TRIGGER_RELATION_ID)?;
+        with_state(|st| st.critical_relcaches_built = true);
+    }
+
+    if !crate::criticalSharedRelcachesBuilt() {
+        load_critical_index(DATABASE_NAME_INDEX_ID, types_core::DATABASE_RELATION_ID)?;
+        load_critical_index(DATABASE_OID_INDEX_ID, types_core::DATABASE_RELATION_ID)?;
+        load_critical_index(AUTH_ID_ROLNAME_INDEX_ID, types_core::AUTH_ID_RELATION_ID)?;
+        load_critical_index(AUTH_ID_OID_INDEX_ID, types_core::AUTH_ID_RELATION_ID)?;
+        load_critical_index(AUTH_MEM_MEM_ROLE_INDEX_ID, types_core::AUTH_MEM_RELATION_ID)?;
+        load_critical_index(SHARED_SEC_LABEL_OBJECT_INDEX_ID, CAT_PG_SHSECLABEL.relid)?;
+        with_state(|st| st.critical_shared_relcaches_built = true);
+    }
+
+    gtrace_us("critical_indexes", t0);
+
+    let t0 = std::time::Instant::now();
+    finish_relcache_entries()?;
+    gtrace_us("finish_entries", t0);
+
+    let t0 = std::time::Instant::now();
+    if need_new_cache_file {
+        // Without this pre-warm the lazy relcache builds of syscache
+        // catalogs land inside the first planning window and EXPLAIN
+        // (BUFFERS) Planning counts diverge from C (+20-26 touches).
+        syscache_seams::init_catalog_cache_phase2::call()?;
+        write_relcache_init_file(true)?;
+        write_relcache_init_file(false)?;
+        gtrace_us("warm_and_write", t0);
+    }
+    Ok(())
+}
+
+// Replace formrdesc stubs (relowner == InvalidOid) with the real pg_class
+// row. C also refreshes rules/triggers/RLS/tableam here; those fields live
+// with later units. Restart-from-scratch scan shape as in C.
+fn finish_relcache_entries() -> PgResult<()> {
+    loop {
+        let target = with_state(|st| {
+            st.id_cache
+                .iter()
+                .find(|(_, e)| e.rel.rd_rel.relowner == types_core::InvalidOid)
+                .map(|(k, e)| (*k, std::rc::Rc::clone(&e.rel)))
+        });
+        let Some((relid, rel)) = target else {
+            return Ok(());
+        };
+        let index_ok = crate::criticalRelcachesBuilt();
+        let scanned = relcache_build_seams::scan_pg_relation::call(relid, index_ok, false)?
+            .ok_or_else(|| cache_lookup_failed(relid))?;
+        debug_assert_eq!(rel.rd_att.tdtypeid, scanned.form.reltype);
+        debug_assert_eq!(rel.rd_att.tdtypmod, -1);
+        if scanned.form.relowner == types_core::InvalidOid {
+            return Err(Box::new(
+                PgError::error(format!(
+                    "invalid relowner in pg_class entry for \"{}\"",
+                    rel.name()
+                ))
+                .with_sqlstate(ERRCODE_INTERNAL_ERROR),
+            ));
+        }
+        // formrdesc set up rd_att correctly by construction (C asserts, never
+        // copies it: catcache entries may already share it).
+        let newrel = std::rc::Rc::new(types_rel::RelationData { rd_locator: Default::default(), rd_smgr: Default::default(),
+            rd_id: relid,
+            rd_backend: rel.rd_backend,
+            rd_islocaltemp: rel.rd_islocaltemp,
+            rd_isvalid: core::cell::Cell::new(true),
+            rd_createSubid: core::cell::Cell::new(types_core::InvalidSubTransactionId),
+            rd_newRelfilelocatorSubid: core::cell::Cell::new(types_core::InvalidSubTransactionId),
+            rd_firstRelfilelocatorSubid: core::cell::Cell::new(types_core::InvalidSubTransactionId),
+            rd_droppedSubid: core::cell::Cell::new(types_core::InvalidSubTransactionId),
+            rd_lockInfo: lmgr::RelationInitLockInfo(relid, scanned.form.relisshared),
+            rd_rel: scanned.form,
+            rd_att: std::rc::Rc::clone(&rel.rd_att),
+            rd_index: None,
+            rd_opcintype: mcx::PgVec::new_in(crate::cache_mcx()),
+            rd_opfamily: mcx::PgVec::new_in(crate::cache_mcx()),
+            rd_indoption: mcx::PgVec::new_in(crate::cache_mcx()),
+            rd_indcollation: mcx::PgVec::new_in(crate::cache_mcx()),
+            rd_options: scanned.options.map(Box::new),
+            pgstat_enabled: core::cell::Cell::new(rel.pgstat_enabled.get()),
+            // C SWAPFIELD keeps pgstat_info across the rebuild; same key, gen
+            // still governs validity.
+            pgstat_link: core::cell::Cell::new(rel.pgstat_link.get()),
+            rd_amcache: Default::default(),
+            rd_amcache_hash: Default::default(), rd_amcache_gin: Default::default(), rd_amcache_spgist: Default::default(),
+            rd_support: mcx::PgVec::new_in(crate::cache_mcx()),
+            rd_supportinfo: Default::default(),
+            rd_opcoptions: Default::default(),
+            rd_indexlist: Default::default(),
+            rd_trigdesc: Default::default(),
+            rd_hastriggers: scanned.relhastriggers, rd_hasrules: scanned.relhasrules,
+        });
+        crate::build::RelationInitPhysicalAddr(&newrel)?;
+        with_state(|st| {
+            if let Some(ent) = st.id_cache.get_mut(&relid) {
+                ent.rel = std::rc::Rc::clone(&newrel);
+            }
+        });
+    }
+}
+
+#[track_caller]
+#[cold]
+#[inline(never)]
+fn cache_lookup_failed(relid: Oid) -> Box<PgError> {
+    Box::new(
+        PgError::new(FATAL, format!("cache lookup failed for relation {relid}"))
+            .with_sqlstate(ERRCODE_UNDEFINED_OBJECT),
+    )
+}
+
+fn critical_index_missing(indexoid: Oid) -> Box<PgError> {
+    Box::new(
+        PgError::new(
+            PANIC,
+            format!("could not open critical system index {indexoid}"),
+        )
+        .with_sqlstate(ERRCODE_DATA_CORRUPTED),
+    )
+}
+
+fn load_critical_index(indexoid: Oid, heapoid: Oid) -> PgResult<()> {
+    // Catalog before index, or deadlock against exclusive lockers.
+    lmgr::LockRelationOid(heapoid, AccessShareLock)?;
+    lmgr::LockRelationOid(indexoid, AccessShareLock)?;
+    let ird = build::RelationBuildDesc(indexoid, true)?;
+    if ird.is_none() {
+        return Err(critical_index_missing(indexoid));
+    }
+    // C: rd_isnailed = true, rd_refcnt = 1 (the nail is the flag here).
+    with_state(|st| {
+        if let Some(ent) = st.id_cache.get_mut(&indexoid) {
+            ent.nailed = true;
+        }
+    });
+    lmgr::UnlockRelationOid(indexoid, AccessShareLock)?;
+    lmgr::UnlockRelationOid(heapoid, AccessShareLock)?;
+    // C also pre-warms RelationGetIndexAttOptions (derived-data unit).
+    Ok(())
+}
+
+fn init_file_path(shared: bool) -> Option<PathBuf> {
+    if shared {
+        Some(Path::new("global").join(RELCACHE_INIT_FILENAME))
+    } else {
+        init_small::globals::DatabasePath()
+            .map(|p| Path::new(p).join(RELCACHE_INIT_FILENAME))
+    }
+}
+
+struct Rd<'a> {
+    b: &'a [u8],
+    off: usize,
+}
+
+impl<'a> Rd<'a> {
+    fn bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.off.checked_add(n)?;
+        let s = self.b.get(self.off..end)?;
+        self.off = end;
+        Some(s)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.bytes(1)?[0])
+    }
+    fn boolean(&mut self) -> Option<bool> {
+        match self.u8()? {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+    fn i8(&mut self) -> Option<i8> {
+        Some(self.u8()? as i8)
+    }
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_ne_bytes(self.bytes(2)?.try_into().ok()?))
+    }
+    fn i16(&mut self) -> Option<i16> {
+        Some(self.u16()? as i16)
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_ne_bytes(self.bytes(4)?.try_into().ok()?))
+    }
+    fn i32(&mut self) -> Option<i32> {
+        Some(self.u32()? as i32)
+    }
+    fn f32(&mut self) -> Option<f32> {
+        Some(f32::from_bits(self.u32()?))
+    }
+    fn f64(&mut self) -> Option<f64> {
+        Some(f64::from_bits(u64::from_ne_bytes(self.bytes(8)?.try_into().ok()?)))
+    }
+    fn at_end(&self) -> bool {
+        self.off == self.b.len()
+    }
+}
+
+pub(crate) type Buf<'mcx> = PgVec<'mcx, u8>;
+
+fn put_u8(buf: &mut Buf<'_>, v: u8) {
+    buf.push(v);
+}
+fn put_bool(buf: &mut Buf<'_>, v: bool) {
+    buf.push(v as u8);
+}
+fn put_i8(buf: &mut Buf<'_>, v: i8) {
+    buf.push(v as u8);
+}
+fn put_u16(buf: &mut Buf<'_>, v: u16) {
+    buf.extend_from_slice(&v.to_ne_bytes());
+}
+fn put_i16(buf: &mut Buf<'_>, v: i16) {
+    buf.extend_from_slice(&v.to_ne_bytes());
+}
+fn put_u32(buf: &mut Buf<'_>, v: u32) {
+    buf.extend_from_slice(&v.to_ne_bytes());
+}
+fn put_i32(buf: &mut Buf<'_>, v: i32) {
+    buf.extend_from_slice(&v.to_ne_bytes());
+}
+fn put_f32(buf: &mut Buf<'_>, v: f32) {
+    put_u32(buf, v.to_bits());
+}
+fn put_f64(buf: &mut Buf<'_>, v: f64) {
+    buf.extend_from_slice(&v.to_bits().to_ne_bytes());
+}
+
+fn put_class(buf: &mut Buf<'_>, f: &FormData_pg_class) {
+    buf.extend_from_slice(&f.relname.data);
+    put_u32(buf, f.relnamespace);
+    put_u32(buf, f.reltype);
+    put_u32(buf, f.relowner);
+    put_u32(buf, f.relam);
+    put_u32(buf, f.relfilenode);
+    put_u32(buf, f.reltablespace);
+    put_i32(buf, f.relpages);
+    put_f32(buf, f.reltuples);
+    put_i32(buf, f.relallvisible);
+    put_u32(buf, f.reltoastrelid);
+    put_bool(buf, f.relhasindex);
+    put_bool(buf, f.relisshared);
+    put_u8(buf, f.relpersistence);
+    put_u8(buf, f.relkind);
+    put_bool(buf, f.relhassubclass);
+    put_bool(buf, f.relrowsecurity);
+    put_bool(buf, f.relispopulated);
+    put_u8(buf, f.relreplident);
+    put_bool(buf, f.relispartition);
+    put_u32(buf, f.relfrozenxid);
+    put_u32(buf, f.relminmxid);
+}
+
+fn parse_class(rd: &mut Rd<'_>) -> Option<FormData_pg_class> {
+    Some(FormData_pg_class {
+        relname: NameData { data: rd.bytes(64)?.try_into().ok()? },
+        relnamespace: rd.u32()?,
+        reltype: rd.u32()?,
+        relowner: rd.u32()?,
+        relam: rd.u32()?,
+        relfilenode: rd.u32()?,
+        reltablespace: rd.u32()?,
+        relpages: rd.i32()?,
+        reltuples: rd.f32()?,
+        relallvisible: rd.i32()?,
+        reltoastrelid: rd.u32()?,
+        relhasindex: rd.boolean()?,
+        relisshared: rd.boolean()?,
+        relpersistence: rd.u8()?,
+        relkind: rd.u8()?,
+        relhassubclass: rd.boolean()?,
+        relrowsecurity: rd.boolean()?,
+        relispopulated: rd.boolean()?,
+        relreplident: rd.u8()?,
+        relispartition: rd.boolean()?,
+        relfrozenxid: rd.u32()?,
+        relminmxid: rd.u32()?,
+    })
+}
+
+fn put_attr(buf: &mut Buf<'_>, a: &FormData_pg_attribute) {
+    put_u32(buf, a.attrelid);
+    buf.extend_from_slice(&a.attname.data);
+    put_u32(buf, a.atttypid);
+    put_i16(buf, a.attlen);
+    put_i16(buf, a.attnum);
+    put_i32(buf, a.atttypmod);
+    put_i16(buf, a.attndims);
+    put_bool(buf, a.attbyval);
+    put_i8(buf, a.attalign);
+    put_i8(buf, a.attstorage);
+    put_i8(buf, a.attcompression);
+    put_bool(buf, a.attnotnull);
+    put_bool(buf, a.atthasdef);
+    put_bool(buf, a.atthasmissing);
+    put_i8(buf, a.attidentity);
+    put_i8(buf, a.attgenerated);
+    put_bool(buf, a.attisdropped);
+    put_bool(buf, a.attislocal);
+    put_i16(buf, a.attinhcount);
+    put_u32(buf, a.attcollation);
+}
+
+fn parse_attr(rd: &mut Rd<'_>) -> Option<FormData_pg_attribute> {
+    Some(FormData_pg_attribute {
+        attrelid: rd.u32()?,
+        attname: NameData { data: rd.bytes(64)?.try_into().ok()? },
+        atttypid: rd.u32()?,
+        attlen: rd.i16()?,
+        attnum: rd.i16()?,
+        atttypmod: rd.i32()?,
+        attndims: rd.i16()?,
+        attbyval: rd.boolean()?,
+        attalign: rd.i8()?,
+        attstorage: rd.i8()?,
+        attcompression: rd.i8()?,
+        attnotnull: rd.boolean()?,
+        atthasdef: rd.boolean()?,
+        atthasmissing: rd.boolean()?,
+        attidentity: rd.i8()?,
+        attgenerated: rd.i8()?,
+        attisdropped: rd.boolean()?,
+        attislocal: rd.boolean()?,
+        attinhcount: rd.i16()?,
+        attcollation: rd.u32()?,
+    })
+}
+
+/// Validate the physical-layout fields of an on-disk attribute before it is
+/// installed into a TupleDesc. The init file is untrusted on-disk bytes, and
+/// downstream unsafe deform (attlen/attbyval/attalign drive pointer
+/// arithmetic and by-value fetches); C largely trusts this file, but the
+/// port's unchecked deform makes validation mandatory. A tampered
+/// pg_internal.init otherwise drives OOB reads.
+///
+/// The rules mirror TypeCreate (catalog/pg_type.c): attlen must be a legal
+/// typlen (>0, or -1 varlena / -2 cstring); attbyval only for a fixed length
+/// that fetch_att()/store_att_byval() support (sizeof(char/int16/int32/Datum),
+/// Datum == 8 bytes here) with the matching alignment; varlena needs int/
+/// double alignment and cstring needs char alignment. attalign must be one of
+/// the four legal codes in every case (populate_compact_attribute otherwise
+/// panics on the compact-attr mapping).
+fn attr_layout_valid(a: &FormData_pg_attribute) -> bool {
+    // attalign must be a legal alignment code (c/s/i/d).
+    if !matches!(
+        a.attalign,
+        TYPALIGN_CHAR | TYPALIGN_SHORT | TYPALIGN_INT | TYPALIGN_DOUBLE
+    ) {
+        return false;
+    }
+    // attlen must be a legal typlen: positive fixed, -1 varlena, or -2 cstring.
+    if !(a.attlen > 0 || a.attlen == -1 || a.attlen == -2) {
+        return false;
+    }
+    if a.attbyval {
+        // Pass-by-value: fixed length supported by fetch_att/store_att_byval,
+        // with the alignment that agrees with that size.
+        match a.attlen {
+            1 => a.attalign == TYPALIGN_CHAR,
+            2 => a.attalign == TYPALIGN_SHORT,
+            4 => a.attalign == TYPALIGN_INT,
+            // SIZEOF_DATUM == 8 on this port (Datum is 8 bytes).
+            8 => a.attalign == TYPALIGN_DOUBLE,
+            _ => false,
+        }
+    } else {
+        // varlena types must have int alignment or better.
+        if a.attlen == -1 && !(a.attalign == TYPALIGN_INT || a.attalign == TYPALIGN_DOUBLE) {
+            return false;
+        }
+        // cstring must have char alignment.
+        if a.attlen == -2 && a.attalign != TYPALIGN_CHAR {
+            return false;
+        }
+        true
+    }
+}
+
+fn put_options(buf: &mut Buf<'_>, o: &Option<RdOptions>) {
+    match o {
+        None => put_u8(buf, 0),
+        Some(RdOptions::Std(s)) => {
+            put_u8(buf, 1);
+            put_i32(buf, s.fillfactor);
+            put_i32(buf, s.toast_tuple_target);
+            let a = &s.autovacuum;
+            put_bool(buf, a.enabled);
+            put_i32(buf, a.vacuum_threshold);
+            put_i32(buf, a.vacuum_max_threshold);
+            put_i32(buf, a.vacuum_ins_threshold);
+            put_i32(buf, a.analyze_threshold);
+            put_i32(buf, a.vacuum_cost_limit);
+            put_i32(buf, a.freeze_min_age);
+            put_i32(buf, a.freeze_max_age);
+            put_i32(buf, a.freeze_table_age);
+            put_i32(buf, a.multixact_freeze_min_age);
+            put_i32(buf, a.multixact_freeze_max_age);
+            put_i32(buf, a.multixact_freeze_table_age);
+            put_i32(buf, a.log_min_duration);
+            put_f64(buf, a.vacuum_cost_delay);
+            put_f64(buf, a.vacuum_scale_factor);
+            put_f64(buf, a.vacuum_ins_scale_factor);
+            put_f64(buf, a.analyze_scale_factor);
+            put_bool(buf, s.user_catalog_table);
+            put_i32(buf, s.parallel_workers);
+            put_i32(buf, s.vacuum_index_cleanup as i32);
+            put_bool(buf, s.vacuum_truncate);
+            put_bool(buf, s.vacuum_truncate_set);
+            put_f64(buf, s.vacuum_max_eager_freeze_failure_rate);
+        }
+        Some(RdOptions::View(v)) => {
+            put_u8(buf, 2);
+            put_bool(buf, v.security_barrier);
+            put_bool(buf, v.security_invoker);
+            put_i32(buf, v.check_option as i32);
+        }
+        Some(RdOptions::BTree(o)) => {
+            put_u8(buf, 3);
+            put_i32(buf, o.fillfactor);
+            put_f64(buf, o.vacuum_cleanup_index_scale_factor);
+            put_bool(buf, o.deduplicate_items);
+        }
+        Some(RdOptions::Hash(o)) => {
+            put_u8(buf, 4);
+            put_i32(buf, o.fillfactor);
+        }
+        Some(RdOptions::Gin(o)) => {
+            put_u8(buf, 5);
+            put_bool(buf, o.use_fast_update);
+            put_i32(buf, o.pending_list_cleanup_size);
+        }
+        Some(RdOptions::Gist(o)) => {
+            put_u8(buf, 6);
+            put_i32(buf, o.fillfactor);
+            put_i32(buf, o.buffering_mode as i32);
+        }
+        Some(RdOptions::SpGist(o)) => {
+            put_u8(buf, 7);
+            put_i32(buf, o.fillfactor);
+        }
+        Some(RdOptions::Brin(o)) => {
+            put_u8(buf, 8);
+            put_i32(buf, o.pages_per_range);
+            put_bool(buf, o.autosummarize);
+        }
+        Some(RdOptions::Pgrcolumnar(o)) => {
+            put_u8(buf, 9);
+            put_i32(
+                buf,
+                match o.codec {
+                    ::types_rel::PgrcolumnarCodec::Auto => 0,
+                    ::types_rel::PgrcolumnarCodec::Lz4 => 1,
+                    ::types_rel::PgrcolumnarCodec::Zstd => 2,
+                    ::types_rel::PgrcolumnarCodec::Plain => 3,
+                },
+            );
+            put_i32(buf, o.zstd_level);
+            let ck = o.cluster_key().as_bytes();
+            put_u16(buf, ck.len() as u16);
+            buf.extend_from_slice(ck);
+            let cc = o.codec_cols().as_bytes();
+            put_u16(buf, cc.len() as u16);
+            buf.extend_from_slice(cc);
+        }
+        Some(RdOptions::Hnsw(o)) => {
+            put_u8(buf, 10);
+            put_i32(buf, o.m);
+            put_i32(buf, o.ef_construction);
+        }
+        Some(RdOptions::Bloom(o)) => {
+            put_u8(buf, 11);
+            put_i32(buf, o.bloom_length);
+            for b in o.bit_size.iter() {
+                put_i32(buf, *b);
+            }
+        }
+    }
+}
+
+fn parse_options(rd: &mut Rd<'_>) -> Option<Option<RdOptions>> {
+    match rd.u8()? {
+        0 => Some(None),
+        1 => Some(Some(RdOptions::Std(StdRdOptions {
+            fillfactor: rd.i32()?,
+            toast_tuple_target: rd.i32()?,
+            autovacuum: AutoVacOpts {
+                enabled: rd.boolean()?,
+                vacuum_threshold: rd.i32()?,
+                vacuum_max_threshold: rd.i32()?,
+                vacuum_ins_threshold: rd.i32()?,
+                analyze_threshold: rd.i32()?,
+                vacuum_cost_limit: rd.i32()?,
+                freeze_min_age: rd.i32()?,
+                freeze_max_age: rd.i32()?,
+                freeze_table_age: rd.i32()?,
+                multixact_freeze_min_age: rd.i32()?,
+                multixact_freeze_max_age: rd.i32()?,
+                multixact_freeze_table_age: rd.i32()?,
+                log_min_duration: rd.i32()?,
+                vacuum_cost_delay: rd.f64()?,
+                vacuum_scale_factor: rd.f64()?,
+                vacuum_ins_scale_factor: rd.f64()?,
+                analyze_scale_factor: rd.f64()?,
+            },
+            user_catalog_table: rd.boolean()?,
+            parallel_workers: rd.i32()?,
+            vacuum_index_cleanup: match rd.i32()? {
+                0 => STDRD_OPTION_VACUUM_INDEX_CLEANUP_AUTO,
+                1 => STDRD_OPTION_VACUUM_INDEX_CLEANUP_OFF,
+                2 => STDRD_OPTION_VACUUM_INDEX_CLEANUP_ON,
+                _ => return None,
+            },
+            vacuum_truncate: rd.boolean()?,
+            vacuum_truncate_set: rd.boolean()?,
+            vacuum_max_eager_freeze_failure_rate: rd.f64()?,
+        }))),
+        2 => Some(Some(RdOptions::View(ViewOptions {
+            security_barrier: rd.boolean()?,
+            security_invoker: rd.boolean()?,
+            check_option: match rd.i32()? {
+                0 => VIEW_OPTION_CHECK_OPTION_NOT_SET,
+                1 => VIEW_OPTION_CHECK_OPTION_LOCAL,
+                2 => VIEW_OPTION_CHECK_OPTION_CASCADED,
+                _ => return None,
+            },
+        }))),
+        3 => Some(Some(RdOptions::BTree(BTOptions {
+            fillfactor: rd.i32()?,
+            vacuum_cleanup_index_scale_factor: rd.f64()?,
+            deduplicate_items: rd.boolean()?,
+        }))),
+        4 => Some(Some(RdOptions::Hash(HashOptions { fillfactor: rd.i32()? }))),
+        5 => Some(Some(RdOptions::Gin(GinOptions {
+            use_fast_update: rd.boolean()?,
+            pending_list_cleanup_size: rd.i32()?,
+        }))),
+        6 => Some(Some(RdOptions::Gist(GistOptions {
+            fillfactor: rd.i32()?,
+            buffering_mode: match rd.i32()? {
+                0 => GIST_OPTION_BUFFERING_AUTO,
+                1 => GIST_OPTION_BUFFERING_ON,
+                2 => GIST_OPTION_BUFFERING_OFF,
+                _ => return None,
+            },
+        }))),
+        7 => Some(Some(RdOptions::SpGist(SpGistOptions { fillfactor: rd.i32()? }))),
+        8 => Some(Some(RdOptions::Brin(BrinOptions {
+            pages_per_range: rd.i32()?,
+            autosummarize: rd.boolean()?,
+        }))),
+        9 => {
+            let mut o = ::types_rel::PgrcolumnarOptions::default();
+            o.codec = match rd.i32()? {
+                0 => ::types_rel::PgrcolumnarCodec::Auto,
+                1 => ::types_rel::PgrcolumnarCodec::Lz4,
+                2 => ::types_rel::PgrcolumnarCodec::Zstd,
+                3 => ::types_rel::PgrcolumnarCodec::Plain,
+                _ => return None,
+            };
+            o.zstd_level = rd.i32()?;
+            let n = rd.u16()? as usize;
+            let ck = core::str::from_utf8(rd.bytes(n)?).ok()?;
+            if !o.set_cluster_key(ck) {
+                return None;
+            }
+            let n = rd.u16()? as usize;
+            let cc = core::str::from_utf8(rd.bytes(n)?).ok()?;
+            if !o.set_codec_cols(cc) {
+                return None;
+            }
+            Some(Some(RdOptions::Pgrcolumnar(o)))
+        }
+        10 => Some(Some(RdOptions::Hnsw(types_rel::reloptions::HnswOptions {
+            m: rd.i32()?,
+            ef_construction: rd.i32()?,
+        }))),
+        11 => {
+            let bloom_length = rd.i32()?;
+            let mut bit_size = [0i32; 32];
+            for b in bit_size.iter_mut() {
+                *b = rd.i32()?;
+            }
+            Some(Some(RdOptions::Bloom(types_rel::reloptions::BloomOptions {
+                bloom_length,
+                bit_size,
+            })))
+        }
+        _ => None,
+    }
+}
+
+fn put_opt_str(buf: &mut Buf<'_>, s: &Option<PgString<'_>>) {
+    match s {
+        None => put_u8(buf, 0),
+        Some(s) => {
+            put_u8(buf, 1);
+            put_u32(buf, s.as_bytes().len() as u32);
+            buf.extend_from_slice(s.as_bytes());
+        }
+    }
+}
+
+fn parse_opt_str(rd: &mut Rd<'_>, mcx: Mcx<'static>) -> Option<Option<PgString<'static>>> {
+    match rd.u8()? {
+        0 => Some(None),
+        1 => {
+            let len = rd.u32()? as usize;
+            let s = core::str::from_utf8(rd.bytes(len)?).ok()?;
+            Some(Some(PgString::from_str_in(s, mcx).ok()?))
+        }
+        _ => None,
+    }
+}
+
+fn put_oid_vec(buf: &mut Buf<'_>, v: &[Oid]) {
+    put_u16(buf, v.len() as u16);
+    for &o in v {
+        put_u32(buf, o);
+    }
+}
+
+fn parse_oid_vec(rd: &mut Rd<'_>, mcx: Mcx<'static>) -> Option<PgVec<'static, Oid>> {
+    let n = rd.u16()? as usize;
+    let mut v = mcx::vec_with_capacity_in(mcx, n).ok()?;
+    for _ in 0..n {
+        v.push(rd.u32()?);
+    }
+    Some(v)
+}
+
+fn put_i16_vec(buf: &mut Buf<'_>, v: &[i16]) {
+    put_u16(buf, v.len() as u16);
+    for &o in v {
+        put_i16(buf, o);
+    }
+}
+
+fn parse_i16_vec(rd: &mut Rd<'_>, mcx: Mcx<'static>) -> Option<PgVec<'static, i16>> {
+    let n = rd.u16()? as usize;
+    let mut v = mcx::vec_with_capacity_in(mcx, n).ok()?;
+    for _ in 0..n {
+        v.push(rd.i16()?);
+    }
+    Some(v)
+}
+
+fn put_index(buf: &mut Buf<'_>, i: &FormData_pg_index<'_>) {
+    put_u32(buf, i.indexrelid);
+    put_u32(buf, i.indrelid);
+    put_i16(buf, i.indnatts);
+    put_i16(buf, i.indnkeyatts);
+    put_bool(buf, i.indisunique);
+    put_bool(buf, i.indnullsnotdistinct);
+    put_bool(buf, i.indisprimary);
+    put_bool(buf, i.indisexclusion);
+    put_bool(buf, i.indimmediate);
+    put_bool(buf, i.indisvalid);
+    put_bool(buf, i.indisready);
+    put_bool(buf, i.indcheckxmin);
+    put_u32(buf, i.indxmin);
+    put_i16_vec(buf, &i.indkey);
+    put_bool(buf, i.has_indpred);
+    put_opt_str(buf, &i.indexprs_src);
+    put_opt_str(buf, &i.indpred_src);
+}
+
+fn parse_index(rd: &mut Rd<'_>, mcx: Mcx<'static>) -> Option<FormData_pg_index<'static>> {
+    Some(FormData_pg_index {
+        indexrelid: rd.u32()?,
+        indrelid: rd.u32()?,
+        indnatts: rd.i16()?,
+        indnkeyatts: rd.i16()?,
+        indisunique: rd.boolean()?,
+        indnullsnotdistinct: rd.boolean()?,
+        indisprimary: rd.boolean()?,
+        indisexclusion: rd.boolean()?,
+        indimmediate: rd.boolean()?,
+        indisvalid: rd.boolean()?,
+        indisready: rd.boolean()?,
+        indcheckxmin: rd.boolean()?,
+        indxmin: rd.u32()?,
+        indkey: parse_i16_vec(rd, mcx)?,
+        has_indpred: rd.boolean()?,
+        indexprs_src: parse_opt_str(rd, mcx)?,
+        indpred_src: parse_opt_str(rd, mcx)?,
+    })
+}
+
+pub(crate) fn encode_entry(buf: &mut Buf<'_>, rel: &RelationData<'static>, nailed: bool) {
+    put_bool(buf, nailed);
+    put_u32(buf, rel.rd_id);
+    put_i32(buf, rel.rd_backend);
+    put_bool(buf, rel.rd_islocaltemp);
+    put_class(buf, &rel.rd_rel);
+    put_bool(buf, rel.rd_hastriggers);
+    put_bool(buf, rel.rd_hasrules);
+    put_u16(buf, rel.rd_att.natts as u16);
+    for a in rel.rd_att.attrs.iter() {
+        put_attr(buf, a);
+    }
+    put_options(buf, &rel.rd_options.as_deref().copied());
+    if rel.rd_rel.relkind == RELKIND_INDEX {
+        put_index(buf, rel.rd_index.as_ref().expect("index entry without rd_index"));
+        put_oid_vec(buf, &rel.rd_opcintype);
+        put_oid_vec(buf, &rel.rd_opfamily);
+        put_i16_vec(buf, &rel.rd_indoption);
+        put_oid_vec(buf, &rel.rd_indcollation);
+        put_oid_vec(buf, &rel.rd_support);
+    }
+}
+
+fn parse_entry(rd: &mut Rd<'_>, mcx: Mcx<'static>) -> Option<(RelationData<'static>, bool)> {
+    let nailed = rd.boolean()?;
+    let rd_id = rd.u32()?;
+    let rd_backend = rd.i32()?;
+    let rd_islocaltemp = rd.boolean()?;
+    let form = parse_class(rd)?;
+    let rd_hastriggers = rd.boolean()?;
+    let rd_hasrules = rd.boolean()?;
+
+    let natts = rd.u16()? as usize;
+    if natts == 0 || natts > MAX_ATTS {
+        return None;
+    }
+    let mut attrs: PgVec<'static, FormData_pg_attribute> =
+        mcx::vec_with_capacity_in(mcx, natts).ok()?;
+    let mut has_not_null = false;
+    for _ in 0..natts {
+        let a = parse_attr(rd)?;
+        // Untrusted on-disk layout fields drive unsafe deform; reject the file
+        // (rebuild-from-catalogs) before installing a corrupt descriptor.
+        if !attr_layout_valid(&a) {
+            return None;
+        }
+        has_not_null |= a.attnotnull;
+        attrs.push(a);
+    }
+    let mut td = tupdesc::CreateTupleDesc(mcx, &attrs).ok()?;
+    td.tdtypeid = if form.reltype != 0 { form.reltype } else { RECORDOID };
+    td.tdtypmod = -1;
+    td.tdrefcount = 1;
+    if has_not_null {
+        td.constr = Some(mcx::box_new_in(
+            mcx,
+            TupleConstr {
+                defval: PgVec::new_in(mcx),
+                check: PgVec::new_in(mcx),
+                missing: PgVec::new_in(mcx),
+                num_defval: 0,
+                num_check: 0,
+                relchecks: 0,
+                has_not_null: true,
+                has_generated_stored: false,
+                has_generated_virtual: false,
+            },
+        ));
+    }
+
+    let rd_options = parse_options(rd)?;
+
+    let (rd_index, opcintype, opfamily, indoption, indcollation, support, supportinfo) =
+        if form.relkind == RELKIND_INDEX {
+            let idx = parse_index(rd, mcx)?;
+            let nkey = idx.indnkeyatts as usize;
+            let opcintype = parse_oid_vec(rd, mcx)?;
+            let opfamily = parse_oid_vec(rd, mcx)?;
+            let indoption = parse_i16_vec(rd, mcx)?;
+            let indcollation = parse_oid_vec(rd, mcx)?;
+            let support = parse_oid_vec(rd, mcx)?;
+            if nkey == 0
+                || opcintype.len() != nkey
+                || opfamily.len() != nkey
+                || indoption.len() != nkey
+                || indcollation.len() != nkey
+                || support.len() % nkey != 0
+            {
+                return None;
+            }
+            // Same slot-0 preload as RelationInitIndexAccessInfo: btree/hash
+            // resolve BTORDER_PROC eagerly, other AMs dispatch lazily.
+            let amsupport = support.len() / nkey;
+            let mut supportinfo: Vec<Option<types_fmgr::FmgrInfo>> = Vec::with_capacity(nkey);
+            for i in 0..nkey {
+                let proc = if form.relam == BTREE_AM_OID || form.relam == HASH_AM_OID {
+                    *support.get(i * amsupport)?
+                } else {
+                    0
+                };
+                supportinfo.push(if proc != 0 {
+                    Some(fmgr_seams::fmgr_info::call(proc).ok()?)
+                } else {
+                    None
+                });
+            }
+            (Some(idx), opcintype, opfamily, indoption, indcollation, support, supportinfo)
+        } else {
+            (
+                None,
+                PgVec::new_in(mcx),
+                PgVec::new_in(mcx),
+                PgVec::new_in(mcx),
+                PgVec::new_in(mcx),
+                PgVec::new_in(mcx),
+                Vec::new(),
+            )
+        };
+
+    let data = RelationData {
+        rd_locator: Default::default(),
+        rd_smgr: Default::default(),
+        rd_id,
+        rd_backend,
+        rd_islocaltemp,
+        rd_isvalid: core::cell::Cell::new(true),
+        rd_createSubid: core::cell::Cell::new(InvalidSubTransactionId),
+        rd_newRelfilelocatorSubid: core::cell::Cell::new(InvalidSubTransactionId),
+        rd_firstRelfilelocatorSubid: core::cell::Cell::new(InvalidSubTransactionId),
+        rd_droppedSubid: core::cell::Cell::new(InvalidSubTransactionId),
+        rd_lockInfo: lmgr::RelationInitLockInfo(rd_id, form.relisshared),
+        rd_rel: form,
+        rd_att: Rc::new(td),
+        rd_index,
+        rd_opcintype: opcintype,
+        rd_opfamily: opfamily,
+        rd_indoption: indoption,
+        rd_indcollation: indcollation,
+        rd_options: rd_options.map(Box::new),
+        pgstat_enabled: core::cell::Cell::new(false),
+        pgstat_link: core::cell::Cell::new((0, core::ptr::null_mut())),
+        rd_amcache: Default::default(),
+        rd_amcache_hash: Default::default(),
+        rd_amcache_gin: Default::default(),
+        rd_amcache_spgist: Default::default(),
+        rd_support: support,
+        rd_supportinfo: core::cell::RefCell::new(supportinfo),
+        rd_opcoptions: Default::default(),
+        rd_indexlist: Default::default(),
+        rd_trigdesc: Default::default(),
+        rd_hastriggers,
+        rd_hasrules,
+    };
+    Some((data, nailed))
+}
+
+// std Vec: droppy Rc payloads can't live in arena collections (rd_supportinfo
+// precedent); boot-only scratch.
+type ParsedEntries = Vec<(RelationData<'static>, bool)>;
+/// (entry, nailed, start byte offset, end byte offset) — the span allows the
+/// L2-routing loader to re-parse a single entry into CacheMemoryContext when
+/// it cannot ride a shared core (the private fallback arm).
+type ParsedEntriesSpans = Vec<(RelationData<'static>, bool, usize, usize)>;
+
+pub(crate) fn parse_init_file(data: &[u8], mcx: Mcx<'static>) -> Option<(ParsedEntries, usize, usize)> {
+    let (rels, nr, ni) = parse_init_file_spans(data, mcx)?;
+    Some((rels.into_iter().map(|(d, n, _, _)| (d, n)).collect(), nr, ni))
+}
+
+fn parse_init_file_spans(
+    data: &[u8],
+    mcx: Mcx<'static>,
+) -> Option<(ParsedEntriesSpans, usize, usize)> {
+    let mut rd = Rd { b: data, off: 0 };
+    if rd.i32()? != RELCACHE_INIT_FILEMAGIC || rd.u32()? != RELCACHE_INIT_FORMAT {
+        return None;
+    }
+    let mut rels = ParsedEntriesSpans::new();
+    let mut nailed_rels = 0usize;
+    let mut nailed_indexes = 0usize;
+    while !rd.at_end() {
+        let start = rd.off;
+        let (data, nailed) = parse_entry(&mut rd, mcx)?;
+        // Recompute physical addressing: relmapped rels and CREATE DATABASE
+        // copies must not trust the stored relfilenumber.
+        build::RelationInitPhysicalAddr(&data).ok()?;
+        if nailed {
+            if data.rd_rel.relkind == RELKIND_INDEX {
+                nailed_indexes += 1;
+            } else {
+                nailed_rels += 1;
+            }
+        }
+        rels.push((data, nailed, start, rd.off));
+    }
+    Some((rels, nailed_rels, nailed_indexes))
+}
+
+/// Wave-3a: route init-file entries through the shared L2 cores
+/// (install-or-adopt). GUC-wise this is FOLDED into `shared_catalog_cache`
+/// (no separate GUC — the routing is just the L2's install/adopt path applied
+/// at init-file load, and shipping it as part of the L2 keeps one operator
+/// knob). PGRUST_L2_INITFILE=0 remains a harness-only splitter that reverts
+/// to fully-private deserialization while leaving the rest of the L2 on;
+/// PGRUST_L2_CACHE=0 / shared_catalog_cache=off disable it with everything
+/// else.
+fn initfile_l2_routing() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| match std::env::var("PGRUST_L2_INITFILE") {
+        Ok(v) => v.trim() != "0",
+        Err(_) => true,
+    }) && l2cache::enabled()
+        && !l2cache::private_build_mode()
+}
+
+/// The expected-nailed-counts sanity check shared by both load arms.
+fn nailed_counts_ok(shared: bool, nailed_rels: usize, nailed_indexes: usize) -> PgResult<bool> {
+    let (exp_rels, exp_indexes) = if shared {
+        (NUM_CRITICAL_SHARED_RELS, NUM_CRITICAL_SHARED_INDEXES)
+    } else {
+        (NUM_CRITICAL_LOCAL_RELS, NUM_CRITICAL_LOCAL_INDEXES)
+    };
+    if nailed_rels != exp_rels || nailed_indexes != exp_indexes {
+        let kind = if shared { " shared" } else { "" };
+        elog::elog(
+            WARNING,
+            format!(
+                "found {nailed_rels} nailed{kind} rels and {nailed_indexes} nailed{kind} \
+                 indexes in init file, but expected {exp_rels} and {exp_indexes} respectively"
+            ),
+        )?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Wave-3a: install-or-adopt shared cores for init-file entries.
+///
+/// # Generation care (why publishing file content into L2 is sound)
+///
+/// The file represents committed catalog state as of when it was written, and
+/// every DDL that could invalidate an init-file member unlinks BOTH init
+/// files under RelCacheInitLock *before* bumping the L2 generation and
+/// queueing its sinval messages (RelationCacheInitFilePreInvalidate →
+/// inval send → PostInvalidate; write_relcache_init_file rechecks under the
+/// same lock). The loader therefore reads the file bytes AND snapshots the
+/// relcache generation stripes while holding RelCacheInitLock (shared): if
+/// the file exists under the lock, no unlink-protected DDL has invalidated
+/// its content since it was written, so the content is current at exactly the
+/// snapshotted generations. A DDL committing after we release the lock bumps
+/// past our snapshot — our publishes land at the superseded generation, which
+/// laggard readers may legitimately still see (staleness-until-Accept, the
+/// D3.2 semantics) and post-inval readers can never reach.
+///
+/// PUBLISH is restricted to rels for which the unlink invariant actually
+/// holds — RelationIdIsInInitFile(relid) — because only their invalidations
+/// unlink the file. (Every local-file entry passes by construction — the
+/// write path filters on the same predicate; in the shared file the handful
+/// of critical shared indexes without syscache support fall to the private
+/// arm.) ADOPTING an existing core at the snapshotted generation is safe for
+/// any entry: whoever published it did so under the miss-path publish rules.
+///
+/// The first backend to load thus installs cores; every later backend's load
+/// finds and aliases them — shells over core arrays, exactly as the miss
+/// path builds them (~0.4-0.5MB/conn of formerly-private relcache bulk).
+fn load_entries_via_l2(bytes: &[u8], shared: bool, gens: &[u64]) -> PgResult<bool> {
+    use crate::l2core::{shell_from_core, RelCoreShared};
+
+    // Two passes so the per-backend DIRTY footprint of a load stays at the
+    // scratch high-water (~one entry), not the whole file: phys_footprint
+    // counts dirtied-then-freed pages, and a full parse of every entry costs
+    // as many dirty pages as the old private load did — which is exactly the
+    // byte win this routing exists to deliver. Pass 1 validates the file and
+    // records entry spans, resetting the scratch context per entry (aset
+    // reset keeps only the keeper block, so pages are re-used, not re-
+    // dirtied). Pass 2 installs: an adopted core needs no parse at all; only
+    // the first backend (publisher) and the private-arm entries re-parse.
+    let mut scratch = MemoryContext::new("RelCacheInitFileScratch");
+    // SAFETY (both passes): lifetime-erased handle to a context that outlives
+    // every use — each parsed entry is dropped before the next reset()/the
+    // function returns, and nothing installed in the relcache references the
+    // scratch arena: shared cores are deep copies on the global heap
+    // (RelCoreShared::from_built), shells allocate in CacheMemoryContext and
+    // alias only core-owned memory, and the private-fallback arm parses its
+    // byte span into CacheMemoryContext instead.
+    macro_rules! scratch_mcx {
+        () => {
+            unsafe { core::mem::transmute::<Mcx<'_>, Mcx<'static>>(scratch.mcx()) }
+        };
+    }
+
+    // Pass 1: validate every entry + the nailed census before touching any
+    // cache state (a torn file must never half-install).
+    let mut rd = Rd { b: bytes, off: 0 };
+    if rd.i32() != Some(RELCACHE_INIT_FILEMAGIC) || rd.u32() != Some(RELCACHE_INIT_FORMAT) {
+        return Ok(false);
+    }
+    // (start, end, relid, nailed)
+    let mut metas: Vec<(usize, usize, Oid, bool)> = Vec::new();
+    let mut nailed_rels = 0usize;
+    let mut nailed_indexes = 0usize;
+    while !rd.at_end() {
+        let start = rd.off;
+        let tmp: Mcx<'static> = scratch_mcx!();
+        let Some((data, nailed)) = parse_entry(&mut rd, tmp) else {
+            return Ok(false);
+        };
+        // Same reject-the-file semantics the private loader gives a physaddr
+        // failure (parse_init_file_spans's `.ok()?`).
+        if build::RelationInitPhysicalAddr(&data).is_err() {
+            return Ok(false);
+        }
+        if nailed {
+            if data.rd_rel.relkind == RELKIND_INDEX {
+                nailed_indexes += 1;
+            } else {
+                nailed_rels += 1;
+            }
+        }
+        metas.push((start, rd.off, data.rd_id, nailed));
+        drop(data);
+        scratch.reset();
+    }
+    if !nailed_counts_ok(shared, nailed_rels, nailed_indexes)? {
+        return Ok(false);
+    }
+
+    // Shared catalogs are keyed db=InvalidOid (loaded before MyDatabaseId is
+    // set, and identical for every database); local entries use the same
+    // (relid, MyDatabaseId) key the miss path publishes under.
+    let db = if shared { types_core::InvalidOid } else { init_small::globals::MyDatabaseId() };
+    let parse_span = |mcx: Mcx<'static>, start: usize, end: usize| -> PgResult<(RelationData<'static>, bool)> {
+        let mut rd = Rd { b: &bytes[..end], off: start };
+        let Some((data, nailed)) = parse_entry(&mut rd, mcx) else {
+            // Unreachable: the same bytes parsed in pass 1.
+            return Err(Box::new(
+                PgError::error("init file entry failed to re-parse".to_string())
+                    .with_sqlstate(ERRCODE_INTERNAL_ERROR),
+            ));
+        };
+        // Recompute physical addressing: relmapped rels and CREATE DATABASE
+        // copies must not trust the stored relfilenumber.
+        build::RelationInitPhysicalAddr(&data)?;
+        Ok((data, nailed))
+    };
+
+    // Pass 2: install. Adopt-hit entries never parse; publish/private arms do.
+    for &(start, end, relid, nailed) in metas.iter() {
+        let gen = gens[l2cache::rel_stripe_of(relid)];
+        let key = l2cache::L2Key { kind: l2cache::KIND_REL, id: relid, db, hash: 0 };
+        let core: Option<std::sync::Arc<RelCoreShared>> = if let Some(v) =
+            l2cache::lookup(key, gen, |a| a.is::<RelCoreShared>())
+        {
+            Some(v.downcast().expect("KIND_REL entries are RelCoreShared"))
+        } else if RelationIdIsInInitFile(relid) {
+            // Publisher arm: parse into scratch, deep-copy to a shared core.
+            let tmp: Mcx<'static> = scratch_mcx!();
+            let (data, _) = parse_span(tmp, start, end)?;
+            let built = RelCoreShared::from_built(&data).map(|c| {
+                let sz = c.approx_bytes();
+                let v: std::sync::Arc<dyn core::any::Any + Send + Sync> = std::sync::Arc::new(c);
+                l2cache::insert(key, gen, v, sz, |a| a.is::<RelCoreShared>())
+                    .downcast()
+                    .expect("KIND_REL entries are RelCoreShared")
+            });
+            drop(data);
+            scratch.reset();
+            built
+        } else {
+            None
+        };
+        match core {
+            Some(core) => {
+                let rel = Rc::new(shell_from_core(&core)?);
+                store::insert(Rc::clone(&rel), nailed, false)?;
+                rel.rd_isvalid.set(true);
+            }
+            None => {
+                // Private arm: not shareable (or not unlink-protected) —
+                // parse this entry's bytes into CacheMemoryContext, i.e.
+                // exactly today's load for this one entry.
+                let (data, nailed2) = parse_span(crate::cache_mcx(), start, end)?;
+                debug_assert_eq!(nailed2, nailed);
+                store::insert(Rc::new(data), nailed2, false)?;
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn load_relcache_init_file(shared: bool) -> PgResult<bool> {
+    let Some(path) = init_file_path(shared) else {
+        return Ok(false);
+    };
+    // vfs-routed (provider-seam reroute): init files are datadir domain;
+    // std::fs would bypass the sim namespace.
+    let path_s = path.to_str().expect("datadir paths are UTF-8");
+    // A newer C pg_internal.init beside ours means a C backend served this
+    // datadir after we wrote our file; C's DDL unlinks only its own name, so
+    // ours may be stale — rebuild. (Under sim, vfs mtimes are all zero and
+    // no C backend can enter the sim world, so this never fires there.)
+    let mtime_fresh = || -> bool {
+        let mtime_of = |p: &Path| -> Option<(i64, i64)> {
+            let mut st = fd::FileInfo::zeroed();
+            (fd::pg_stat(p.to_str()?, &mut st) == 0).then_some((st.mtime_sec, st.mtime_nsec))
+        };
+        match (mtime_of(&path), mtime_of(&path.with_file_name(C_RELCACHE_INIT_FILENAME))) {
+            (Some(ours), Some(theirs)) => theirs <= ours,
+            _ => true,
+        }
+    };
+
+    if initfile_l2_routing() {
+        // Cheap unlocked probe first: the common no-file case (fresh datadir,
+        // post-DDL rebuild) must not touch the LWLock at all.
+        if fd::read_whole_file(path_s).is_err() {
+            return Ok(false);
+        }
+        // Re-read + generation snapshot under RelCacheInitLock (shared): see
+        // load_entries_via_l2's generation-care contract. Concurrent loaders
+        // proceed in parallel; only DDL pre-invalidate and file writes hold
+        // it exclusively, briefly.
+        let lock = lwlock::main_lock(RELCACHE_INIT_LOCK_OFFSET);
+        lwlock::LWLockAcquire(lock, lwlock::LW_SHARED, init_small::globals::MyProcNumber())?;
+        let got = (|| {
+            let bytes = fd::read_whole_file(path_s).ok()?;
+            if !mtime_fresh() {
+                return None;
+            }
+            Some((bytes, l2cache::rel_gen_snapshot()))
+        })();
+        lwlock::LWLockRelease(lock)?;
+        let Some((bytes, gens)) = got else {
+            return Ok(false);
+        };
+        if !load_entries_via_l2(&bytes, shared, &gens)? {
+            return Ok(false);
+        }
+        // The parse scratch context just died into the thread-local allocator
+        // heap; hand its segments back now. Without this the routed load's
+        // whole byte win hides as per-thread mimalloc retention (measured:
+        // warmed-100 footprint flat despite 139 entries turning into shells).
+        let _ = mcx::release_retained();
+    } else {
+        let Ok(bytes) = fd::read_whole_file(path_s) else {
+            return Ok(false);
+        };
+        if !mtime_fresh() {
+            return Ok(false);
+        }
+        let mcx = crate::cache_mcx();
+        let Some((rels, nailed_rels, nailed_indexes)) = parse_init_file(&bytes, mcx) else {
+            return Ok(false);
+        };
+        if !nailed_counts_ok(shared, nailed_rels, nailed_indexes)? {
+            return Ok(false);
+        }
+        for (data, nailed) in rels {
+            store::insert(Rc::new(data), nailed, false)?;
+        }
+    }
+    with_state(|st| {
+        if shared {
+            st.critical_shared_relcaches_built = true;
+        } else {
+            st.critical_relcaches_built = true;
+        }
+    });
+    Ok(true)
+}
+
+// relcache.c:6647/6750/6802/6806: ereport(FATAL, (errcode_for_file_access(),
+// errmsg_internal("could not write init file: %m"))) -- the backend exits,
+// the SQLSTATE follows errno (ENOSPC = 53100) and %m is strerror text.
+#[track_caller]
+#[cold]
+#[inline(never)]
+fn could_not_write(e: std::io::Error) -> Box<PgError> {
+    let errnum = e.raw_os_error().unwrap_or(0);
+    Box::new(
+        PgError::new(
+            FATAL,
+            format!("could not write init file: {}", elog::errno::strerror(errnum)),
+        )
+        .with_sqlstate(elog::errno::sqlstate_for_file_access(errnum))
+        .with_saved_errno(errnum),
+    )
+}
+
+// Wave-3a decision: the write path stays serialized from the L1 RelationData
+// entries, NOT from L2 cores. Shells alias core arrays, so encode_entry reads
+// the identical bytes either way; writes are rare (only the first backend
+// after the file goes missing), and serializing from cores would need a
+// core for every entry including the private-arm ones — complexity for zero
+// byte savings on a cold path.
+fn write_relcache_init_file(shared: bool) -> PgResult<()> {
+    if with_state(|st| st.invals_received != 0) {
+        return Ok(());
+    }
+    let Some(final_path) = init_file_path(shared) else {
+        return Ok(());
+    };
+    // Snapshot outside the state borrow: RelationIdIsInInitFile crosses seams.
+    let entries: Vec<(Rc<RelationData<'static>>, bool)> = with_state(|st| {
+        st.id_cache.iter().map(|(_, e)| (Rc::clone(&e.rel), e.nailed)).collect()
+    });
+
+    let cx = MemoryContext::new("RelCacheInitFileWrite");
+    let mut buf: Buf<'_> = PgVec::new_in(cx.mcx());
+    put_i32(&mut buf, RELCACHE_INIT_FILEMAGIC);
+    put_u32(&mut buf, RELCACHE_INIT_FORMAT);
+    for (rel, nailed) in &entries {
+        if rel.rd_rel.relisshared != shared {
+            continue;
+        }
+        // Local file: only rels a relcache inval would invalidate the file for.
+        if !shared && !RelationIdIsInInitFile(rel.rd_id) {
+            debug_assert!(!*nailed);
+            continue;
+        }
+        encode_entry(&mut buf, rel, *nailed);
+    }
+
+    // Temp file + rename: a backend starting concurrently must never see a
+    // partially written file. C's temp name is unique per WRITER because
+    // MyProcPid is per-process; under the thread model every backend shares
+    // one pid, so the pid alone would let two concurrently-starting
+    // sessions of the same database open THE SAME temp file (each O_TRUNCs
+    // the other's partial writes; the survivor renames a torn file into
+    // place — the loader's magic/format/nailed-count checks reject it, so
+    // the damage is a silent rebuild, but the C uniqueness contract is
+    // still owed). MyProcNumber is unique per live backend thread and
+    // restores it.
+    let temp_path = final_path.with_file_name(format!(
+        "{}.{}.{}",
+        RELCACHE_INIT_FILENAME,
+        init_small::globals::process_id(),
+        init_small::globals::MyProcNumber()
+    ));
+    // vfs-routed (provider-seam reroute): datadir-domain create/write/rename
+    // must ride the vfs; std::fs would bypass the sim namespace.
+    let temp_s = temp_path.to_str().expect("datadir paths are UTF-8");
+    let _ = fd::pg_unlink(temp_s);
+    let fd_ = match fd::OpenTransientFile(temp_s, libc::O_CREAT | libc::O_TRUNC | libc::O_WRONLY) {
+        Ok(f) if f >= 0 => f,
+        _ => {
+            // relcache.c:6633-6637: ereport(WARNING, (errcode_for_file_access(),
+            // errmsg("could not create relation-cache initialization file
+            // \"%s\": %m"), errdetail("Continuing anyway, but there's
+            // something wrong."))) -- strerror text, not io::Error's
+            // "(os error N)"; the session goes on without an init file.
+            let errnum = fd::get_errno();
+            elog::ereport(WARNING)
+                .errcode(elog::errno::sqlstate_for_file_access(errnum))
+                .errmsg(format!(
+                    "could not create relation-cache initialization file \"{}\": {}",
+                    temp_path.display(),
+                    elog::errno::strerror(errnum)
+                ))
+                .errdetail("Continuing anyway, but there's something wrong.")
+                .finish(here())?;
+            return Ok(());
+        }
+    };
+    let mut off: usize = 0;
+    while off < buf.len() {
+        let n = fd::pg_pwrite(fd_, &buf[off..], off as i64);
+        if n <= 0 {
+            let e = std::io::Error::from_raw_os_error(fd::get_errno());
+            fd::CloseTransientFile(fd_);
+            return Err(could_not_write(e));
+        }
+        off += n as usize;
+    }
+    if fd::CloseTransientFile(fd_) != 0 {
+        return Err(could_not_write(std::io::Error::from_raw_os_error(fd::get_errno())));
+    }
+
+    // Stale-write race: recheck invals under RelCacheInitLock after draining
+    // SI; another backend's committed DDL between our snapshot and here must
+    // win (its unlink already happened or its SI reaches us now).
+    let lock = lwlock::main_lock(RELCACHE_INIT_LOCK_OFFSET);
+    lwlock::LWLockAcquire(lock, lwlock::LW_EXCLUSIVE, init_small::globals::MyProcNumber())?;
+    let result = (|| -> PgResult<()> {
+        inval_seams::accept_invalidation_messages::call()?;
+        if with_state(|st| st.invals_received == 0) {
+            let final_s = final_path.to_str().expect("datadir paths are UTF-8");
+            if fd::pg_rename(temp_s, final_s) < 0 {
+                let _ = fd::pg_unlink(temp_s);
+            }
+        } else {
+            let _ = fd::pg_unlink(temp_s);
+        }
+        Ok(())
+    })();
+    lwlock::LWLockRelease(lock)?;
+    result
+}
+
+pub fn RelationIdIsInInitFile(relationId: Oid) -> bool {
+    if relationId == CAT_PG_SHSECLABEL.relid
+        || relationId == TRIGGER_RELID_NAME_INDEX_ID
+        || relationId == DATABASE_NAME_INDEX_ID
+        || relationId == SHARED_SEC_LABEL_OBJECT_INDEX_ID
+    {
+        // Init-file members without syscache support (C asserts the same).
+        debug_assert!(!syscache_seams::relation_supports_sys_cache::call(relationId));
+        return true;
+    }
+    syscache_seams::relation_supports_sys_cache::call(relationId)
+}
+
+// The elog-style location of a builder report raised here: empty, so the
+// track_caller capture of the ereport call site stands (as elog() does).
+fn here() -> ErrorLocation {
+    ErrorLocation { filename: None, lineno: 0, funcname: None }
+}
+
+// relcache.c:6959-6970 unlink_initfile(initfilename, elevel): any error other
+// than ENOENT is ereport(elevel, (errcode_for_file_access(), errmsg("could not
+// remove cache file \"%s\": %m"))) -- ERROR from the invalidation path, LOG
+// from RelationCacheInitFileRemove at postmaster start. EACCES is 42501 and
+// %m is strerror text, not io::Error's "(os error N)".
+fn unlink_initfile(path: &Path, elevel: ErrorLevel) -> PgResult<()> {
+    // vfs-routed (provider-seam reroute).
+    let path_s = path.to_str().expect("datadir paths are UTF-8");
+    if fd::pg_unlink(path_s) == 0 || fd::get_errno() == libc::ENOENT {
+        return Ok(());
+    }
+    let errnum = fd::get_errno();
+    let message = format!(
+        "could not remove cache file \"{}\": {}",
+        path.display(),
+        elog::errno::strerror(errnum)
+    );
+    let sqlstate = elog::errno::sqlstate_for_file_access(errnum);
+    if elevel >= ERROR {
+        return Err(Box::new(
+            PgError::error(message).with_sqlstate(sqlstate).with_saved_errno(errnum),
+        ));
+    }
+    elog::ereport(elevel).errcode(sqlstate).errmsg(message).finish(here())
+}
+
+fn unlink_both(dir: &Path, elevel: ErrorLevel) -> PgResult<()> {
+    unlink_initfile(&dir.join(RELCACHE_INIT_FILENAME), elevel)?;
+    unlink_initfile(&dir.join(C_RELCACHE_INIT_FILENAME), elevel)
+}
+
+// Serializes against write_relcache_init_file via RelCacheInitLock: unlink
+// under the lock, send SI between Pre and Post, release in Post.
+pub fn RelationCacheInitFilePreInvalidate() -> PgResult<()> {
+    let lock = lwlock::main_lock(RELCACHE_INIT_LOCK_OFFSET);
+    lwlock::LWLockAcquire(lock, lwlock::LW_EXCLUSIVE, init_small::globals::MyProcNumber())?;
+    if let Some(db) = init_small::globals::DatabasePath() {
+        unlink_both(Path::new(db), ERROR)?;
+    }
+    unlink_both(Path::new("global"), ERROR)
+}
+
+pub fn RelationCacheInitFilePostInvalidate() -> PgResult<()> {
+    lwlock::LWLockRelease(lwlock::main_lock(RELCACHE_INIT_LOCK_OFFSET))
+}
+
+// Startup removal: init files may be stale after crash recovery / PITR.
+// vfs-routed walks (provider-seam reroute): the stale files live in the
+// datadir namespace, which is simulated under sim.
+// relcache.c:6905-6950: every failure here is LOG -- unlink_initfile(.., LOG)
+// and ReadDirExtended(.., LOG) -- so a stale init file that cannot be removed
+// or an unreadable pg_tblspc is visible at the default log_min_messages.
+pub fn RelationCacheInitFileRemove() {
+    let _ = unlink_both(Path::new("global"), LOG);
+    remove_in_dir(Path::new("base"));
+    let _ = (|| -> PgResult<()> {
+        let dir = fd::AllocateDir(PG_TBLSPC_DIR)?;
+        while let Some(de) = fd::ReadDirExtended(dir, PG_TBLSPC_DIR, LOG)? {
+            if de.d_name.bytes().all(|b| b.is_ascii_digit()) {
+                remove_in_dir(
+                    &Path::new(PG_TBLSPC_DIR).join(&de.d_name).join(TABLESPACE_VERSION_DIRECTORY),
+                );
+            }
+        }
+        fd::FreeDir(dir)?;
+        Ok(())
+    })();
+}
+
+fn remove_in_dir(tblspc: &Path) {
+    let _ = (|| -> PgResult<()> {
+        let dirname = tblspc.to_str().expect("datadir paths are UTF-8");
+        let dir = fd::AllocateDir(dirname)?;
+        while let Some(de) = fd::ReadDirExtended(dir, dirname, LOG)? {
+            if de.d_name.bytes().all(|b| b.is_ascii_digit()) {
+                let _ = unlink_both(&tblspc.join(&de.d_name), LOG);
+            }
+        }
+        fd::FreeDir(dir)?;
+        Ok(())
+    })();
+}
+
+#[cfg(test)]
+mod hunt_sqlstate {
+    use super::*;
+
+    #[test]
+    fn phase3_cache_lookup_failed_is_fatal_42704() {
+        let e = cache_lookup_failed(1259);
+        assert_eq!(e.sqlstate(), ERRCODE_UNDEFINED_OBJECT);
+        assert_eq!(e.level(), FATAL);
+    }
+
+    #[test]
+    fn load_critical_index_miss_is_panic_xx001() {
+        let e = critical_index_missing(2658);
+        assert_eq!(e.sqlstate(), ERRCODE_DATA_CORRUPTED);
+        assert_eq!(e.level(), PANIC);
+    }
+
+    // relcache.c:6647 ereport(FATAL, errcode_for_file_access(),
+    // errmsg_internal("could not write init file: %m")): ENOSPC is
+    // ERRCODE_DISK_FULL and the text carries strerror, not io::Error's
+    // " (os error N)" suffix.
+    #[test]
+    fn write_init_file_failure_is_fatal_file_access() {
+        let e = could_not_write(std::io::Error::from_raw_os_error(libc::ENOSPC));
+        assert_eq!(e.level(), FATAL);
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_DISK_FULL);
+        assert_eq!(e.message(), "could not write init file: No space left on device");
+    }
+}

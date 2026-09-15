@@ -1,0 +1,246 @@
+//! pg_get_ruledef family (ruleutils.c pg_get_ruledef_worker + make_ruledef).
+//! C reads pg_rewrite through SPI; this scans the oid index directly.
+
+use std::rc::Rc;
+
+use datum::Datum;
+use mcx::{Mcx, MemoryContext};
+use types_core::{AttrNumber, Oid};
+use types_error::{PgError, PgResult, ERRCODE_FEATURE_NOT_SUPPORTED};
+use types_rel::AccessShareLock;
+use types_scan::scankey::{BTEqualStrategyNumber, ScanKeyData};
+use types_tuple::{HeapTupleData, NameData, TupleDescData};
+
+use crate::deparse::{get_rule_expr, DeparseContext, PRETTYINDENT_STD};
+use crate::query::{get_query_def, set_deparse_for_query};
+use crate::viewdef::{view_attnames, WRAP_COLUMN_DEFAULT};
+use crate::{
+    generate_qualified_relation_name, generate_relation_name, quote_identifier, PRETTYFLAG_INDENT,
+    PRETTYFLAG_SCHEMA,
+};
+
+const REWRITE_RELATION_ID: Oid = 2618;
+const REWRITE_OID_INDEX_ID: Oid = 2692;
+const REWRITE_REL_RULENAME_INDEX_ID: Oid = 2693;
+
+const ANUM_PG_REWRITE_OID: i32 = 1;
+const ANUM_PG_REWRITE_RULENAME: i32 = 2;
+const ANUM_PG_REWRITE_EV_CLASS: i32 = 3;
+const ANUM_PG_REWRITE_EV_TYPE: i32 = 4;
+const ANUM_PG_REWRITE_IS_INSTEAD: i32 = 6;
+const ANUM_PG_REWRITE_EV_QUAL: i32 = 7;
+const ANUM_PG_REWRITE_EV_ACTION: i32 = 8;
+
+pub(crate) struct PgRewriteRow {
+    pub(crate) rulename: String,
+    pub(crate) ev_class: Oid,
+    pub(crate) ev_type: u8,
+    pub(crate) is_instead: bool,
+    pub(crate) ev_qual: String,
+    pub(crate) ev_action: String,
+}
+
+pub(crate) fn req(td: &TupleDescData<'_>, tup: &HeapTupleData<'_>, attno: i32) -> Datum {
+    let mut isnull = false;
+    // SAFETY: pg_rewrite row read under its relation's descriptor; every
+    // attno here is NOT NULL in pg_rewrite.
+    let d = unsafe { types_tuple::heap_getattr(tup, attno, td, &mut isnull) };
+    assert!(!isnull, "unexpected null in pg_rewrite column {attno}");
+    d
+}
+
+// ev_qual/ev_action are routinely pglz-compressed inline.
+pub(crate) fn text_attr(td: &TupleDescData<'_>, tup: &HeapTupleData<'_>, attno: i32) -> PgResult<String> {
+    let d = req(td, tup, attno);
+    let p = d.as_usize() as *const u8;
+    // SAFETY: non-null varlena attr datum addresses in-tuple bytes; length is
+    // taken from its own header before slicing.
+    let raw = unsafe {
+        let b0 = *p;
+        let len = if b0 == 0x01 {
+            detoast::varsize_any(core::slice::from_raw_parts(p, 2))
+        } else if b0 & 0x01 != 0 {
+            ((b0 >> 1) & 0x7F) as usize
+        } else {
+            (u32::from_ne_bytes(*(p as *const [u8; 4])) >> 2) as usize
+        };
+        core::slice::from_raw_parts(p, len)
+    };
+    let scratch = MemoryContext::new("pg_rewrite text attr");
+    let image = detoast::detoast_attr(scratch.mcx(), raw)?;
+    Ok(String::from_utf8(image[datum::varlena::VARHDRSZ..].to_vec())
+        .expect("pg_rewrite text attr is UTF-8"))
+}
+
+fn oid_key(attno: i32, oid: Oid) -> PgResult<ScanKeyData> {
+    let mut key = ScanKeyData::empty();
+    key.sk_attno = attno as AttrNumber;
+    key.sk_strategy = BTEqualStrategyNumber;
+    key.sk_collation = types_core::catalog::C_COLLATION_OID;
+    key.sk_func = fmgr_seams::fmgr_info::call(types_core::fmgr::F_OIDEQ)?;
+    key.sk_argument = Datum::from_oid(oid);
+    Ok(key)
+}
+
+fn fetch_rule(ruleoid: Oid) -> PgResult<Option<PgRewriteRow>> {
+    let keys = [oid_key(ANUM_PG_REWRITE_OID, ruleoid)?];
+    fetch_rule_scan(REWRITE_OID_INDEX_ID, &keys)
+}
+
+// pg_get_viewdef_worker's SPI query: ev_class = $1 AND rulename = '_RETURN'.
+pub(crate) fn fetch_view_return_rule(viewoid: Oid) -> PgResult<Option<PgRewriteRow>> {
+    let mut rulename = NameData::default();
+    rulename.namestrcpy("_RETURN");
+    let mut name_key = ScanKeyData::empty();
+    name_key.sk_attno = ANUM_PG_REWRITE_RULENAME as AttrNumber;
+    name_key.sk_strategy = BTEqualStrategyNumber;
+    name_key.sk_collation = types_core::catalog::C_COLLATION_OID;
+    name_key.sk_func = fmgr_seams::fmgr_info::call(types_core::fmgr::F_NAMEEQ)?;
+    name_key.sk_argument = Datum::from_usize(rulename.data.as_ptr() as usize);
+    let keys = [oid_key(ANUM_PG_REWRITE_EV_CLASS, viewoid)?, name_key];
+    fetch_rule_scan(REWRITE_REL_RULENAME_INDEX_ID, &keys)
+}
+
+// C reads pg_rewrite through read-only SPI, i.e. under the active query
+// snapshot rather than the catalog snapshot.
+fn fetch_rule_scan(index_id: Oid, keys: &[ScanKeyData]) -> PgResult<Option<PgRewriteRow>> {
+    let cx = MemoryContext::new("pg_get_ruledef scan");
+    let scan_mcx = cx.mcx();
+    let rel = table::table_open(scan_mcx, REWRITE_RELATION_ID, AccessShareLock)?;
+    let snapshot = snapmgr::ActiveSnapshotSet().then(snapmgr::GetActiveSnapshot);
+    let mut scan = genam::systable_beginscan(
+        scan_mcx,
+        &rel,
+        index_id,
+        relcache::criticalRelcachesBuilt(),
+        snapshot,
+        keys,
+    )?;
+    let mut row: Option<PgRewriteRow> = None;
+    if let Some(tup) = genam::systable_getnext(scan_mcx, &mut scan)? {
+        let td = rel.descr();
+        let name = req(td, tup, ANUM_PG_REWRITE_RULENAME);
+        // SAFETY: rulename NameData column inside the tuple image.
+        let name = unsafe { *(name.as_usize() as *const NameData) };
+        row = Some(PgRewriteRow {
+            rulename: String::from_utf8_lossy(name.name_str()).into_owned(),
+            ev_class: req(td, tup, ANUM_PG_REWRITE_EV_CLASS).as_oid(),
+            ev_type: req(td, tup, ANUM_PG_REWRITE_EV_TYPE).as_u8(),
+            is_instead: req(td, tup, ANUM_PG_REWRITE_IS_INSTEAD).as_bool(),
+            ev_qual: text_attr(td, tup, ANUM_PG_REWRITE_EV_QUAL)?,
+            ev_action: text_attr(td, tup, ANUM_PG_REWRITE_EV_ACTION)?,
+        });
+    }
+    genam::systable_endscan(scan_mcx, scan)?;
+    rel.close(AccessShareLock)?;
+    Ok(row)
+}
+
+pub fn pg_get_ruledef_worker(
+    mcx: Mcx<'_>,
+    ruleoid: Oid,
+    pretty_flags: i32,
+) -> PgResult<Option<String>> {
+    crate::check_pg_rewrite_select("SELECT * FROM pg_catalog.pg_rewrite WHERE oid = $1")?;
+    let Some(rule) = fetch_rule(ruleoid)? else {
+        return Ok(None);
+    };
+    Ok(Some(make_ruledef(mcx, &rule, pretty_flags)?))
+}
+
+pub(crate) fn rule_event_keyword(rulename: &str, ev_type: u8) -> PgResult<&'static str> {
+    match ev_type {
+        b'1' => Ok("SELECT"),
+        b'2' => Ok("UPDATE"),
+        b'3' => Ok("INSERT"),
+        b'4' => Ok("DELETE"),
+        other => Err(PgError::error(format!(
+            "rule \"{rulename}\" has unsupported event type {other}"
+        ))
+        .with_sqlstate(ERRCODE_FEATURE_NOT_SUPPORTED)
+        .into()),
+    }
+}
+
+pub(crate) fn make_ruledef(mcx: Mcx<'_>, rule: &PgRewriteRow, pretty_flags: i32) -> PgResult<String> {
+    // ruleutils.c:5395-5397: stringToNode("<>") is NIL, and an empty action
+    // list is elog(ERROR), catchable.
+    let actions = readfuncs::stringToNodeNullable(mcx, &rule.ev_action)?
+        .and_then(|node| node.as_list())
+        .filter(|actions| !actions.is_nil());
+    let Some(actions) = actions else {
+        return Err(Box::new(PgError::error("invalid empty ev_action list")));
+    };
+    // ruleutils.c:5399/5531: the rule's relation is open (AccessShareLock)
+    // while its definition is built.
+    let ev_relation = table::table_open(mcx, rule.ev_class, AccessShareLock)?;
+
+    let mut ctx = DeparseContext::new(mcx, pretty_flags);
+    ctx.wrap_column = WRAP_COLUMN_DEFAULT;
+    ctx.buf
+        .push_str(&format!("CREATE RULE {} AS", quote_identifier(&rule.rulename)));
+    ctx.buf.push_str(if pretty_flags & PRETTYFLAG_INDENT != 0 {
+        "\n    ON "
+    } else {
+        " ON "
+    });
+
+    let event = rule_event_keyword(&rule.rulename, rule.ev_type)?;
+    ctx.buf.push_str(event);
+    let mut view_result_desc: Option<Rc<Vec<String>>> = None;
+    if event == "SELECT" {
+        view_result_desc = Some(Rc::new(view_attnames(rule.ev_class)?));
+    }
+
+    let relname = if pretty_flags & PRETTYFLAG_SCHEMA != 0 {
+        generate_relation_name(mcx, rule.ev_class)?
+    } else {
+        generate_qualified_relation_name(mcx, rule.ev_class)?
+    };
+    ctx.buf.push_str(&format!(" TO {relname}"));
+
+    if rule.ev_qual != "<>" {
+        if pretty_flags & PRETTYFLAG_INDENT != 0 {
+            ctx.buf.push_str("\n  ");
+        }
+        ctx.buf.push_str(" WHERE ");
+        let qual = readfuncs::stringToNode(mcx, &rule.ev_qual)?;
+        let first = actions.nth(0).as_query().expect("ev_action holds Queries");
+        let query = match rewrite_manip::getInsertSelectQuery_parts(first)? {
+            Some((_, sub)) => sub,
+            None => first,
+        };
+        // ruleutils.c:5474-5475: must acquire locks right away; see notes in
+        // get_query_def().
+        rewrite_handler_seams::acquire_rewrite_locks::call(mcx, query, false, false)?;
+        let dpns = set_deparse_for_query(mcx, query, &[])?;
+        ctx.varprefix = query.rtable.len() != 1;
+        ctx.indent_level = PRETTYINDENT_STD;
+        ctx.namespaces.push(Rc::new(dpns));
+        get_rule_expr(qual, &mut ctx, false)?;
+        ctx.namespaces.clear();
+        ctx.varprefix = false;
+        ctx.indent_level = 0;
+    }
+
+    ctx.buf.push_str(" DO ");
+    if rule.is_instead {
+        ctx.buf.push_str("INSTEAD ");
+    }
+
+    if actions.len() > 1 {
+        ctx.buf.push('(');
+        for action in actions.iter() {
+            let query = action.as_query().expect("ev_action holds Queries");
+            get_query_def(query, &mut ctx, view_result_desc.clone(), true)?;
+            ctx.buf.push_str(if pretty_flags != 0 { ";\n" } else { "; " });
+        }
+        ctx.buf.push_str(");");
+    } else {
+        let query = actions.nth(0).as_query().expect("ev_action holds Queries");
+        get_query_def(query, &mut ctx, view_result_desc, true)?;
+        ctx.buf.push(';');
+    }
+    ev_relation.close(AccessShareLock)?;
+    Ok(ctx.buf.into_inner())
+}

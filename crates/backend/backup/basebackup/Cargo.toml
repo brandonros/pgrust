@@ -1,0 +1,69 @@
+[package]
+name = "basebackup"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "basebackup"
+path = "src/lib.rs"
+
+[dependencies]
+pg_clock = { path = "../../../port/pg_clock" }
+libc = "0.2"
+elog = { path = "../../utils/error/elog" }
+mcx = { path = "../../../_support/mcx" }
+types_core = { path = "../../../_support/types/types_core" }
+types_error = { path = "../../../_support/types/types_error" }
+types_storage = { path = "../../../_support/types/types_storage" }
+pgstrcasecmp = { path = "../../../port/pgstrcasecmp" }
+repl_gram = { path = "../../replication/repl_gram" }
+walsender = { path = "../../replication/walsender" }
+walsender_seams = { path = "../../replication/walsender_seams" }
+basebackup_incremental = { path = "../basebackup_incremental" }
+blkreftable = { path = "../../../common/blkreftable" }
+ps_status_seams = { path = "../../utils/misc/ps_status_seams" }
+ps_status = { path = "../../utils/misc/ps_status" }
+fd = { path = "../../storage/file/fd" }
+init_small = { path = "../../utils/init/init_small" }
+transam_xlog = { path = "../../access/transam/transam_xlog" }
+xlogbackup = { path = "../../access/transam/xlogbackup" }
+
+# Sibling inc-5 leaf crates (delivered in parallel; converge at reference's
+# interfaces). The root workspace wiring + these paths are reconciled at
+# integration time.
+sink = { path = "../sink" }
+basebackup_compress = { path = "../compress" }
+compression = { path = "../../../common/compression" }
+backup_copy = { path = "../backup_copy" }
+backup_copy_seams = { path = "../backup_copy_seams" }
+throttle = { path = "../throttle" }
+sink_support = { path = "../sink_support" }
+manifest = { path = "../manifest" }
+
+# DestRemoteSimple result-set bridge (SendXlogRecPtrResult / SendTablespaceList).
+datum = { path = "../../../_support/types/datum" }
+fmgr = { package = "types_fmgr", path = "../../../_support/types/fmgr" }
+types_dest = { path = "../../../_support/types/types_dest" }
+tcop_dest = { path = "../../tcop/dest" }
+tupdesc = { path = "../../access/common/tupdesc" }
+exectuples_output = { path = "../../executor/exectuples_output" }
+varlena = { path = "../../utils/adt/varlena" }
+pqcomm_seams = { path = "../../libpq/pqcomm_seams" }
+basebackup_target = { path = "../basebackup_target" }
+guc_tables = { path = "../../utils/misc/guc_tables" }
+
+# audit-18.6 b086: basebackup_read_file wait event, sendDir CHECK_FOR_INTERRUPTS,
+# sendFile checksum-failure stats (basebackup.c:1818/1277/2119).
+waitevent_seams = { path = "../../utils/activity/waitevent_seams" }
+postgres_seams = { path = "../../tcop/postgres_seams" }
+pgstat = { path = "../../utils/activity/pgstat" }
+
+[dev-dependencies]
+# upstream e7564ee8cdcb (18.6): progress-sink cleanup witness binds a real
+# PgBackendStatus (lmgr's progress_beentry recipe) to read st_progress_command.
+backend_status = { path = "../../utils/activity/backend_status" }
+backend_progress = { path = "../../utils/activity/backend_progress" }
+ipc_seams = { path = "../../storage/ipc/ipc_seams" }
+# audit-18.6 b086 witnesses: fd.c AllocateDesc consults GetCurrentSubTransactionId.
+xact_seams = { path = "../../access/transam/xact_seams" }

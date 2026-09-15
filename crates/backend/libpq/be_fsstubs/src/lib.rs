@@ -1,0 +1,768 @@
+// be-fsstubs.c: SQL-callable lo_* interface over the per-backend FD table.
+#![allow(non_snake_case, non_upper_case_globals)]
+
+use core::cell::RefCell;
+use core::mem::ManuallyDrop;
+
+use datum::Varlena;
+use elog::ereport;
+use large_object::{
+    inv_close, inv_create, inv_drop, inv_open, inv_read, inv_seek, inv_tell, inv_truncate,
+    inv_write, LargeObjectDesc, INV_READ, INV_WRITE, SEEK_END, SEEK_SET,
+};
+use mcx::{Mcx, PgVec};
+use types_core::{int64, InvalidOid, Oid, SubTransactionId};
+use types_error::{
+    PgResult, ERRCODE_FEATURE_NOT_SUPPORTED, ERRCODE_INSUFFICIENT_PRIVILEGE,
+    ERRCODE_INVALID_PARAMETER_VALUE,
+    ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE, ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+    ERRCODE_PROGRAM_LIMIT_EXCEEDED, ERRCODE_UNDEFINED_OBJECT, ERROR,
+};
+use types_storage::large_object::{IFS_RDLOCK, IFS_WRLOCK};
+
+pub mod fmgr_builtins;
+
+const MaxAllocSize: int64 = 0x3FFF_FFFF;
+const VARHDRSZ: int64 = 4;
+
+struct FsState {
+    // C's cookies[] in fscxt: the slots own the descriptors.
+    cookies: Vec<Option<LargeObjectDesc>>,
+    lo_cleanup_needed: bool,
+}
+
+thread_local! {
+    // ManuallyDrop keeps the TLS payload dtor-free (backend-lifetime in C too);
+    // AtEOXact_LargeObject empties it at every transaction end.
+    static STATE: RefCell<ManuallyDrop<FsState>> = const {
+        RefCell::new(ManuallyDrop::new(FsState {
+            cookies: Vec::new(),
+            lo_cleanup_needed: false,
+        }))
+    };
+}
+
+fn with_state<R>(f: impl FnOnce(&mut FsState) -> R) -> R {
+    STATE.with(|s| f(&mut s.borrow_mut()))
+}
+
+#[cold]
+fn invalid_descriptor(fd: i32) -> Box<types_error::PgError> {
+    ereport(ERROR)
+        .errcode(ERRCODE_UNDEFINED_OBJECT)
+        .errmsg(format!("invalid large-object descriptor: {fd}"))
+        .into_error()
+        .into()
+}
+
+#[cold]
+fn close_error(fnamebuf: &str, errnum: i32) -> Box<types_error::PgError> {
+    ereport(ERROR)
+        .with_saved_errno(errnum)
+        .errcode_for_file_access()
+        .errmsg(format!("could not close file \"{fnamebuf}\": %m"))
+        .into_error()
+        .into()
+}
+
+fn fd_is_valid(fd: i32) -> bool {
+    fd >= 0
+        && with_state(|s| {
+            (fd as usize) < s.cookies.len() && s.cookies[fd as usize].is_some()
+        })
+}
+
+fn newLOfd() -> i32 {
+    with_state(|s| {
+        s.lo_cleanup_needed = true;
+        for (i, c) in s.cookies.iter().enumerate() {
+            if c.is_none() {
+                return i as i32;
+            }
+        }
+        // No free slot: first allocation is 64 slots, else double (C's
+        // MemoryContextAllocZero / repalloc0_array growth).
+        if s.cookies.is_empty() {
+            s.cookies.resize_with(64, || None);
+            0
+        } else {
+            let i = s.cookies.len();
+            s.cookies.resize_with(i * 2, || None);
+            i as i32
+        }
+    })
+}
+
+fn closeLOfd(fd: i32) -> PgResult<()> {
+    // Clear the slot first so an error can't double-free (C: better a leak
+    // than a crash).
+    let mut lobj = match with_state(|s| s.cookies[fd as usize].take()) {
+        Some(l) => l,
+        None => return Ok(()),
+    };
+    if let Some(snapshot) = lobj.snapshot.take() {
+        snapmgr::UnregisterSnapshotFromOwner(
+            &snapshot,
+            resowner_seams::top_transaction_resource_owner::call(),
+        );
+    }
+    inv_close(lobj)
+}
+
+pub fn be_lo_open<'mcx>(mcx: Mcx<'mcx>, lobjId: Oid, mode: i32) -> PgResult<i32> {
+    if mode & INV_WRITE != 0 {
+        xact::PreventCommandIfReadOnly("lo_open(INV_WRITE)")?;
+    }
+
+    let fd = newLOfd();
+
+    let mut lobjDesc = inv_open(mcx, lobjId, mode)?;
+    lobjDesc.subid = xact::GetCurrentSubTransactionId();
+
+    // Register the snapshot in TopTransaction's resowner so it stays alive
+    // until the LO is closed rather than until the current portal shuts down.
+    if let Some(snapshot) = lobjDesc.snapshot.take() {
+        lobjDesc.snapshot = Some(snapmgr::RegisterSnapshotOnOwner(
+            &snapshot,
+            resowner_seams::top_transaction_resource_owner::call(),
+        )?);
+    }
+
+    with_state(|s| {
+        debug_assert!(s.cookies[fd as usize].is_none());
+        s.cookies[fd as usize] = Some(lobjDesc);
+    });
+
+    Ok(fd)
+}
+
+pub fn be_lo_close(fd: i32) -> PgResult<i32> {
+    if !fd_is_valid(fd) {
+        return Err(invalid_descriptor(fd));
+    }
+    closeLOfd(fd)?;
+    Ok(0)
+}
+
+#[cold]
+fn not_opened(fd: i32, what: &str) -> Box<types_error::PgError> {
+    ereport(ERROR)
+        .errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE)
+        .errmsg(format!("large object descriptor {fd} was not opened for {what}"))
+        .into_error()
+        .into()
+}
+
+// Bare (non-fmgr) read/write ops, shared with the fastpath protocol callers.
+pub fn lo_read<'mcx>(mcx: Mcx<'mcx>, fd: i32, buf: &mut [u8]) -> PgResult<i32> {
+    if !fd_is_valid(fd) {
+        return Err(invalid_descriptor(fd));
+    }
+    // Check state first so the error is about the FD, not the privilege.
+    with_state(|s| {
+        let lobj = s.cookies[fd as usize].as_mut().expect("fd_is_valid");
+        if (lobj.flags & IFS_RDLOCK) == 0 {
+            return Err(not_opened(fd, "reading"));
+        }
+        inv_read(mcx, lobj, buf)
+    })
+}
+
+pub fn lo_write<'mcx>(mcx: Mcx<'mcx>, fd: i32, buf: &[u8]) -> PgResult<i32> {
+    if !fd_is_valid(fd) {
+        return Err(invalid_descriptor(fd));
+    }
+    with_state(|s| {
+        let lobj = s.cookies[fd as usize].as_mut().expect("fd_is_valid");
+        if (lobj.flags & IFS_WRLOCK) == 0 {
+            return Err(not_opened(fd, "writing"));
+        }
+        inv_write(mcx, lobj, buf)
+    })
+}
+
+pub fn be_lo_lseek<'mcx>(mcx: Mcx<'mcx>, fd: i32, offset: i32, whence: i32) -> PgResult<i32> {
+    if !fd_is_valid(fd) {
+        return Err(invalid_descriptor(fd));
+    }
+    let status = with_state(|s| {
+        inv_seek(mcx, s.cookies[fd as usize].as_mut().expect("fd_is_valid"), offset as int64, whence)
+    })?;
+    if status != status as i32 as int64 {
+        return Err(ereport(ERROR)
+            .errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE)
+            .errmsg(format!(
+                "lo_lseek result out of range for large-object descriptor {fd}"
+            ))
+            .into_error()
+            .into());
+    }
+    Ok(status as i32)
+}
+
+pub fn be_lo_lseek64<'mcx>(mcx: Mcx<'mcx>, fd: i32, offset: int64, whence: i32) -> PgResult<int64> {
+    if !fd_is_valid(fd) {
+        return Err(invalid_descriptor(fd));
+    }
+    with_state(|s| {
+        inv_seek(mcx, s.cookies[fd as usize].as_mut().expect("fd_is_valid"), offset, whence)
+    })
+}
+
+pub fn be_lo_creat<'mcx>(mcx: Mcx<'mcx>) -> PgResult<Oid> {
+    xact::PreventCommandIfReadOnly("lo_creat()")?;
+    with_state(|s| s.lo_cleanup_needed = true);
+    inv_create(mcx, InvalidOid)
+}
+
+pub fn be_lo_create<'mcx>(mcx: Mcx<'mcx>, lobjId: Oid) -> PgResult<Oid> {
+    xact::PreventCommandIfReadOnly("lo_create()")?;
+    with_state(|s| s.lo_cleanup_needed = true);
+    inv_create(mcx, lobjId)
+}
+
+pub fn be_lo_tell(fd: i32) -> PgResult<i32> {
+    if !fd_is_valid(fd) {
+        return Err(invalid_descriptor(fd));
+    }
+    let offset = with_state(|s| inv_tell(s.cookies[fd as usize].as_ref().expect("fd_is_valid")))?;
+    if offset != offset as i32 as int64 {
+        return Err(ereport(ERROR)
+            .errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE)
+            .errmsg(format!(
+                "lo_tell result out of range for large-object descriptor {fd}"
+            ))
+            .into_error()
+            .into());
+    }
+    Ok(offset as i32)
+}
+
+pub fn be_lo_tell64(fd: i32) -> PgResult<int64> {
+    if !fd_is_valid(fd) {
+        return Err(invalid_descriptor(fd));
+    }
+    with_state(|s| inv_tell(s.cookies[fd as usize].as_ref().expect("fd_is_valid")))
+}
+
+pub fn be_lo_unlink<'mcx>(mcx: Mcx<'mcx>, lobjId: Oid) -> PgResult<i32> {
+    xact::PreventCommandIfReadOnly("lo_unlink()")?;
+
+    if !pg_largeobject::LargeObjectExists(mcx, lobjId)? {
+        return Err(ereport(ERROR)
+            .errcode(ERRCODE_UNDEFINED_OBJECT)
+            .errmsg(format!("large object {lobjId} does not exist"))
+            .into_error()
+            .into());
+    }
+
+    // Must be owner; checked here rather than in inv_drop so the error comes
+    // before closing relevant FDs.
+    if !guc_tables::vars::lo_compat_privileges.read()
+        && !aclchk::object_ownercheck_lo(mcx, lobjId, miscinit::GetUserId())?
+    {
+        return Err(ereport(ERROR)
+            .errcode(ERRCODE_INSUFFICIENT_PRIVILEGE)
+            .errmsg(format!("must be owner of large object {lobjId}"))
+            .into_error()
+            .into());
+    }
+
+    // If there are any open LO FDs referencing that ID, close 'em.
+    let to_close: Vec<i32> = with_state(|s| {
+        s.cookies
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.as_ref().is_some_and(|l| l.id == lobjId))
+            .map(|(i, _)| i as i32)
+            .collect()
+    });
+    for i in to_close {
+        closeLOfd(i)?;
+    }
+
+    // inv_drop creates no need for end-of-transaction cleanup.
+    inv_drop(mcx, lobjId)
+}
+
+pub fn be_loread<'mcx>(mcx: Mcx<'mcx>, fd: i32, mut len: i32) -> PgResult<Varlena<'mcx>> {
+    if len < 0 {
+        len = 0;
+    }
+    // C: `palloc(VARHDRSZ + len)` — palloc's MaxAllocSize admission raises
+    // the catchable XX000 "invalid memory alloc request size N" before
+    // lo_read looks at the fd. VARHDRSZ is an int there, so the sum is C int
+    // arithmetic: for len near INT_MAX it wraps and is sign-extended to Size,
+    // and N in the message is that wrapped value.
+    let request = (VARHDRSZ as i32).wrapping_add(len) as isize as usize;
+    mcx::check_alloc_size(request)?;
+    let mut image: PgVec<'mcx, u8> = PgVec::new_in(mcx);
+    image
+        .try_reserve_exact(VARHDRSZ as usize + len as usize)
+        .map_err(|_| mcx.oom(VARHDRSZ as usize + len as usize))?;
+    image.resize(VARHDRSZ as usize + len as usize, 0);
+    let totalread = lo_read(mcx, fd, &mut image[VARHDRSZ as usize..])?;
+    image.truncate(VARHDRSZ as usize + totalread as usize);
+    Ok(Varlena::from_image(image))
+}
+
+pub fn be_lowrite<'mcx>(mcx: Mcx<'mcx>, fd: i32, wbuf: &[u8]) -> PgResult<i32> {
+    xact::PreventCommandIfReadOnly("lowrite()")?;
+    lo_write(mcx, fd, wbuf)
+}
+
+// BUFSIZE (be-fsstubs.c).
+const BUFSIZE: usize = 8192;
+
+fn to_fnamebuf(filename: &[u8]) -> PgResult<String> {
+    // text_to_cstring_buffer(filename, fnamebuf, sizeof(fnamebuf)) into a
+    // char[MAXPGPATH] (be-fsstubs.c:439, :511): at most MAXPGPATH-1 bytes are
+    // copied, clipped on a character boundary of the database encoding
+    // (varlena.c text_to_cstring_buffer -> pg_mbcliplen), so an overlong
+    // filename reaches open(2) truncated — ENOENT for a long path of short
+    // components, and the clipped path in the error message — rather than
+    // ENAMETOOLONG with the full text. Paths are opaque bytes to the OS; the
+    // tree carries them as UTF-8 strings, so non-UTF-8 bytes (a SQL_ASCII
+    // database) are the UTF-8-only carve's typed refusal
+    // (docs/design/carve-ratifications.md §11), never a U+FFFD substitute
+    // that would name a different file than C opens.
+    let limit = types_core::MAXPGPATH - 1;
+    let n = if filename.len() <= limit {
+        filename.len()
+    } else {
+        mbutils_seams::pg_mbcliplen::call(filename, filename.len() as i32, limit as i32) as usize
+    };
+    match std::str::from_utf8(&filename[..n]) {
+        Ok(s) => Ok(s.to_owned()),
+        Err(_) => Err(ereport(ERROR)
+            .errcode(ERRCODE_FEATURE_NOT_SUPPORTED)
+            .errmsg(format!(
+                "non-ASCII server file names are not supported yet in databases with encoding \"{}\"",
+                mbutils_seams::get_database_encoding_name::call()
+            ))
+            .errhint("Use a database with encoding \"UTF8\".")
+            .into_error()
+            .into()),
+    }
+}
+
+fn lo_import_internal<'mcx>(mcx: Mcx<'mcx>, filename: &[u8], lobjOid: Oid) -> PgResult<Oid> {
+    xact::PreventCommandIfReadOnly("lo_import()")?;
+
+    let fnamebuf = to_fnamebuf(filename)?;
+
+    let fd = fd::desc::OpenTransientFile(&fnamebuf, libc::O_RDONLY)?;
+    if fd < 0 {
+        return Err(ereport(ERROR)
+            .with_saved_errno(elog::errno::current_errno())
+            .errcode_for_file_access()
+            .errmsg(format!("could not open server file \"{fnamebuf}\": %m"))
+            .into_error()
+            .into());
+    }
+
+    with_state(|s| s.lo_cleanup_needed = true);
+    let oid = inv_create(mcx, lobjOid)?;
+
+    let result = (|| -> PgResult<()> {
+        let mut lobj = inv_open(mcx, oid, INV_WRITE)?;
+        let mut buf = [0u8; BUFSIZE];
+        loop {
+            // SAFETY: buf is a live BUFSIZE-byte buffer; fd is the transient
+            // file just opened above.
+            let nbytes = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), BUFSIZE) };
+            if nbytes < 0 {
+                return Err(ereport(ERROR)
+                    .with_saved_errno(elog::errno::current_errno())
+                    .errcode_for_file_access()
+                    .errmsg(format!("could not read server file \"{fnamebuf}\": %m"))
+                    .into_error()
+                    .into());
+            }
+            if nbytes == 0 {
+                break;
+            }
+            let written = inv_write(mcx, &mut lobj, &buf[..nbytes as usize])?;
+            debug_assert_eq!(written as usize, nbytes as usize);
+        }
+        inv_close(lobj)
+    })();
+
+    if fd::desc::CloseTransientFile(fd) != 0 {
+        let errnum = elog::errno::current_errno();
+        result?;
+        return Err(close_error(&fnamebuf, errnum));
+    }
+    result?;
+
+    Ok(oid)
+}
+
+pub fn be_lo_import<'mcx>(mcx: Mcx<'mcx>, filename: &[u8]) -> PgResult<Oid> {
+    lo_import_internal(mcx, filename, InvalidOid)
+}
+
+pub fn be_lo_import_with_oid<'mcx>(mcx: Mcx<'mcx>, filename: &[u8], oid: Oid) -> PgResult<Oid> {
+    lo_import_internal(mcx, filename, oid)
+}
+
+pub fn be_lo_export<'mcx>(mcx: Mcx<'mcx>, lobjId: Oid, filename: &[u8]) -> PgResult<i32> {
+    with_state(|s| s.lo_cleanup_needed = true);
+    let mut lobj = inv_open(mcx, lobjId, INV_READ)?;
+
+    let fnamebuf = to_fnamebuf(filename)?;
+
+    // C reduces the backend's normal 077 umask to 022 around the open so a
+    // file the open CREATES lands as 0644 (rw-r--r--) rather than
+    // world-writable, then restores it; a file that already exists is only
+    // truncated — open(2) ignores the mode bits then, so its permissions are
+    // untouched (be-fsstubs.c:513). umask is process-global and pgrust runs a
+    // thread per backend, so mutating it here would race with file creation
+    // on other threads (their opens would briefly see the wrong mask).
+    // Instead note whether the target pre-exists, create with a narrow,
+    // umask-proof owner-only mode, and fchmod a file this open created to the
+    // exact bits C's masked 0666 yields — identical resulting permissions
+    // with no shared-state mutation. See syslogger::logfile_open and
+    // copy::to (BeginCopyTo) for the same idiom. (metadata follows symlinks,
+    // as open does.)
+    #[cfg_attr(target_family = "wasm", allow(unused_variables))]
+    let preexisting = std::fs::metadata(&fnamebuf).is_ok();
+    let fd = fd::desc::OpenTransientFilePerm(
+        &fnamebuf,
+        libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+        // 0600: no umask can widen it, so the file is never momentarily
+        // group/other-accessible before the fchmod below.
+        (libc::S_IRUSR | libc::S_IWUSR) as u32,
+    )?;
+    if fd < 0 {
+        return Err(ereport(ERROR)
+            .with_saved_errno(elog::errno::current_errno())
+            .errcode_for_file_access()
+            .errmsg(format!("could not create server file \"{fnamebuf}\": %m"))
+            .into_error()
+            .into());
+    }
+    // Set the exact permissions C produces for a file it created
+    // (0666 & ~022 == 0644), independent of the process umask; a pre-existing
+    // file keeps whatever mode it had, as C's open(O_CREAT|O_TRUNC) leaves it.
+    // SAFETY: fd is the descriptor just created above.
+    // wasm32: no mode bits on WASI files — no-op.
+    #[cfg(not(target_family = "wasm"))]
+    if !preexisting {
+        unsafe {
+            libc::fchmod(
+                fd,
+                libc::S_IRUSR | libc::S_IWUSR | libc::S_IRGRP | libc::S_IROTH,
+            );
+        }
+    }
+
+    let result = (|| -> PgResult<()> {
+        let mut buf = [0u8; BUFSIZE];
+        loop {
+            let nbytes = inv_read(mcx, &mut lobj, &mut buf)?;
+            if nbytes <= 0 {
+                break;
+            }
+            // SAFETY: buf's first nbytes bytes were just filled by inv_read.
+            let written =
+                unsafe { libc::write(fd, buf.as_ptr().cast(), nbytes as usize) };
+            if written != nbytes as isize {
+                return Err(ereport(ERROR)
+                    .with_saved_errno(elog::errno::current_errno())
+                    .errcode_for_file_access()
+                    .errmsg(format!("could not write server file \"{fnamebuf}\": %m"))
+                    .into_error()
+                    .into());
+            }
+        }
+        Ok(())
+    })();
+
+    if fd::desc::CloseTransientFile(fd) != 0 {
+        let errnum = elog::errno::current_errno();
+        result?;
+        return Err(close_error(&fnamebuf, errnum));
+    }
+    result?;
+
+    inv_close(lobj)?;
+
+    Ok(1)
+}
+
+fn lo_truncate_internal<'mcx>(mcx: Mcx<'mcx>, fd: i32, len: int64) -> PgResult<()> {
+    if !fd_is_valid(fd) {
+        return Err(invalid_descriptor(fd));
+    }
+    with_state(|s| {
+        let lobj = s.cookies[fd as usize].as_mut().expect("fd_is_valid");
+        if (lobj.flags & IFS_WRLOCK) == 0 {
+            return Err(not_opened(fd, "writing"));
+        }
+        inv_truncate(mcx, lobj, len)
+    })
+}
+
+pub fn be_lo_truncate<'mcx>(mcx: Mcx<'mcx>, fd: i32, len: i32) -> PgResult<i32> {
+    xact::PreventCommandIfReadOnly("lo_truncate()")?;
+    lo_truncate_internal(mcx, fd, len as int64)?;
+    Ok(0)
+}
+
+pub fn be_lo_truncate64<'mcx>(mcx: Mcx<'mcx>, fd: i32, len: int64) -> PgResult<i32> {
+    xact::PreventCommandIfReadOnly("lo_truncate64()")?;
+    lo_truncate_internal(mcx, fd, len)?;
+    Ok(0)
+}
+
+pub fn AtEOXact_LargeObject(isCommit: bool) -> PgResult<()> {
+    if !with_state(|s| s.lo_cleanup_needed) {
+        return Ok(());
+    }
+
+    // On commit close the FDs to avoid leaked-resource warnings; on abort the
+    // clear below is the MemoryContextDelete(fscxt) analogue.
+    if isCommit {
+        let open: Vec<i32> = with_state(|s| {
+            (0..s.cookies.len() as i32)
+                .filter(|&i| s.cookies[i as usize].is_some())
+                .collect()
+        });
+        for i in open {
+            closeLOfd(i)?;
+        }
+    }
+
+    with_state(|s| s.cookies = Vec::new());
+
+    large_object::close_lo_relation(isCommit)?;
+
+    with_state(|s| s.lo_cleanup_needed = false);
+
+    Ok(())
+}
+
+pub fn AtEOSubXact_LargeObject(
+    isCommit: bool,
+    mySubid: SubTransactionId,
+    parentSubid: SubTransactionId,
+) -> PgResult<()> {
+    if with_state(|s| s.cookies.is_empty()) {
+        return Ok(()); // no LO operations in this xact
+    }
+
+    let n = with_state(|s| s.cookies.len() as i32);
+    for i in 0..n {
+        let subid = with_state(|s| s.cookies[i as usize].as_ref().map(|l| l.subid));
+        if subid == Some(mySubid) {
+            if isCommit {
+                with_state(|s| {
+                    s.cookies[i as usize].as_mut().expect("checked above").subid = parentSubid;
+                });
+            } else {
+                closeLOfd(i)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn lo_get_fragment_internal<'mcx>(
+    mcx: Mcx<'mcx>,
+    loOid: Oid,
+    offset: int64,
+    nbytes: i32,
+) -> PgResult<Varlena<'mcx>> {
+    with_state(|s| s.lo_cleanup_needed = true);
+    let mut loDesc = inv_open(mcx, loOid, INV_READ)?;
+
+    // Compute the byte count actually read, accommodating nbytes == -1 and
+    // reads beyond the end of the LO.
+    let loSize = inv_seek(mcx, &mut loDesc, 0, SEEK_END)?;
+    // be-fsstubs.c:781 `loSize - offset` overflows for offset near INT64_MIN
+    // (C UB; the clang oracle lands on the too-large error): checked here.
+    let result_length: int64 = if loSize > offset {
+        match loSize.checked_sub(offset) {
+            Some(avail) if nbytes >= 0 && (nbytes as int64) <= avail => nbytes as int64,
+            Some(avail) => avail,
+            None => int64::MAX,
+        }
+    } else {
+        0
+    };
+
+    if result_length > MaxAllocSize - VARHDRSZ {
+        return Err(ereport(ERROR)
+            .errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED)
+            .errmsg("large object read request is too large")
+            .into_error()
+            .into());
+    }
+
+    let total = VARHDRSZ as usize + result_length as usize;
+    let mut image: PgVec<'mcx, u8> = PgVec::new_in(mcx);
+    image.try_reserve_exact(total).map_err(|_| mcx.oom(total))?;
+    image.resize(total, 0);
+
+    inv_seek(mcx, &mut loDesc, offset, SEEK_SET)?;
+    let total_read = inv_read(mcx, &mut loDesc, &mut image[VARHDRSZ as usize..])?;
+    debug_assert_eq!(total_read as int64, result_length);
+
+    inv_close(loDesc)?;
+
+    Ok(Varlena::from_image(image))
+}
+
+pub fn be_lo_get<'mcx>(mcx: Mcx<'mcx>, loOid: Oid) -> PgResult<Varlena<'mcx>> {
+    lo_get_fragment_internal(mcx, loOid, 0, -1)
+}
+
+pub fn be_lo_get_fragment<'mcx>(
+    mcx: Mcx<'mcx>,
+    loOid: Oid,
+    offset: int64,
+    nbytes: i32,
+) -> PgResult<Varlena<'mcx>> {
+    if nbytes < 0 {
+        return Err(ereport(ERROR)
+            .errcode(ERRCODE_INVALID_PARAMETER_VALUE)
+            .errmsg("requested length cannot be negative")
+            .into_error()
+            .into());
+    }
+    lo_get_fragment_internal(mcx, loOid, offset, nbytes)
+}
+
+pub fn be_lo_from_bytea<'mcx>(mcx: Mcx<'mcx>, loOid: Oid, data: &[u8]) -> PgResult<Oid> {
+    xact::PreventCommandIfReadOnly("lo_from_bytea()")?;
+
+    with_state(|s| s.lo_cleanup_needed = true);
+    let loOid = inv_create(mcx, loOid)?;
+    let mut loDesc = inv_open(mcx, loOid, INV_WRITE)?;
+    let written = inv_write(mcx, &mut loDesc, data)?;
+    debug_assert_eq!(written, data.len() as i32);
+    inv_close(loDesc)?;
+
+    Ok(loOid)
+}
+
+pub fn be_lo_put<'mcx>(mcx: Mcx<'mcx>, loOid: Oid, offset: int64, data: &[u8]) -> PgResult<()> {
+    xact::PreventCommandIfReadOnly("lo_put()")?;
+
+    with_state(|s| s.lo_cleanup_needed = true);
+    let mut loDesc = inv_open(mcx, loOid, INV_WRITE)?;
+    inv_seek(mcx, &mut loDesc, offset, SEEK_SET)?;
+    let written = inv_write(mcx, &mut loDesc, data)?;
+    debug_assert_eq!(written, data.len() as i32);
+    inv_close(loDesc)?;
+
+    Ok(())
+}
+
+pub fn init_seams() {
+    be_fsstubs_seams::at_eoxact_large_object::set(AtEOXact_LargeObject);
+    be_fsstubs_seams::at_eosubxact_large_object::set(AtEOSubXact_LargeObject);
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    // be-fsstubs.c:372 be_loread: `palloc(VARHDRSZ + len)` is admitted by
+    // palloc's MaxAllocSize check before lo_read ever looks at the fd, so an
+    // oversized len is the catchable XX000 "invalid memory alloc request size
+    // N" — never 53200 "out of memory" — and N is the C int sum (VARHDRSZ is
+    // an int) wrapped at INT_MAX and sign-extended to Size.
+    #[test]
+    fn loread_len_past_max_alloc_is_invalid_alloc_request() {
+        let ctx = mcx::MemoryContext::new("t");
+        let mcx = ctx.mcx();
+        for (len, request) in [
+            (1_073_741_824i32, 1_073_741_828usize),
+            (1_073_741_820, 1_073_741_824),
+            (i32::MAX, (4i32.wrapping_add(i32::MAX)) as isize as usize),
+        ] {
+            let e = crate::be_loread(mcx, 0, len).expect_err("request past MaxAllocSize");
+            assert_eq!(
+                e.message(),
+                format!("invalid memory alloc request size {request}"),
+                "len {len}"
+            );
+            assert_eq!(e.sqlstate(), types_error::ERRCODE_INTERNAL_ERROR, "len {len}");
+        }
+        // An admitted len reaches lo_read, whose fd check fails as before.
+        let e = crate::be_loread(mcx, 0, 16).expect_err("fd 0 is not open");
+        assert_eq!(e.message(), "invalid large-object descriptor: 0");
+    }
+
+    // be-fsstubs.c:545/:475: the close failure's %m expands the close errno.
+    #[test]
+    fn close_error_expands_errno() {
+        let e = crate::close_error("/tmp/lo.out", libc::EIO);
+        assert_eq!(
+            e.message(),
+            "could not close file \"/tmp/lo.out\": Input/output error"
+        );
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_IO_ERROR);
+    }
+
+    // text_to_cstring_buffer hands the raw bytes to open(2); a filename
+    // that is not UTF-8 (a SQL_ASCII database) is the §11 typed refusal,
+    // never a U+FFFD substitute naming a different file.
+    #[test]
+    fn non_utf8_filename_is_the_ratified_refusal() {
+        mbutils_seams::get_database_encoding_name::set(|| "SQL_ASCII");
+        let e = crate::to_fnamebuf(b"/tmp/caf\xe9").unwrap_err();
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_FEATURE_NOT_SUPPORTED);
+        assert_eq!(
+            e.message(),
+            "non-ASCII server file names are not supported yet in databases with encoding \"SQL_ASCII\""
+        );
+        assert_eq!(e.hint(), Some("Use a database with encoding \"UTF8\"."));
+        assert_eq!(crate::to_fnamebuf("/tmp/caf\u{e9}".as_bytes()).unwrap(), "/tmp/caf\u{e9}");
+    }
+
+    // The lo_export permission bits C produces: 0666 & ~022.
+    const EXPORT_FILE_MODE: libc::mode_t =
+        libc::S_IRUSR | libc::S_IWUSR | libc::S_IRGRP | libc::S_IROTH;
+
+    // Guards against regressing to a process-global umask swap: creating the
+    // file narrow and fchmod'ing to the target mode must yield exactly 0644
+    // regardless of the ambient umask (i.e. without racing on shared state).
+    #[test]
+    fn fchmod_export_mode_is_umask_independent() {
+        assert_eq!(EXPORT_FILE_MODE, 0o644 as libc::mode_t);
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("pgrust_lo_export_test_{}", std::process::id()));
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+
+        // A restrictive umask that, if applied to the open() mode, would strip
+        // the group/other read bits — proving fchmod is what fixes them.
+        let old_umask = unsafe { libc::umask(0o077) };
+
+        let fd = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+                (libc::S_IRUSR | libc::S_IWUSR) as libc::c_uint,
+            )
+        };
+        assert!(fd >= 0, "open failed: {}", std::io::Error::last_os_error());
+
+        let rc = unsafe { libc::fchmod(fd, EXPORT_FILE_MODE) };
+        assert_eq!(rc, 0, "fchmod failed: {}", std::io::Error::last_os_error());
+        unsafe { libc::close(fd) };
+        unsafe { libc::umask(old_umask) };
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            mode, 0o644,
+            "export file must be 0644 regardless of umask; got {mode:o}"
+        );
+    }
+}

@@ -1,0 +1,861 @@
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::RwLock;
+
+// Session-settable vars (PGC_USERSET/SUSET/BACKEND + per-session INTERNAL
+// like is_superuser) use per-session backings; postmaster/sighup-scope and
+// compile-time-constant vars keep plain process-global cells.
+#[allow(unused_imports)]
+use crate::session_guc_string as session_string_var;
+
+// C: int restrict_nonsystem_relation_kind (postgres.c). The string GUC's
+// hooks live in tcop::postgres; the derived flag word lives here so the
+// rewriter reads it without a tcop dependency.
+crate::session_guc_int!(
+    RESTRICT_NONSYSTEM_RELATION_KIND,
+    restrict_nonsystem_relation_kind,
+    set_restrict_nonsystem_relation_kind,
+    0
+);
+
+// Session-settable scalars, one cluster: hot per-query readers (tcop debug/
+// log flags) share a single TLS base per function.
+crate::session_guc_cluster!(BackingSessionGucs, BACKING_SESSION_GUCS:
+    (log_duration_cell, bool, log_duration, set_log_duration, false),
+    // C: bool Log_disconnections (postgres.c). PGC_SU_BACKEND: fixed at
+    // backend start; the tcop main loop registers the on_proc_exit logger
+    // when this is set (GL-GUCBATCH-1 wire).
+    (Log_disconnections_cell, bool, Log_disconnections, set_Log_disconnections, false),
+    (Debug_print_plan_cell, bool, Debug_print_plan, set_Debug_print_plan, false),
+    (Debug_print_parse_cell, bool, Debug_print_parse, set_Debug_print_parse, false),
+    (Debug_print_rewritten_cell, bool, Debug_print_rewritten, set_Debug_print_rewritten, false),
+    (Debug_pretty_print_cell, bool, Debug_pretty_print, set_Debug_pretty_print, true),
+    (log_parser_stats_cell, bool, log_parser_stats, set_log_parser_stats, false),
+    (log_planner_stats_cell, bool, log_planner_stats, set_log_planner_stats, false),
+    (log_executor_stats_cell, bool, log_executor_stats, set_log_executor_stats, false),
+    (log_statement_stats_cell, bool, log_statement_stats, set_log_statement_stats, false),
+    (row_security_cell, bool, row_security, set_row_security, true),
+    // pgrust.lane_executor (pgrust-only): TOMBSTONE (P7-2 D-8; boot default
+    // OFF since S-1 2026-08-19). The lane-v2 executor is deleted; the cell
+    // stays so the registered GUC keeps its slot (SET accepted, warn-once,
+    // no effect — no consumer reads it). PGRUST_LANE_V2 no longer seeds it
+    // (accepted and ignored for one release).
+    (pgrust_lane_executor_cell, bool, pgrust_lane_executor, set_pgrust_lane_executor, false),
+    // pgrust.condition_cache (pgrust-only): the pgrcolumnar per-granule
+    // qual-verdict cache (ClickHouse QueryConditionCache counterpart).
+    // Default OFF — the benchmark arms enable it explicitly and record it in
+    // manifests. The PREWHERE arm reads the cell at qual-arm time.
+    (pgrust_condition_cache_cell, bool, pgrust_condition_cache, set_pgrust_condition_cache, false),
+    // pgrust.explain_runtime_verdicts (pgrust-only): EXPLAIN ANALYZE display
+    // gate for the runtime admission walk's refusal verdicts. Default OFF —
+    // C prints nothing there and default EXPLAIN output stays C-parity
+    // (covdiff-fuzzer E1-A).
+    (pgrust_explain_runtime_verdicts_cell, bool, pgrust_explain_runtime_verdicts, set_pgrust_explain_runtime_verdicts, false),
+    // pgrust.condition_cache_size: the cache's byte budget in KB (work_mem
+    // unit idiom); default 102400 KB = 100 MB, ClickHouse's
+    // query_condition_cache_size default. LRU-evicted at that bound.
+    (pgrust_condition_cache_size_cell, i32, pgrust_condition_cache_size, set_pgrust_condition_cache_size, 102400),
+    // pgrust.parallel_engine (pgrust-only, M5-0): the product parallel-engine
+    // selector (consts::PARALLEL_ENGINE_*). Default RUNTIME since the M5
+    // boarding flip (§4.4 criteria met; `legacy` restores pre-M5 planning
+    // byte-for-byte); the per-arm bench pool GUCs layer BENEATH the switch
+    // and keep working verbatim either way.
+    (pgrust_parallel_engine_cell, i32, pgrust_parallel_engine, set_pgrust_parallel_engine, 1),
+    // pgrust.version_string_style (pgrust-only, dl-verstring ruling
+    // 2026-08-06): which identity leads in version()'s banner. Default
+    // postgres_first — clients that take the FIRST number in version()
+    // (duckdb-postgres's ExtractPostgresVersion parsed the legacy leading
+    // "0.3" as pre-8.3 PostgreSQL and silently degraded) must read the
+    // PostgreSQL compatibility version. pgrust_first restores the legacy
+    // pgrust-led form byte-for-byte. `server_version` is unaffected.
+    (pgrust_version_string_style_cell, i32, pgrust_version_string_style, set_pgrust_version_string_style, crate::consts::VERSION_STRING_POSTGRES_FIRST),
+    // pgrust.runtime_dop (pgrust-only, M5-0): the product DOP knob, consulted
+    // ONLY under engine=runtime (the M5-1 router). 0 = auto (available cores).
+    (pgrust_runtime_dop_cell, i32, pgrust_runtime_dop, set_pgrust_runtime_dop, 0),
+    // pgrust.sqe_heap (pgrust-only): heap-on-sqe v1 (heap-face.md). OFF by
+    // default — the v1 safety switch: when off, heap statements never enter
+    // the sqe slot (one TLS read per SELECT). When on, recognized heap
+    // analytic shapes serve through the sqe heap face (R1: serve or typed
+    // ERROR); unrecognized shapes keep routing to the incumbent engines
+    // until their rung lands.
+    (pgrust_sqe_heap_cell, bool, pgrust_sqe_heap, set_pgrust_sqe_heap, false),
+    // pgrust.sqe_threads (pgrust-only): the sqe server engine's worker width
+    // (SqeConfig.threads at the seam's engine build). 0 = auto (available
+    // cores); N caps at N. Default 0 = auto per Michael's ruling (auto,
+    // 2026-08-18; a width budget governor is the eventual fairness
+    // mechanism — see seam.rs::engine_threads). PGRUST_SQE_THREADS seeds
+    // the startup default (PGC_S_ENV_VAR).
+    (pgrust_sqe_threads_cell, i32, pgrust_sqe_threads, set_pgrust_sqe_threads, 0),
+    // pgrust.runtime_*_pool / lane_parallel_pool / gather_fair_stride
+    // (pgrust-only, env-to-guc train): the per-arm DEV/BENCH force-override
+    // layer BENEATH pgrust.parallel_engine. Registered (env-to-guc) so they
+    // are discoverable/tunable in pg_settings; each defaults 0 = auto (inherit
+    // pgrust.runtime_dop under engine=runtime). TOMBSTONED P7-2 D-8 with the
+    // per-arm readers (runtime_pool.rs / lane_pool.rs — deleted): the cells
+    // stay so the registered GUCs keep their slots (SET accepted, warn-once,
+    // no effect).
+    (pgrust_runtime_scan_pool_cell, i32, pgrust_runtime_scan_pool, set_pgrust_runtime_scan_pool, 0),
+    (pgrust_runtime_agg_pool_cell, i32, pgrust_runtime_agg_pool, set_pgrust_runtime_agg_pool, 0),
+    (pgrust_runtime_distinct_pool_cell, i32, pgrust_runtime_distinct_pool, set_pgrust_runtime_distinct_pool, 0),
+    (pgrust_runtime_hashjoin_pool_cell, i32, pgrust_runtime_hashjoin_pool, set_pgrust_runtime_hashjoin_pool, 0),
+    (pgrust_runtime_sort_pool_cell, i32, pgrust_runtime_sort_pool, set_pgrust_runtime_sort_pool, 0),
+    (pgrust_runtime_bitmap_pool_cell, i32, pgrust_runtime_bitmap_pool, set_pgrust_runtime_bitmap_pool, 0),
+    (pgrust_lane_parallel_pool_cell, i32, pgrust_lane_parallel_pool, set_pgrust_lane_parallel_pool, 0),
+    (pgrust_gather_fair_stride_cell, i32, pgrust_gather_fair_stride, set_pgrust_gather_fair_stride, 0),
+    // pgrust.memory_watchdog_test_hog (pgrust-only, GL-MEMWATCH-1, developer):
+    // per-query deliberate leak in MB into a named session-lifetime context
+    // ("WatchdogTestHog") — the watchdog e2e's context hog. Session-scoped so
+    // one test session cannot hog another. 0 = off (the only production value).
+    (pgrust_memory_watchdog_test_hog_cell, i32, pgrust_memory_watchdog_test_hog, set_pgrust_memory_watchdog_test_hog, 0),
+    (check_function_bodies_cell, bool, check_function_bodies, set_check_function_bodies, true),
+    (default_with_oids_cell, bool, default_with_oids, set_default_with_oids, false),
+    (current_role_is_superuser_cell, bool, current_role_is_superuser, set_current_role_is_superuser, false),
+    (in_hot_standby_guc_cell, bool, in_hot_standby_guc, set_in_hot_standby_guc, false),
+    (log_parameter_max_length_cell, i32, log_parameter_max_length, set_log_parameter_max_length, -1),
+    (log_parameter_max_length_on_error_cell, i32, log_parameter_max_length_on_error, set_log_parameter_max_length_on_error, 0),
+    (log_temp_files_cell, i32, log_temp_files, set_log_temp_files, -1),
+    (temp_file_limit_cell, i32, temp_file_limit, set_temp_file_limit, -1),
+    (num_temp_buffers_cell, i32, num_temp_buffers, set_num_temp_buffers, 1024),
+    (ssl_renegotiation_limit_cell, i32, ssl_renegotiation_limit, set_ssl_renegotiation_limit, 0),
+    (PostAuthDelay_cell, i32, PostAuthDelay, set_PostAuthDelay, 0),
+    (log_min_duration_sample_cell, i32, log_min_duration_sample, set_log_min_duration_sample, -1),
+    (log_min_duration_statement_cell, i32, log_min_duration_statement, set_log_min_duration_statement, -1),
+    (log_statement_cell, i32, log_statement, set_log_statement, 0),
+    (compute_query_id_cell, i32, compute_query_id, set_compute_query_id, 2),
+    // C: int default_toast_compression (toast_compression.c). PGC_USERSET
+    // enum; the heaptoast invalid-attcompression fallback reads this slot
+    // (toast_internals.c:59), so the product MUST install it — the reader
+    // landed with only a test-local install (the gate-blindness class).
+    (default_toast_compression_cell, i32, default_toast_compression, set_default_toast_compression, crate::consts::TOAST_PGLZ_COMPRESSION),
+    (phony_random_seed_cell, f64, phony_random_seed, set_phony_random_seed, (0.0) as f64),
+    (log_statement_sample_rate_cell, f64, log_statement_sample_rate, set_log_statement_sample_rate, (1.0) as f64),
+    (log_xact_sample_rate_cell, f64, log_xact_sample_rate, set_log_xact_sample_rate, (0.0) as f64),
+);
+
+macro_rules! bool_var {
+    ($cell:ident, $name:ident, $set:ident, $boot:expr) => {
+        static $cell: AtomicBool = AtomicBool::new($boot);
+        pub fn $name() -> bool {
+            $cell.load(Ordering::Relaxed)
+        }
+        pub fn $set(v: bool) {
+            $cell.store(v, Ordering::Relaxed);
+        }
+    };
+}
+
+macro_rules! int_var {
+    ($cell:ident, $name:ident, $set:ident, $boot:expr) => {
+        static $cell: AtomicI32 = AtomicI32::new($boot);
+        pub fn $name() -> i32 {
+            $cell.load(Ordering::Relaxed)
+        }
+        pub fn $set(v: i32) {
+            $cell.store(v, Ordering::Relaxed);
+        }
+    };
+}
+
+macro_rules! string_var {
+    ($cell:ident, $get:ident, $set:ident, $boot:expr) => {
+        static $cell: RwLock<Option<String>> = RwLock::new(None);
+        pub fn $get() -> Option<String> {
+            let guard = $cell.read().unwrap();
+            match &*guard {
+                Some(s) => Some(s.clone()),
+                None => {
+                    let boot: Option<&'static str> = $boot;
+                    boot.map(str::to_owned)
+                }
+            }
+        }
+        pub fn $set(v: Option<String>) {
+            *$cell.write().unwrap() = v;
+        }
+    };
+}
+
+bool_var!(B_AllowAlterSystem, AllowAlterSystem, set_AllowAlterSystem, true);
+
+bool_var!(B_assert_enabled, assert_enabled, set_assert_enabled, false);
+
+bool_var!(B_data_checksums, data_checksums, set_data_checksums, false);
+
+// pgrust.runtime (pgrust-only, env-to-guc train): the M0 master switch for the
+// morsel runtime worker pool. PGC_POSTMASTER (the pool spawns once at
+// postmaster start; it cannot be un-spawned per session), default ON since the
+// M5 boarding flip. The PGRUST_RUNTIME boot env var seeds this (=0 -> off) via
+// initialize_guc_options_from_environment (PGC_S_ENV_VAR); postgresql.conf can
+// also set it. THE one authority for "runtime requested" (t34-config review,
+// defect 3): runtime::runtime_enabled() IS a read of this cell, so the pool
+// spawn gate (launch_backend::rtpool::start_if_enabled) and every executor arm
+// read the same value; `pgrust.runtime=off` fully disables the engine (no pool
+// -> runtime::global() None -> every arm stays serial). (P7-2 D-8: the M5-3
+// probe and its runtime_pool liveness flag are deleted.)
+bool_var!(B_pgrust_runtime, pgrust_runtime, set_pgrust_runtime, true);
+
+// pgrust.mem_autotune (pgrust-only, env-to-guc train): gates the machine-scaled
+// memory/parallel default auto-tune at postmaster boot (autotune.rs, assembled
+// from night/mem-defaults into the config train). PGC_POSTMASTER, default OFF
+// so the byte-identical SHOW ALL / pg_settings conformance suite is unaffected
+// unless the operator opts in. Seeded by the PGRUST_MEM_AUTOTUNE boot env var.
+bool_var!(B_pgrust_mem_autotune, pgrust_mem_autotune, set_pgrust_mem_autotune, false);
+
+// pgrust.runtime_vacuum_pool (pgrust-only, GL-M41-3 flip): parallel VACUUM's
+// driver rides the morsel-pool workers (M4.1 ⊕ Q2, PGPROC-leasing bound gate
+// at QoS Utility) instead of a launched bgworker gang. DEFAULT ON since the
+// train-40 flip (GL-M41-3: wall 1.009 parity 2-idx / 0.906 WIN 4-idx, OLTP
+// flat 1.020 under the Q1 cap, reclaim 15ms) — off restores the launched
+// gang exactly (flipped-kill). Layering unchanged: the pool channel also
+// requires the pooldb identity glue (PGRUST_RUNTIME_POOLDB, the M2 lane's
+// switch) — until that flips, default servers keep the launched driver and
+// this GUC is polarity-ready. Seeded by PGRUST_RUNTIME_VACUUM_POOL.
+bool_var!(
+    B_pgrust_runtime_vacuum_pool,
+    pgrust_runtime_vacuum_pool,
+    set_pgrust_runtime_vacuum_pool,
+    true
+);
+// pgrust.memory_watchdog family (pgrust-only, GL-MEMWATCH-1): the process
+// memory watchdog — a postmaster-lifetime sampler thread comparing process
+// RSS (and cgroup v2 memory.current/memory.max when present) against a
+// limit, and logging the accounted-vs-real ledger plus per-backend context
+// dumps at escalating thresholds BEFORE the container OOM killer arrives
+// (which arrives with no diagnostics at all — the GL-HASHAGG-SPILL-1 /
+// GL-TSACCT-1 incident class). Process-global cells: the watchdog thread
+// reads them each tick, so PGC_SIGHUP edits apply without a restart.
+bool_var!(
+    B_pgrust_memory_watchdog,
+    pgrust_memory_watchdog,
+    set_pgrust_memory_watchdog,
+    true
+);
+// On breach, also signal every live backend to dump its memory-context tree
+// to the log (the pg_log_backend_memory_contexts machinery, fanned out).
+bool_var!(
+    B_pgrust_memory_watchdog_dump,
+    pgrust_memory_watchdog_dump,
+    set_pgrust_memory_watchdog_dump,
+    true
+);
+// Sampler cadence in ms. The tick reads /proc + two atomics — off every
+// query path entirely; 1s keeps worst-case detection latency far under the
+// growth rates that killed us (GiB/minute class).
+int_var!(
+    I_pgrust_memory_watchdog_interval,
+    pgrust_memory_watchdog_interval,
+    set_pgrust_memory_watchdog_interval,
+    1000
+);
+// Base warn threshold as a percent of the limit; escalation tiers derive
+// from it (T, T + (100-T)/2, T + 3(100-T)/4 — 80 -> 80/90/95).
+int_var!(
+    I_pgrust_memory_watchdog_threshold,
+    pgrust_memory_watchdog_threshold,
+    set_pgrust_memory_watchdog_threshold,
+    80
+);
+// Absolute memory limit in MB the thresholds apply to. 0 = auto: the cgroup
+// v2 memory.max when bounded (the container case IS the incident case);
+// with neither signal the watchdog idles with one boot log line.
+int_var!(
+    I_pgrust_memory_watchdog_limit,
+    pgrust_memory_watchdog_limit,
+    set_pgrust_memory_watchdog_limit,
+    0
+);
+// Connection-scaling admission control (docs/design/connection-scaling.md
+// D1 + D6). All process-global cells per this file's header law:
+// max_active_queries and connection_queue_timeout are PGC_SIGHUP (read on
+// every gated statement start / queue tick), connection_queue_size is
+// PGC_POSTMASTER (it sizes the pmchild backend pool at boot).
+int_var!(
+    I_max_active_queries,
+    max_active_queries,
+    set_max_active_queries,
+    0
+);
+int_var!(
+    I_connection_queue_size,
+    connection_queue_size,
+    set_connection_queue_size,
+    0
+);
+// D3.4 idle passivation: PGC_SIGHUP, read once per idle-period arm.
+int_var!(
+    I_idle_passivate_timeout,
+    idle_passivate_timeout,
+    set_idle_passivate_timeout,
+    60
+);
+int_var!(
+    I_connection_queue_timeout,
+    connection_queue_timeout,
+    set_connection_queue_timeout,
+    5000
+);
+// D6 admission bypass (pgrust-only, docs/design/connection-scaling.md §D6,
+// ruling 2026-09-14): a pre-authentication CLAIM that the connection is a
+// privileged/interactive one and may take a reserved-band slot instead of
+// queueing at the ordinary ceiling. pgrust.admission_bypass is PGC_BACKEND
+// (a startup-packet option; its value is read straight off the Port in
+// InitProcess, before the GUC machinery applies it, so this cell only
+// mirrors it for SHOW). pgrust.admission_bypass_applications is PGC_SIGHUP,
+// read on every regular-backend InitProcess.
+/// Default `pgrust.admission_bypass_applications`: the startup-packet
+/// application_name each interactive/admin client sends when the user has
+/// not set one. Prefix-matched case-insensitively (many tools append a
+/// version or a connection id). Drivers, ORMs, poolers and the libpq batch
+/// utilities (pg_dump/pg_restore/pgbench/pg_basebackup) are deliberately
+/// absent: those are application connections and must queue. Provenance
+/// per entry (verified 2026-09-14) is in the block below.
+//
+// Entry            | client                 | what it sends (startup packet unless noted) | source
+// -----------------+------------------------+---------------------------------------------+-------
+// psql             | psql                   | "psql" (fallback_application_name = progname; a renamed binary changes it) | postgres/src/bin/psql/startup.c
+// pgcli            | pgcli                  | "pgcli" (--application-name default, PGAPPNAME) | github.com/dbcli/pgcli/blob/main/pgcli/main.py
+// pgAdmin 4        | pgAdmin 4              | "pgAdmin 4 - DB:<db>" / "pgAdmin 4 - CONN:<n>" via PGAPPNAME | pgadmin4/web/pgadmin/utils/driver/psycopg3/connection.py, web/branding.py (APP_NAME)
+// HeidiSQL         | HeidiSQL               | "HeidiSQL" (libpq conninfo application_name) | HeidiSQL/source/dbconnection.pas, apphelpers.pas (APPNAME)
+// TablePlus        | TablePlus              | "TablePlus" (pg_stat_activity evidence; closed source) | github.com/TablePlus/TablePlus/issues/1881
+// dbvis            | DbVisualizer >= 10.0   | "dbvis" (JDBC ApplicationName property)     | dbvis.com/releasenotes/10.0/
+// azdata           | Azure Data Studio (PG) | "azdata" (applicationName -> application_name in pgtoolsservice) | github.com/microsoft/azuredatastudio-postgresql/issues/274
+// OmniDB           | OmniDB                 | "OmniDB" (psycopg2 conninfo)                | OmniDB/OmniDB_app/include/OmniDatabase/PostgreSQL.py
+// SQL Workbench/J  | SQL Workbench/J        | "SQL Workbench/J <build> (<conn id>)" (JDBC ApplicationName, on by default) | sql-workbench src/main/java/workbench/db/DbDriver.java (getProgramName)
+// DataGrip         | JetBrains DataGrip     | "DataGrip <version>" ("Send application info", on by default; JetBrains-confirmed, may be applied post-connect) | youtrack.jetbrains.com/issue/DBE-15847, DBE-5185
+// IntelliJ IDEA    | JetBrains IDEs (DB tool)| "IntelliJ IDEA <version>" (same mechanism as DataGrip) | youtrack.jetbrains.com/issue/DBE-5185
+// DBeaver          | DBeaver                | "DBeaver <ver> - Main|Metadata|SQLEditor <script>" — set POST-connect via setClientInfo/SET; the startup packet carries pgjdbc's "PostgreSQL JDBC Driver" unless the user sets the ApplicationName driver property, so this entry only helps then | dbeaver/plugins/org.jkiss.dbeaver.model/.../DBUtils.java (getClientApplicationName), ext.postgresql/model/PostgreDataSource.java
+// Postico          | Postico                | the developer states it sets application_name; the exact string is unpublished, "Postico" assumed (UNVERIFIED) | github.com/jakob/Postico/issues/818
+//
+// Deliberately NOT listed (verified defaults): "PostgreSQL JDBC Driver"
+// (pgjdbc, always sent — an application/driver connection), Npgsql /
+// psycopg / node-postgres / pgx / lib/pq / SQLAlchemy / tokio-postgres
+// (send nothing by default), PgBouncer / Pgpool-II (none of their own),
+// the libpq utilities pg_dump / pg_dumpall / pg_restore / pgbench /
+// pg_basebackup / pg_receivewal / pg_recvlogical / vacuumdb & friends /
+// pg_isready (their own progname), Adminer (SET after connect only),
+// Beekeeper Studio / phpPgAdmin / pg_top / pgcenter (none). Navicat and
+// Valentina Studio: unknown, not listed.
+pub const ADMISSION_BYPASS_APPLICATIONS_DEFAULT: &str = "psql, pgcli, pgAdmin 4, HeidiSQL, TablePlus, dbvis, azdata, OmniDB, SQL Workbench/J, DataGrip, IntelliJ IDEA, DBeaver, Postico";
+
+bool_var!(
+    B_pgrust_admission_bypass,
+    pgrust_admission_bypass,
+    set_pgrust_admission_bypass,
+    false
+);
+string_var!(
+    CELL_pgrust_admission_bypass_applications,
+    pgrust_admission_bypass_applications,
+    set_pgrust_admission_bypass_applications,
+    Some(ADMISSION_BYPASS_APPLICATIONS_DEFAULT)
+);
+// D3.1 bounded L1 caches: both PGC_SIGHUP — the enforcement points
+// (catcache/relcache evict-on-insert) read the cell on every cap check, so
+// a reload applies to the next insertion. Defaults sized from the D3.0
+// census (notes/connection-scaling-measurements.md): ~3x the warmed
+// pgbench+catalog workload. The PGRUST_CATCACHE_CAP / PGRUST_RELCACHE_CAP
+// env vars remain harness overrides (env wins if set; cached at first read).
+int_var!(
+    I_catcache_size_limit,
+    catcache_size_limit,
+    set_catcache_size_limit,
+    2048
+);
+int_var!(
+    I_relcache_size_limit,
+    relcache_size_limit,
+    set_relcache_size_limit,
+    512
+);
+// Wave-4 stack discipline: release dead dirty stack pages at idle
+// passivation (madvise; per-OS gating + safety argument in
+// tcop/postgres/src/stack_mem.rs). Subordinate to idle_passivate_timeout;
+// PGRUST_PASSIVATE_STACK env override wins when set.
+bool_var!(
+    B_idle_passivate_stack,
+    idle_passivate_stack,
+    set_idle_passivate_stack,
+    true
+);
+// D3.2 shared immutable L2 catalog cache (+ the wave-3a init-file routing,
+// folded in: init-file loads adopt/install shared cores iff the L2 is on;
+// PGRUST_L2_INITFILE=0 remains a harness-only splitter). PGC_POSTMASTER:
+// flipping it mid-life would desync generation views against live L1 state.
+bool_var!(
+    B_shared_catalog_cache,
+    shared_catalog_cache,
+    set_shared_catalog_cache,
+    true
+);
+// pgrust-only (docs/design/test-views.md D1): the ephemeral-database
+// janitor. Both are process-global cells per this file's header law —
+// prefix is PGC_POSTMASTER, grace PGC_SIGHUP (the janitor thread runs the
+// reload idiom and reads the cell each tick). Grace is stored in seconds
+// (GUC_UNIT_S row in tables.rs).
+string_var!(
+    CELL_pgrust_ephemeral_db_prefix,
+    pgrust_ephemeral_db_prefix,
+    set_pgrust_ephemeral_db_prefix,
+    Some("")
+);
+int_var!(
+    I_pgrust_ephemeral_db_grace,
+    pgrust_ephemeral_db_grace,
+    set_pgrust_ephemeral_db_grace,
+    15
+);
+// D2 mint-on-connect posture (docs/design/test-views.md): all PGC_SIGHUP,
+// read at mint time on the connecting backend's thread (which processed the
+// config at startup) and by the janitor after its reload idiom.
+string_var!(
+    CELL_pgrust_ephemeral_db_mint_roles,
+    pgrust_ephemeral_db_mint_roles,
+    set_pgrust_ephemeral_db_mint_roles,
+    Some("")
+);
+int_var!(
+    I_pgrust_ephemeral_db_max_per_role,
+    pgrust_ephemeral_db_max_per_role,
+    set_pgrust_ephemeral_db_max_per_role,
+    0
+);
+// D3 warm pool (docs/design/test-views.md warm-pool addendum): PGC_SIGHUP,
+// read by the janitor each tick after its reload idiom.
+int_var!(
+    I_pgrust_ephemeral_db_pool_size,
+    pgrust_ephemeral_db_pool_size,
+    set_pgrust_ephemeral_db_pool_size,
+    0
+);
+// Mint-strategy pick (test-views.md mint-strategy addendum): PGC_SIGHUP,
+// read by the janitor at each strategy pick.
+int_var!(
+    I_pgrust_ephemeral_db_wal_log_threshold,
+    pgrust_ephemeral_db_wal_log_threshold,
+    set_pgrust_ephemeral_db_wal_log_threshold,
+    -1
+);
+// Post-mint prewarm (test-views.md prewarm addendum): PGC_SIGHUP, read by
+// the janitor at each touch enqueue/dispatch.
+bool_var!(
+    B_pgrust_ephemeral_db_prewarm,
+    pgrust_ephemeral_db_prewarm,
+    set_pgrust_ephemeral_db_prewarm,
+    true
+);
+bool_var!(
+    B_integer_datetimes,
+    integer_datetimes,
+    set_integer_datetimes,
+    true
+);
+
+int_var!(I_huge_page_size, huge_page_size, set_huge_page_size, 0);
+int_var!(I_max_function_args, max_function_args, set_max_function_args, 100); // FUNC_MAX_ARGS
+int_var!(I_max_index_keys, max_index_keys, set_max_index_keys, 32); // INDEX_MAX_KEYS
+int_var!(
+    I_max_identifier_length,
+    max_identifier_length,
+    set_max_identifier_length,
+    63
+); // NAMEDATALEN-1
+int_var!(I_block_size, block_size, set_block_size, 8192); // BLCKSZ
+int_var!(I_segment_size, segment_size, set_segment_size, 131072); // RELSEG_SIZE
+int_var!(I_wal_block_size, wal_block_size, set_wal_block_size, 8192); // XLOG_BLCKSZ
+int_var!(
+    I_server_version_num,
+    server_version_num,
+    set_server_version_num,
+    180006
+); // PG_VERSION_NUM
+int_var!(
+    I_shared_memory_size_mb,
+    shared_memory_size_mb,
+    set_shared_memory_size_mb,
+    0
+);
+int_var!(
+    I_shared_memory_size_in_huge_pages,
+    shared_memory_size_in_huge_pages,
+    set_shared_memory_size_in_huge_pages,
+    -1
+);
+int_var!(I_num_os_semaphores, num_os_semaphores, set_num_os_semaphores, 0);
+
+int_var!(
+    I_SuperuserReservedConnections,
+    SuperuserReservedConnections,
+    set_SuperuserReservedConnections,
+    3
+);
+int_var!(
+    I_ReservedConnections,
+    ReservedConnections,
+    set_ReservedConnections,
+    0
+);
+bool_var!(B_EnableSSL, EnableSSL, set_EnableSSL, false);
+// C: char *oauth_validator_libraries_string (auth-oauth.c). PGC_SIGHUP;
+// resolved against the builtin validator registry, never dlopened (§2 carve).
+string_var!(
+    CELL_oauth_validator_libraries,
+    oauth_validator_libraries,
+    set_oauth_validator_libraries,
+    Some("")
+);
+// jwt_validator.* / oauth_validator.* (pgrust-only): the in-tree OAuth
+// validators' configuration (crates/backend/libpq/oauth_validators).
+string_var!(CELL_jwt_validator_jwks_uri, jwt_validator_jwks_uri, set_jwt_validator_jwks_uri, Some(""));
+string_var!(CELL_jwt_validator_audience, jwt_validator_audience, set_jwt_validator_audience, Some(""));
+string_var!(CELL_jwt_validator_identity_claim, jwt_validator_identity_claim, set_jwt_validator_identity_claim, Some("sub"));
+string_var!(CELL_jwt_validator_introspection_uri, jwt_validator_introspection_uri, set_jwt_validator_introspection_uri, Some(""));
+string_var!(CELL_jwt_validator_introspection_client_id, jwt_validator_introspection_client_id, set_jwt_validator_introspection_client_id, Some(""));
+string_var!(CELL_jwt_validator_introspection_client_secret, jwt_validator_introspection_client_secret, set_jwt_validator_introspection_client_secret, Some(""));
+string_var!(CELL_jwt_validator_ca_file, jwt_validator_ca_file, set_jwt_validator_ca_file, Some(""));
+bool_var!(B_jwt_validator_require_scopes, jwt_validator_require_scopes, set_jwt_validator_require_scopes, true);
+bool_var!(B_jwt_validator_allow_insecure_http, jwt_validator_allow_insecure_http, set_jwt_validator_allow_insecure_http, false);
+int_var!(I_jwt_validator_clock_skew, jwt_validator_clock_skew, set_jwt_validator_clock_skew, 60);
+int_var!(I_jwt_validator_jwks_cache_ttl, jwt_validator_jwks_cache_ttl, set_jwt_validator_jwks_cache_ttl, 300);
+int_var!(I_jwt_validator_http_timeout, jwt_validator_http_timeout, set_jwt_validator_http_timeout, 10);
+#[cfg(feature = "oauth-test-validator")]
+string_var!(CELL_oauth_validator_authn_id, oauth_validator_authn_id, set_oauth_validator_authn_id, None);
+#[cfg(feature = "oauth-test-validator")]
+bool_var!(B_oauth_validator_authorize_tokens, oauth_validator_authorize_tokens, set_oauth_validator_authorize_tokens, true);
+bool_var!(
+    B_restart_after_crash,
+    restart_after_crash,
+    set_restart_after_crash,
+    true
+);
+bool_var!(
+    B_remove_temp_files_after_crash,
+    remove_temp_files_after_crash,
+    set_remove_temp_files_after_crash,
+    true
+);
+bool_var!(
+    B_send_abort_for_crash,
+    send_abort_for_crash,
+    set_send_abort_for_crash,
+    false
+);
+bool_var!(
+    B_send_abort_for_kill,
+    send_abort_for_kill,
+    set_send_abort_for_kill,
+    false
+);
+bool_var!(B_log_hostname, log_hostname, set_log_hostname, false);
+bool_var!(B_summarize_wal, summarize_wal, set_summarize_wal, false);
+int_var!(I_PostPortNumber, PostPortNumber, set_PostPortNumber, 5432); // DEF_PGPORT
+int_var!(
+    I_AuthenticationTimeout,
+    AuthenticationTimeout,
+    set_AuthenticationTimeout,
+    60
+);
+int_var!(I_PreAuthDelay, PreAuthDelay, set_PreAuthDelay, 0);
+string_var!(
+    CELL_ListenAddresses,
+    ListenAddresses,
+    set_ListenAddresses,
+    Some("localhost")
+);
+string_var!(
+    CELL_Unix_socket_directories,
+    Unix_socket_directories,
+    set_Unix_socket_directories,
+    Some("/tmp")
+);
+
+int_var!(I_huge_pages, huge_pages, set_huge_pages, 2); // HUGE_PAGES_TRY
+// shared_memory_type (guc_tables.c): read by PGSharedMemoryCreate's huge_pages
+// interlock (sysv_shmem.c:730); the thread model has no other consumer.
+int_var!(
+    I_shared_memory_type,
+    shared_memory_type,
+    set_shared_memory_type,
+    2
+); // SHMEM_TYPE_MMAP
+int_var!(
+    I_huge_pages_status,
+    huge_pages_status,
+    set_huge_pages_status,
+    3
+); // HUGE_PAGES_UNKNOWN
+
+ // COMPUTE_QUERY_ID_AUTO
+
+string_var!(CELL_event_source, event_source, set_event_source, None);
+session_string_var!(CELL_client_encoding_string,
+    client_encoding_string,
+    set_client_encoding_string,
+    Some("SQL_ASCII")
+);
+session_string_var!(CELL_datestyle_string,
+    datestyle_string,
+    set_datestyle_string,
+    Some("ISO, MDY")
+);
+session_string_var!(CELL_server_encoding_string,
+    server_encoding_string,
+    set_server_encoding_string,
+    Some("SQL_ASCII")
+);
+string_var!(
+    CELL_server_version_string,
+    server_version_string,
+    set_server_version_string,
+    Some(crate::consts::PG_COMPAT_VERSION) // PG_VERSION
+);
+session_string_var!(CELL_role_string,
+    role_string,
+    set_role_string,
+    Some("none")
+);
+session_string_var!(CELL_session_authorization_string,
+    session_authorization_string,
+    set_session_authorization_string,
+    None
+);
+string_var!(
+    CELL_syslog_ident_str,
+    syslog_ident_str,
+    set_syslog_ident_str,
+    Some("postgres")
+);
+session_string_var!(CELL_timezone_string,
+    timezone_string,
+    set_timezone_string,
+    Some("GMT")
+);
+string_var!(
+    CELL_log_timezone_string,
+    log_timezone_string,
+    set_log_timezone_string,
+    Some("GMT")
+);
+session_string_var!(CELL_timezone_abbreviations_string,
+    timezone_abbreviations_string,
+    set_timezone_abbreviations_string,
+    None
+);
+string_var!(
+    CELL_data_directory,
+    data_directory,
+    set_data_directory,
+    None
+);
+string_var!(CELL_ConfigFileName, ConfigFileName, set_ConfigFileName, None);
+string_var!(CELL_HbaFileName, HbaFileName, set_HbaFileName, None);
+string_var!(CELL_IdentFileName, IdentFileName, set_IdentFileName, None);
+string_var!(
+    CELL_external_pid_file,
+    external_pid_file,
+    set_external_pid_file,
+    None
+);
+session_string_var!(CELL_application_name,
+    application_name,
+    set_application_name,
+    Some("")
+);
+session_string_var!(CELL_backtrace_functions,
+    backtrace_functions,
+    set_backtrace_functions,
+    Some("")
+);
+// upstream 2a29b607dbbb (18.6): Add an output_plugin_libraries GUC to bless trusted output plugins
+// C: char *output_plugin_libraries_string (logical.c). PGC_SUSET.
+session_string_var!(CELL_output_plugin_libraries_string,
+    output_plugin_libraries_string,
+    set_output_plugin_libraries_string,
+    Some("pgoutput, test_decoding")
+);
+string_var!(
+    CELL_debug_io_direct_string,
+    debug_io_direct_string,
+    set_debug_io_direct_string,
+    Some("")
+);
+string_var!(
+    CELL_recovery_target_timeline_string,
+    recovery_target_timeline_string,
+    set_recovery_target_timeline_string,
+    Some("latest")
+);
+string_var!(
+    CELL_recovery_target_string,
+    recovery_target_string,
+    set_recovery_target_string,
+    Some("")
+);
+string_var!(
+    CELL_recovery_target_xid_string,
+    recovery_target_xid_string,
+    set_recovery_target_xid_string,
+    Some("")
+);
+string_var!(
+    CELL_recovery_target_name_string,
+    recovery_target_name_string,
+    set_recovery_target_name_string,
+    Some("")
+);
+string_var!(
+    CELL_recovery_target_lsn_string,
+    recovery_target_lsn_string,
+    set_recovery_target_lsn_string,
+    Some("")
+);
+string_var!(
+    CELL_recovery_target_time_string,
+    recovery_target_time_string,
+    set_recovery_target_time_string,
+    Some("")
+);
+string_var!(
+    CELL_recoveryRestoreCommand,
+    recoveryRestoreCommand,
+    set_recoveryRestoreCommand,
+    Some("")
+);
+string_var!(
+    CELL_archiveCleanupCommand,
+    archiveCleanupCommand,
+    set_archiveCleanupCommand,
+    Some("")
+);
+string_var!(
+    CELL_recoveryEndCommand,
+    recoveryEndCommand,
+    set_recoveryEndCommand,
+    Some("")
+);
+string_var!(CELL_PrimaryConnInfo, PrimaryConnInfo, set_PrimaryConnInfo, Some(""));
+string_var!(CELL_PrimarySlotName, PrimarySlotName, set_PrimarySlotName, Some(""));
+bool_var!(
+    B_recoveryTargetInclusive,
+    recoveryTargetInclusive,
+    set_recoveryTargetInclusive,
+    true
+);
+bool_var!(
+    B_wal_receiver_create_temp_slot,
+    wal_receiver_create_temp_slot,
+    set_wal_receiver_create_temp_slot,
+    false
+);
+bool_var!(
+    B_hot_standby_feedback,
+    hot_standby_feedback,
+    set_hot_standby_feedback,
+    false
+);
+int_var!(
+    I_wal_receiver_status_interval,
+    wal_receiver_status_interval,
+    set_wal_receiver_status_interval,
+    10
+);
+int_var!(
+    I_wal_receiver_timeout,
+    wal_receiver_timeout,
+    set_wal_receiver_timeout,
+    60 * 1000
+);
+int_var!(
+    I_recoveryTargetAction,
+    recoveryTargetAction,
+    set_recoveryTargetAction,
+    0
+); // RECOVERY_TARGET_ACTION_PAUSE
+int_var!(
+    I_recovery_min_apply_delay,
+    recovery_min_apply_delay,
+    set_recovery_min_apply_delay,
+    0
+);
+string_var!(CELL_cluster_name, cluster_name, set_cluster_name, Some(""));
+
+// be-secure.c file-scope SSL GUC globals, homed here until be_secure owns
+// installable storage (EnableSSL precedent above).
+bool_var!(
+    B_SSLPreferServerCiphers,
+    SSLPreferServerCiphers,
+    set_SSLPreferServerCiphers,
+    true
+);
+bool_var!(
+    B_ssl_passphrase_command_supports_reload,
+    ssl_passphrase_command_supports_reload,
+    set_ssl_passphrase_command_supports_reload,
+    false
+);
+int_var!(
+    CELL_ssl_min_protocol_version,
+    ssl_min_protocol_version,
+    set_ssl_min_protocol_version,
+    crate::consts::PG_TLS1_2_VERSION
+);
+int_var!(
+    CELL_ssl_max_protocol_version,
+    ssl_max_protocol_version,
+    set_ssl_max_protocol_version,
+    crate::consts::PG_TLS_ANY
+);
+string_var!(CELL_ssl_library, ssl_library, set_ssl_library, Some("OpenSSL"));
+string_var!(
+    CELL_ssl_cert_file,
+    ssl_cert_file,
+    set_ssl_cert_file,
+    Some("server.crt")
+);
+string_var!(
+    CELL_ssl_key_file,
+    ssl_key_file,
+    set_ssl_key_file,
+    Some("server.key")
+);
+string_var!(CELL_ssl_ca_file, ssl_ca_file, set_ssl_ca_file, Some(""));
+string_var!(CELL_ssl_crl_file, ssl_crl_file, set_ssl_crl_file, Some(""));
+string_var!(CELL_ssl_crl_dir, ssl_crl_dir, set_ssl_crl_dir, Some(""));
+string_var!(
+    CELL_ssl_dh_params_file,
+    ssl_dh_params_file,
+    set_ssl_dh_params_file,
+    Some("")
+);
+string_var!(
+    CELL_ssl_passphrase_command,
+    ssl_passphrase_command,
+    set_ssl_passphrase_command,
+    Some("")
+);
+string_var!(
+    CELL_SSLCipherSuites,
+    SSLCipherSuites,
+    set_SSLCipherSuites,
+    Some("")
+);
+string_var!(
+    CELL_SSLCipherList,
+    SSLCipherList,
+    set_SSLCipherList,
+    Some("HIGH:MEDIUM:+3DES:!aNULL")
+);
+string_var!(
+    CELL_SSLECDHCurve,
+    SSLECDHCurve,
+    set_SSLECDHCurve,
+    Some("X25519:prime256v1")
+);
+
+// TLS-lowering probe: fixed-name objdump target (CI cluster run-select1-objdump)
+// proving what a clustered session-GUC read compiles to on the ship binary
+// (direct tpidr-relative loads vs an unrelaxed TLSDESC call). Three reads
+// from one cluster also expose whether the TLS base is shared.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn pgrust_guc_tls_probe() -> i32 {
+    log_statement() + Debug_print_plan() as i32 + log_duration() as i32
+}

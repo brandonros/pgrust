@@ -1,0 +1,79 @@
+[package]
+name = "slotsync"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "slotsync"
+path = "src/lib.rs"
+
+[dependencies]
+timeout = { path = "../../utils/misc/timeout" }
+pgsync = { path = "../../../_support/pgsync" }
+libc = "0.2"
+mcx = { path = "../../../_support/mcx" }
+seam_core = { path = "../../../_support/seam_core" }
+types_core = { path = "../../../_support/types/types_core" }
+types_error = { path = "../../../_support/types/types_error" }
+types_storage = { path = "../../../_support/types/types_storage" }
+types_startup = { path = "../../../_support/types/types_startup" }
+elog = { path = "../../utils/error/elog" }
+guc = { path = "../../utils/misc/guc" }
+guc_tables = { path = "../../utils/misc/guc_tables" }
+init_small = { path = "../../utils/init/init_small" }
+miscinit = { path = "../../utils/init/miscinit" }
+postinit = { path = "../../utils/init/postinit" }
+interrupt = { path = "../../postmaster/interrupt" }
+postgres_tcop = { package = "postgres", path = "../../tcop/postgres" }
+postgres_seams = { path = "../../tcop/postgres_seams" }
+xact = { path = "../../access/transam/xact" }
+transam_xlog = { path = "../../access/transam/transam_xlog" }
+xlogrecovery_seams = { path = "../../access/transam/xlogrecovery_seams" }
+walreceiverfuncs_seams = { path = "../walreceiverfuncs_seams" }
+slot = { path = "../slot" }
+snapbuild = { path = "../logical/snapbuild" }
+walreceiver = { path = "../walreceiver" }
+walsender_config = { path = "../walsender_config" }
+procarray = { path = "../../storage/ipc/procarray" }
+procsignal = { path = "../../storage/ipc/procsignal" }
+slotsync_seams = { path = "../slotsync_seams" }
+ipc = { path = "../../storage/ipc/ipc" }
+latch = { path = "../../storage/ipc/latch" }
+lmgr = { path = "../../storage/lmgr/lmgr" }
+lmgr_proc = { path = "../../storage/lmgr/lmgr_proc" }
+dbcommands_seams = { path = "../../commands/dbcommands_seams" }
+ps_status_seams = { path = "../../utils/misc/ps_status_seams" }
+timestamp_seams = { path = "../../utils/adt/timestamp_seams" }
+types_tuple = { path = "../../../_support/types/types_tuple" }
+types_guc = { path = "../../../_support/types/types_guc" }
+guc_file = { path = "../../utils/misc/guc_file" }
+datum = { path = "../../../_support/types/datum" }
+shmem_seams = { path = "../../storage/ipc/shmem_seams" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+[dev-dependencies]
+# Slot-array bring-up for the tests that drive update_local_synced_slot /
+# drop_local_obsolete_slots (the slot crate's shmem_setup, minus its state).
+pg_sema_seams = { path = "../../port/pg_sema_seams" }
+s_lock_seams = { path = "../../storage/lmgr/s_lock_seams" }
+latch_seams = { path = "../../storage/ipc/latch_seams" }
+miscinit_seams = { path = "../../utils/init/miscinit_seams" }
+waitevent_seams = { path = "../../utils/activity/waitevent_seams" }
+ipc_seams = { path = "../../storage/ipc/ipc_seams" }
+deadlock_seams = { path = "../../storage/lmgr/deadlock_seams" }
+pmsignal_seams = { path = "../../storage/ipc/pmsignal_seams" }
+syncrep_seams = { path = "../syncrep_seams" }
+condition_variable_seams = { path = "../../storage/lmgr/condition_variable_seams" }
+autovacuum_seams = { path = "../../postmaster/autovacuum_seams" }
+lock_seams = { path = "../../storage/lmgr/lock_seams" }
+timeout_seams = { path = "../../utils/misc/timeout_seams" }
+xact_seams = { path = "../../access/transam/xact_seams" }
+xlog_seams = { path = "../../access/transam/transam_xlog_seams", package = "transam_xlog_seams" }
+transam_seams = { path = "../../access/transam/transam_seams" }
+subtrans_seams = { path = "../../access/transam/subtrans_seams" }
+superuser_seams = { path = "../../utils/misc/superuser_seams" }
+inval_seams = { path = "../../utils/cache/inval_seams" }
+lwlock = { path = "../../storage/lmgr/lwlock" }

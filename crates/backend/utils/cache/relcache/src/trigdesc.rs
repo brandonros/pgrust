@@ -1,0 +1,39 @@
+use std::rc::Rc;
+
+use types_core::Oid;
+use types_error::{PgError, PgResult, ERRCODE_INTERNAL_ERROR};
+use types_trigger::TriggerDesc;
+
+use crate::{cache_mcx, store};
+
+#[track_caller]
+#[cold]
+#[inline(never)]
+fn not_open(relid: Oid) -> Box<PgError> {
+    Box::new(
+        PgError::error(format!(
+            "RelationGetTriggerDesc: relation {relid} not in relcache"
+        ))
+        .with_sqlstate(ERRCODE_INTERNAL_ERROR),
+    )
+}
+
+// C hangs rd_trigdesc off the entry at RelationBuildDesc time; here it is
+// built on first ask (rd_indexlist precedent) and the Rc clone replaces C's
+// per-query CopyTriggerDesc.
+pub fn RelationGetTriggerDesc(relid: Oid) -> PgResult<Option<Rc<TriggerDesc<'static>>>> {
+    let rel = store::RelationIdGetRelation(relid)?.ok_or_else(|| not_open(relid))?;
+    if !rel.rd_hastriggers {
+        return Ok(None);
+    }
+    if let Some(cached) = rel.rd_trigdesc.borrow().as_ref() {
+        return Ok(cached.clone());
+    }
+    // The scan re-enters the relcache; no borrow held across it.
+    // RelationGetRelationName(relation) for the trigger.c:1936/1950 messages.
+    let relname = String::from_utf8_lossy(rel.rd_rel.relname.name_str()).into_owned();
+    let built = relcache_build_seams::build_trigger_desc::call(cache_mcx(), relid, &relname)?
+        .map(Rc::new);
+    *rel.rd_trigdesc.borrow_mut() = Some(built.clone());
+    Ok(built)
+}

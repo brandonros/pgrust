@@ -1,0 +1,872 @@
+//! rewriteheap.c: bulk table rewrite preserving visibility + ctid chains,
+//! including the logical-rewrite lane (mapping files under
+//! pg_logical/mappings so decoding can follow rewritten catalog tuples).
+//! State memory lives in the caller's statement mcx and dies at statement
+//! end where C deletes rs_cxt eagerly (bounded by the rewrite's
+//! unresolved-chain footprint, C's own worst case). The logical mapping
+//! buffers hold plain Rust resources (Files) so an error unwind closes the
+//! fds where C leans on vfd/resowner cleanup.
+#![allow(non_snake_case)]
+
+use std::path::PathBuf;
+
+use elog::ereport;
+use heapam::freeze::heap_freeze_tuple;
+use heapam::HeapTupleHeaderGetUpdateXid;
+use heaptuple::{heap_copytuple, HeapTuple};
+use mcx::{Mcx, PgFxHashMap};
+use types_core::xact::{TransactionIdIsNormal, TransactionIdPrecedes};
+use types_core::{BlockNumber, ForkNumber, Oid, TransactionId, XLogRecPtr};
+use types_error::{
+    ErrorLocation, PgError, PgResult, DEBUG1, ERRCODE_PROGRAM_LIMIT_EXCEEDED, ERROR,
+};
+use types_rel::{Relation, HEAP_DEFAULT_FILLFACTOR, RELKIND_TOASTVALUE};
+use types_storage::bufpage::{MaxHeapTupleSize, PageMut, PAI_IS_HEAP};
+use types_storage::RelFileLocator;
+use types_tuple::htup::{
+    HeapTupleData, HeapTupleHeaderData, HEAP2_XACT_MASK, HEAP_HASEXTERNAL, HEAP_UPDATED,
+    HEAP_XACT_MASK, HEAP_XMAX_INVALID,
+};
+use types_core::OffsetNumber;
+use types_tuple::{ItemPointerData, ItemPointerIsValid};
+
+// reorderbuffer.h: PG_LOGICAL_DIR "/mappings".
+const PG_LOGICAL_MAPPINGS_DIR: &str = "pg_logical/mappings";
+// sizeof(LogicalRewriteMappingData): 2x RelFileLocator + 2x ItemPointerData.
+const LOGICAL_REWRITE_MAPPING_SIZE: usize = 36;
+
+// wait_event_types.h (generated from wait_event_names.txt): PG_WAIT_IO | the
+// row of waitevent's IO name table, same derivation as fd's wait_event
+// module. The three rewriteheap.c sites: FileWrite (:881), FileSync (:922),
+// the checkpoint's pg_fsync (:1236).
+const PG_WAIT_IO: u32 = 0x0A00_0000;
+const WAIT_EVENT_LOGICAL_REWRITE_CHECKPOINT_SYNC: u32 = PG_WAIT_IO | 34;
+const WAIT_EVENT_LOGICAL_REWRITE_SYNC: u32 = PG_WAIT_IO | 37;
+const WAIT_EVENT_LOGICAL_REWRITE_WRITE: u32 = PG_WAIT_IO | 39;
+
+// pgstat_report_wait_start/end (wait_event.h) through the waitevent seam;
+// a harness without the waitevent crate reports nothing (the twophase
+// crate's shape for the same seam).
+fn report_wait_start(wait_event_info: u32) {
+    if waitevent_seams::pgstat_report_wait_start::is_installed() {
+        waitevent_seams::pgstat_report_wait_start::call(wait_event_info);
+    }
+}
+
+fn report_wait_end() {
+    if waitevent_seams::pgstat_report_wait_end::is_installed() {
+        waitevent_seams::pgstat_report_wait_end::call();
+    }
+}
+// sizeof(xl_heap_rewrite_mapping) with C padding: xid(4) db(4) rel(4) pad(4)
+// offset(8) num_mappings(4) pad(4) start_lsn(8).
+const XL_HEAP_REWRITE_MAPPING_SIZE: usize = 40;
+const XLOG_HEAP2_REWRITE: u8 = 0x00;
+const RM_HEAP2_ID: u8 = types_core::RmgrIds::RM_HEAP2_ID as u8;
+
+fn loc(line: i32, func: &'static str) -> ErrorLocation {
+    ErrorLocation::new("src/backend/access/heap/rewriteheap.c", line, func)
+}
+
+/// `sscanf(name, LOGICAL_REWRITE_FORMAT, &dboid, &relid, &hi, &lo,
+/// &rewrite_xid, &create_xid) == 6` (rewriteheap.c:1203, the format is
+/// "map-%x-%x-%X_%X-%x-%x"): all six hex conversions must succeed, in order,
+/// with the literal separators between them; whatever follows the sixth
+/// conversion is ignored, as sscanf ignores it. Returns the LSN (hi << 32 |
+/// lo), the only components the checkpoint uses.
+fn parse_logical_rewrite_name(name: &str) -> Option<XLogRecPtr> {
+    // One `%x` conversion (C99 7.21.6.2 / strtoul base 16): leading white
+    // space, an optional sign, an optional 0x/0X prefix, then hex digits;
+    // the value is stored into a 32-bit slot.
+    fn scan_hex(b: &[u8], mut i: usize) -> Option<(u32, usize)> {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let mut negate = false;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            negate = b[i] == b'-';
+            i += 1;
+        }
+        if i + 1 < b.len() && b[i] == b'0' && (b[i + 1] == b'x' || b[i + 1] == b'X')
+            && i + 2 < b.len() && b[i + 2].is_ascii_hexdigit()
+        {
+            i += 2;
+        }
+        let start = i;
+        let mut v: u32 = 0;
+        while i < b.len() && b[i].is_ascii_hexdigit() {
+            v = v.wrapping_mul(16).wrapping_add((b[i] as char).to_digit(16)? as u32);
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        Some((if negate { v.wrapping_neg() } else { v }, i))
+    }
+    let b = name.as_bytes();
+    let rest = b.strip_prefix(b"map-")?;
+    let mut i = b.len() - rest.len();
+    let mut fields = [0u32; 6];
+    for (n, sep) in [b'-', b'-', b'_', b'-', b'-', 0u8].into_iter().enumerate() {
+        let (v, next) = scan_hex(b, i)?;
+        fields[n] = v;
+        i = next;
+        if sep != 0 {
+            if i >= b.len() || b[i] != sep {
+                return None;
+            }
+            i += 1;
+        }
+    }
+    let (hi, lo) = (fields[2], fields[3]);
+    Some(((hi as u64) << 32) | lo as u64)
+}
+
+fn mappings_dir() -> PathBuf {
+    let datadir = init_small::globals::DataDir().expect("rewriteheap: DataDir unset");
+    PathBuf::from(datadir).join(PG_LOGICAL_MAPPINGS_DIR)
+}
+
+/// The datadir-relative `pg_logical/mappings/<name>` C prints for a mapping
+/// file (rewriteheap.c:963 builds `src->path` that way).
+fn mapping_relpath(path: &std::path::Path) -> String {
+    match path.file_name() {
+        Some(name) => format!("{PG_LOGICAL_MAPPINGS_DIR}/{}", name.to_string_lossy()),
+        None => path.display().to_string(),
+    }
+}
+
+/// `CloseTransientFile(fd)` for an owned descriptor: close(2)'s result is
+/// checked (rewriteheap.c:1243), instead of being dropped on the floor.
+#[cfg(unix)]
+fn close_checked(file: impl std::os::unix::io::IntoRawFd) -> std::io::Result<()> {
+    if fd::pg_close(file.into_raw_fd()) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn close_checked<F>(file: F) -> std::io::Result<()> {
+    drop(file);
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct TidHashKey {
+    xmin: TransactionId,
+    tid: ItemPointerData,
+}
+
+struct UnresolvedTupData<'mcx> {
+    old_tid: ItemPointerData,
+    tuple: HeapTuple<'mcx>,
+}
+
+// RewriteMappingFile (rewriteheap.c:186): per-"mapped" xid mapping file with
+// its buffered, not-yet-flushed mapping entries.
+struct RewriteMappingFile {
+    off: u64,
+    path: PathBuf,
+    file: std::fs::File,
+    mappings: Vec<[u8; LOGICAL_REWRITE_MAPPING_SIZE]>,
+}
+
+pub struct RewriteState<'mcx> {
+    mcx: Mcx<'mcx>,
+    rs_bulkstate: Option<bulkwrite::BulkWriteState>,
+    rs_buffer: Option<bulkwrite::BulkWriteBuffer>,
+    rs_blockno: BlockNumber,
+    rs_oldest_xmin: TransactionId,
+    rs_freeze_xid: TransactionId,
+    rs_cutoff_multi: TransactionId,
+    rs_old_frozenxid: TransactionId,
+    rs_old_minmxid: TransactionId,
+    rs_new_relkind: u8,
+    // C NewHeap->rd_toastoid: valid only for the CLUSTER/VACUUM FULL rewrite
+    // when both heaps have toast tables (copy_table_data's choice).
+    rs_toastoid: types_core::Oid,
+    rs_new_save_free_space: usize,
+    rs_unresolved_tups: PgFxHashMap<'mcx, TidHashKey, UnresolvedTupData<'mcx>>,
+    rs_old_new_tid_map: PgFxHashMap<'mcx, TidHashKey, ItemPointerData>,
+    // --- logical rewrite support (rewriteheap.c "Logical rewrite support") ---
+    rs_logical_rewrite: bool,
+    rs_logical_xmin: TransactionId,
+    rs_begin_lsn: XLogRecPtr,
+    rs_num_rewrite_mappings: u32,
+    rs_old_locator: RelFileLocator,
+    rs_new_locator: RelFileLocator,
+    rs_old_relid: Oid,
+    // MyDatabaseId, or InvalidOid for shared catalogs (mapping-file naming
+    // and the xl_heap_rewrite_mapping.mapped_db field).
+    rs_mapped_db: Oid,
+    // std HashMap on purpose: the values own Files; Drop closes them on any
+    // unwind (C leans on vfd/resowner cleanup for the same guarantee).
+    rs_logical_mappings: std::collections::HashMap<TransactionId, RewriteMappingFile>,
+}
+
+pub fn begin_heap_rewrite<'mcx>(
+    mcx: Mcx<'mcx>,
+    old_heap: &Relation<'mcx>,
+    new_heap: &Relation<'mcx>,
+    oldest_xmin: TransactionId,
+    freeze_xid: TransactionId,
+    cutoff_multi: TransactionId,
+    toastoid: types_core::Oid,
+) -> PgResult<RewriteState<'mcx>> {
+    let mut state = RewriteState {
+        mcx,
+        rs_bulkstate: Some(bulkwrite::smgr_bulk_start_rel(new_heap, ForkNumber::MAIN_FORKNUM)?),
+        rs_buffer: None,
+        rs_blockno: bufmgr::RelationGetNumberOfBlocksInFork(new_heap, ForkNumber::MAIN_FORKNUM)?,
+        rs_oldest_xmin: oldest_xmin,
+        rs_freeze_xid: freeze_xid,
+        rs_cutoff_multi: cutoff_multi,
+        rs_old_frozenxid: old_heap.rd_rel.relfrozenxid,
+        rs_old_minmxid: old_heap.rd_rel.relminmxid,
+        rs_new_relkind: new_heap.rd_rel.relkind,
+        rs_toastoid: toastoid,
+        rs_new_save_free_space: new_heap.get_target_page_free_space(HEAP_DEFAULT_FILLFACTOR),
+        rs_unresolved_tups: PgFxHashMap::with_hasher_in(Default::default(), mcx),
+        rs_old_new_tid_map: PgFxHashMap::with_hasher_in(Default::default(), mcx),
+        rs_logical_rewrite: false,
+        rs_logical_xmin: types_core::InvalidTransactionId,
+        rs_begin_lsn: types_core::InvalidXLogRecPtr,
+        rs_num_rewrite_mappings: 0,
+        rs_old_locator: old_heap.rd_locator.get(),
+        rs_new_locator: new_heap.rd_locator.get(),
+        rs_old_relid: old_heap.rd_id,
+        rs_mapped_db: if old_heap.rd_rel.relisshared {
+            types_core::InvalidOid
+        } else {
+            init_small::globals::MyDatabaseId()
+        },
+        rs_logical_mappings: std::collections::HashMap::new(),
+    };
+
+    logical_begin_heap_rewrite(&mut state, old_heap)?;
+
+    Ok(state)
+}
+
+// logical_begin_heap_rewrite (rewriteheap.c:759): prepare mapping-file
+// logging if the rewritten table can be accessed during logical decoding
+// and any decoding slot holds a catalog xmin.
+fn logical_begin_heap_rewrite(state: &mut RewriteState<'_>, old_heap: &Relation<'_>) -> PgResult<()> {
+    state.rs_logical_rewrite = heapam::relation_is_accessible_in_logical_decoding(old_heap);
+    if !state.rs_logical_rewrite {
+        return Ok(());
+    }
+
+    let (_slot_xmin, logical_xmin) = procarray::ProcArrayGetReplicationSlotXmin()?;
+
+    // No logical slots in progress: there cannot be any remappings for
+    // relevant rows yet. The relation's lock protects us against races.
+    if logical_xmin == types_core::InvalidTransactionId {
+        state.rs_logical_rewrite = false;
+        return Ok(());
+    }
+
+    state.rs_logical_xmin = logical_xmin;
+    state.rs_begin_lsn = transam_xlog::GetXLogInsertRecPtr();
+    state.rs_num_rewrite_mappings = 0;
+    Ok(())
+}
+
+pub fn end_heap_rewrite<'mcx>(
+    mut state: RewriteState<'mcx>,
+    new_heap: &Relation<'mcx>,
+) -> PgResult<()> {
+    let keys: mcx::PgVec<'_, TidHashKey> = {
+        let mut v = mcx::PgVec::new_in(state.mcx);
+        v.extend(state.rs_unresolved_tups.keys().copied());
+        v
+    };
+    for key in keys.iter() {
+        let mut unresolved = state.rs_unresolved_tups.remove(key).unwrap();
+        unresolved.tuple.as_tuple_mut().t_data_mut().t_ctid = ItemPointerData::invalid();
+        let mut tup = unresolved.tuple;
+        raw_heap_insert(&mut state, new_heap, tup.as_tuple_mut())?;
+    }
+
+    if let Some(buffer) = state.rs_buffer.take() {
+        let blockno = state.rs_blockno;
+        bulkwrite::smgr_bulk_write(bulk_state(&mut state), blockno, buffer, true)?;
+    }
+
+    // rewriteheap.c:321-323: the bulk writer's final flush (and its FPIs)
+    // precedes the last XLOG_HEAP2_REWRITE mapping records.
+    bulkwrite::smgr_bulk_finish(state.rs_bulkstate.take().expect("bulk writer finished once"))?;
+
+    logical_end_heap_rewrite(&mut state)
+}
+
+fn bulk_state<'a>(state: &'a mut RewriteState<'_>) -> &'a mut bulkwrite::BulkWriteState {
+    state.rs_bulkstate.as_mut().expect("bulk writer still open")
+}
+
+// logical_heap_rewrite_flush_mappings (rewriteheap.c:807): write the buffered
+// mappings to their files (no fsync yet) and WAL-log each batch. The file
+// write happens BEFORE XLogInsert on purpose — the mapping files are not in
+// shared_buffers, so the usual buffer-lock/checkpoint interlock does not
+// apply; see the C "Logical rewrite support" comment.
+fn logical_heap_rewrite_flush_mappings(state: &mut RewriteState<'_>) -> PgResult<()> {
+    debug_assert!(state.rs_logical_rewrite);
+
+    if state.rs_num_rewrite_mappings == 0 {
+        return Ok(());
+    }
+    let _ = elog::elog(
+        DEBUG1,
+        format!("flushing {} logical rewrite mapping entries", state.rs_num_rewrite_mappings),
+    );
+
+    let mapped_db = state.rs_mapped_db;
+    let mapped_rel = state.rs_old_relid;
+    let start_lsn = state.rs_begin_lsn;
+    for (&xid, src) in state.rs_logical_mappings.iter_mut() {
+        let num_mappings = src.mappings.len() as u32;
+        if num_mappings == 0 {
+            continue;
+        }
+
+        let len = num_mappings as usize * LOGICAL_REWRITE_MAPPING_SIZE;
+        let mut waldata: Vec<u8> = Vec::with_capacity(len);
+        for m in src.mappings.drain(..) {
+            waldata.extend_from_slice(&m);
+        }
+        state.rs_num_rewrite_mappings -= num_mappings;
+
+        // xl_heap_rewrite_mapping, C struct layout (incl. alignment holes).
+        let mut xlrec = [0u8; XL_HEAP_REWRITE_MAPPING_SIZE];
+        xlrec[0..4].copy_from_slice(&xid.to_ne_bytes());
+        xlrec[4..8].copy_from_slice(&mapped_db.to_ne_bytes());
+        xlrec[8..12].copy_from_slice(&mapped_rel.to_ne_bytes());
+        xlrec[16..24].copy_from_slice(&(src.off as i64).to_ne_bytes());
+        xlrec[24..28].copy_from_slice(&num_mappings.to_ne_bytes());
+        xlrec[32..40].copy_from_slice(&start_lsn.to_ne_bytes());
+
+        logical_mapping_file_write(src, &waldata)?;
+
+        xloginsert_seams::xlog_insert_record::call(
+            RM_HEAP2_ID,
+            XLOG_HEAP2_REWRITE,
+            0,
+            &[&xlrec, &waldata],
+            &[],
+        )?;
+    }
+    debug_assert_eq!(state.rs_num_rewrite_mappings, 0);
+    Ok(())
+}
+
+// rewriteheap.c:880-886: FileWrite(src->vfd, waldata, len, src->off,
+// WAIT_EVENT_LOGICAL_REWRITE_WRITE) — one positional write at src->off
+// under the LogicalRewriteWrite wait event (fd.c FileWrite brackets the
+// pwrite with pgstat_report_wait_start/end); a failed or short write reports
+// the bytes actually written, naming the file by the datadir-relative path C
+// keeps in src->path. Advances src->off on success.
+fn logical_mapping_file_write(src: &mut RewriteMappingFile, waldata: &[u8]) -> PgResult<()> {
+    let len = waldata.len();
+    report_wait_start(WAIT_EVENT_LOGICAL_REWRITE_WRITE);
+    #[cfg(unix)]
+    let written: i64 = {
+        use std::os::unix::io::AsRawFd;
+        fd::pg_pwrite(src.file.as_raw_fd(), waldata, src.off as i64) as i64
+    };
+    #[cfg(not(unix))]
+    let written: i64 = {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = &src.file;
+        match f.seek(SeekFrom::Start(src.off)).and_then(|_| f.write(waldata)) {
+            Ok(n) => n as i64,
+            Err(e) => {
+                fd::set_errno(e.raw_os_error().unwrap_or(0));
+                -1
+            }
+        }
+    };
+    report_wait_end();
+    if written != len as i64 {
+        return ereport(ERROR)
+            .errcode_for_file_access()
+            .errmsg(format!(
+                "could not write to file \"{}\", wrote {} of {}: %m",
+                mapping_relpath(&src.path),
+                written,
+                len
+            ))
+            .finish(loc(886, "logical_heap_rewrite_flush_mappings"));
+    }
+    src.off += len as u64;
+    Ok(())
+}
+
+// rewriteheap.c:921-924: FileSync(src->vfd, WAIT_EVENT_LOGICAL_REWRITE_SYNC)
+// on one mapping file (fd.c FileSync brackets the fsync with
+// pgstat_report_wait_start/end).
+fn logical_mapping_file_sync(src: &RewriteMappingFile) -> PgResult<()> {
+    report_wait_start(WAIT_EVENT_LOGICAL_REWRITE_SYNC);
+    let synced = src.file.sync_all();
+    report_wait_end();
+    if let Err(e) = synced {
+        // C rewriteheap.c:923: data_sync_elevel(ERROR) — PANIC at default
+        // data_sync_retry=off; a failed fsync must never be retried.
+        return ereport(fd::data_sync_elevel(ERROR))
+            .errcode_for_file_access()
+            .errmsg(format!("could not fsync file \"{}\": {e}", src.path.display()))
+            .finish(loc(921, "logical_end_heap_rewrite"));
+    }
+    Ok(())
+}
+
+// rewriteheap.c:1236-1240: pg_fsync(fd) of one surviving mapping file at
+// checkpoint time, under WAIT_EVENT_LOGICAL_REWRITE_CHECKPOINT_SYNC.
+fn checkpoint_fsync_mapping_file(file: &std::fs::File, path: &std::path::Path) -> PgResult<()> {
+    report_wait_start(WAIT_EVENT_LOGICAL_REWRITE_CHECKPOINT_SYNC);
+    let synced = file.sync_all();
+    report_wait_end();
+    if let Err(e) = synced {
+        // C rewriteheap.c:1238: data_sync_elevel(ERROR) — PANIC at
+        // default data_sync_retry=off. This is the fsyncgate file
+        // shape (written by a backend, fsynced by the checkpoint);
+        // trusting a retry would let a checkpoint complete over
+        // lost mapping data.
+        return ereport(fd::data_sync_elevel(ERROR))
+            .errcode_for_file_access()
+            .errmsg(format!("could not fsync file \"{}\": {e}", path.display()))
+            .finish(loc(1249, "CheckPointLogicalRewriteHeap"));
+    }
+    Ok(())
+}
+
+// logical_end_heap_rewrite (rewriteheap.c:905): flush the remaining
+// in-memory entries, then fsync every mapping file we wrote.
+fn logical_end_heap_rewrite(state: &mut RewriteState<'_>) -> PgResult<()> {
+    if !state.rs_logical_rewrite {
+        return Ok(());
+    }
+    if state.rs_num_rewrite_mappings > 0 {
+        logical_heap_rewrite_flush_mappings(state)?;
+    }
+    for src in state.rs_logical_mappings.values() {
+        logical_mapping_file_sync(src)?;
+    }
+    // Dropping the map closes the files (C: FileClose per entry).
+    state.rs_logical_mappings.clear();
+    Ok(())
+}
+
+// logical_rewrite_log_mapping (rewriteheap.c:935): buffer one (old->new)
+// mapping for 'xid', creating the per-xid mapping file on first use.
+fn logical_rewrite_log_mapping(
+    state: &mut RewriteState<'_>,
+    xid: TransactionId,
+    map: &[u8; LOGICAL_REWRITE_MAPPING_SIZE],
+) -> PgResult<()> {
+    if !state.rs_logical_mappings.contains_key(&xid) {
+        let name = format!(
+            "map-{:x}-{:x}-{:X}_{:X}-{:x}-{:x}",
+            state.rs_mapped_db,
+            state.rs_old_relid,
+            (state.rs_begin_lsn >> 32) as u32,
+            state.rs_begin_lsn as u32,
+            xid,
+            xact_seams::get_current_transaction_id::call()?,
+        );
+        let path = mappings_dir().join(name);
+        let file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                return ereport(ERROR)
+                    .errcode_for_file_access()
+                    .errmsg(format!("could not create file \"{}\": {e}", path.display()))
+                    .finish(loc(977, "logical_rewrite_log_mapping"));
+            }
+        };
+        state
+            .rs_logical_mappings
+            .insert(xid, RewriteMappingFile { off: 0, path, file, mappings: Vec::new() });
+    }
+    let src = state.rs_logical_mappings.get_mut(&xid).unwrap();
+    src.mappings.push(*map);
+    state.rs_num_rewrite_mappings += 1;
+
+    // Write out the buffers once we have too many in-memory entries across
+    // all mapping files (C: 1000, "arbitrary number").
+    if state.rs_num_rewrite_mappings >= 1000 {
+        logical_heap_rewrite_flush_mappings(state)?;
+    }
+    Ok(())
+}
+
+fn serialize_locator(out: &mut [u8], locator: RelFileLocator) {
+    out[0..4].copy_from_slice(&locator.spcOid.to_ne_bytes());
+    out[4..8].copy_from_slice(&locator.dbOid.to_ne_bytes());
+    out[8..12].copy_from_slice(&locator.relNumber.to_ne_bytes());
+}
+
+fn serialize_tid(out: &mut [u8], tid: ItemPointerData) {
+    out[0..2].copy_from_slice(&tid.ip_blkid.bi_hi.to_ne_bytes());
+    out[2..4].copy_from_slice(&tid.ip_blkid.bi_lo.to_ne_bytes());
+    out[4..6].copy_from_slice(&tid.ip_posid.to_ne_bytes());
+}
+
+// logical_rewrite_heap_tuple (rewriteheap.c:999): log a mapping from
+// old_tid to the tuple's new location if the tuple was created or deleted
+// within any decoding slot's xmin horizon.
+fn logical_rewrite_heap_tuple(
+    state: &mut RewriteState<'_>,
+    old_tid: ItemPointerData,
+    new_tuple: &HeapTupleData<'_>,
+) -> PgResult<()> {
+    if !state.rs_logical_rewrite {
+        return Ok(());
+    }
+
+    let new_tid = new_tuple.t_self;
+    let cutoff = state.rs_logical_xmin;
+    let hdr = new_tuple.t_data();
+
+    // HeapTupleHeaderGetXmin: FrozenTransactionId (not normal) once frozen.
+    let xmin = hdr.xmin();
+    // *GetUpdateXid to correctly deal with multixacts.
+    let xmax = HeapTupleHeaderGetUpdateXid(hdr)?;
+
+    // Log the mapping iff the tuple has been created recently.
+    let do_log_xmin = TransactionIdIsNormal(xmin) && !TransactionIdPrecedes(xmin, cutoff);
+    let do_log_xmax = if !TransactionIdIsNormal(xmax) {
+        // No xmax set: can't have any permanent ones.
+        false
+    } else if types_tuple::htup::HEAP_XMAX_IS_LOCKED_ONLY(hdr.t_infomask) {
+        // Only locked: we don't care.
+        false
+    } else {
+        // Deleted recently => log.
+        !TransactionIdPrecedes(xmax, cutoff)
+    };
+
+    if !do_log_xmin && !do_log_xmax {
+        return Ok(());
+    }
+
+    let mut map = [0u8; LOGICAL_REWRITE_MAPPING_SIZE];
+    serialize_locator(&mut map[0..12], state.rs_old_locator);
+    serialize_locator(&mut map[12..24], state.rs_new_locator);
+    serialize_tid(&mut map[24..30], old_tid);
+    serialize_tid(&mut map[30..36], new_tid);
+
+    // Persist per affected xid; both arms unless that would be redundant
+    // (subtransaction-imprecise on purpose, matching C).
+    if do_log_xmin {
+        logical_rewrite_log_mapping(state, xmin, &map)?;
+    }
+    if do_log_xmax && xmin != xmax {
+        logical_rewrite_log_mapping(state, xmax, &map)?;
+    }
+    Ok(())
+}
+
+pub fn rewrite_heap_tuple<'mcx>(
+    state: &mut RewriteState<'mcx>,
+    new_heap: &Relation<'mcx>,
+    old_tuple: &HeapTupleData<'_>,
+    new_tuple: &mut HeapTuple<'mcx>,
+) -> PgResult<()> {
+    {
+        let old_hdr = old_tuple.t_data();
+        let t_choice = old_hdr.t_choice;
+        let old_infomask = old_hdr.t_infomask;
+        let new_hdr = new_tuple.as_tuple_mut().t_data_mut();
+        new_hdr.t_choice = t_choice;
+        new_hdr.t_infomask &= !HEAP_XACT_MASK;
+        new_hdr.t_infomask2 &= !HEAP2_XACT_MASK;
+        new_hdr.t_infomask |= old_infomask & HEAP_XACT_MASK;
+
+        heap_freeze_tuple(
+            new_hdr,
+            state.rs_old_frozenxid,
+            state.rs_old_minmxid,
+            state.rs_freeze_xid,
+            state.rs_cutoff_multi,
+        )?;
+
+        new_hdr.t_ctid = ItemPointerData::invalid();
+    }
+
+    let old_hdr = old_tuple.t_data();
+    let updated = !(old_hdr.t_infomask & HEAP_XMAX_INVALID != 0
+        || heapam_visibility::HeapTupleHeaderIsOnlyLocked(old_hdr)?)
+        && !old_hdr.indicates_moved_partitions()
+        && !(old_tuple.t_self == old_hdr.t_ctid);
+
+    if updated {
+        let hashkey =
+            TidHashKey { xmin: HeapTupleHeaderGetUpdateXid(old_hdr)?, tid: old_hdr.t_ctid };
+        if let Some(new_tid) = state.rs_old_new_tid_map.remove(&hashkey) {
+            new_tuple.as_tuple_mut().t_data_mut().t_ctid = new_tid;
+        } else {
+            let unresolved = UnresolvedTupData {
+                old_tid: old_tuple.t_self,
+                tuple: heap_copytuple(state.mcx, new_tuple.as_tuple())?,
+            };
+            let prev = state.rs_unresolved_tups.insert(hashkey, unresolved);
+            debug_assert!(prev.is_none());
+            return Ok(());
+        }
+    }
+
+    let mut old_tid = old_tuple.t_self;
+    let mut cur: Option<HeapTuple<'mcx>> = None;
+
+    loop {
+        {
+            let tup = match cur.as_mut() {
+                Some(t) => t.as_tuple_mut(),
+                None => new_tuple.as_tuple_mut(),
+            };
+            raw_heap_insert(state, new_heap, tup)?;
+        }
+        let (new_tid, is_updated, xmin) = {
+            let tup = match cur.as_ref() {
+                Some(t) => t.as_tuple(),
+                None => new_tuple.as_tuple(),
+            };
+            (tup.t_self, tup.t_data().t_infomask & HEAP_UPDATED != 0, tup.t_data().xmin())
+        };
+
+        {
+            let tup = match cur.as_ref() {
+                Some(t) => t.as_tuple(),
+                None => new_tuple.as_tuple(),
+            };
+            logical_rewrite_heap_tuple(state, old_tid, tup)?;
+        }
+
+        if is_updated && !TransactionIdPrecedes(xmin, state.rs_oldest_xmin) {
+            let hashkey = TidHashKey { xmin, tid: old_tid };
+            if let Some(unresolved) = state.rs_unresolved_tups.remove(&hashkey) {
+                let mut prev_tuple = unresolved.tuple;
+                old_tid = unresolved.old_tid;
+                prev_tuple.as_tuple_mut().t_data_mut().t_ctid = new_tid;
+                cur = Some(prev_tuple);
+                continue;
+            }
+            let prev = state.rs_old_new_tid_map.insert(hashkey, new_tid);
+            debug_assert!(prev.is_none());
+        }
+        break;
+    }
+    Ok(())
+}
+
+pub fn rewrite_heap_dead_tuple(
+    state: &mut RewriteState<'_>,
+    old_tuple: &HeapTupleData<'_>,
+) -> bool {
+    let hashkey =
+        TidHashKey { xmin: old_tuple.t_data().xmin(), tid: old_tuple.t_self };
+    state.rs_unresolved_tups.remove(&hashkey).is_some()
+}
+
+fn raw_heap_insert<'mcx>(
+    state: &mut RewriteState<'mcx>,
+    new_heap: &Relation<'mcx>,
+    tup: &mut HeapTupleData<'_>,
+) -> PgResult<()> {
+    let has_external = tup.t_data().t_infomask & HEAP_HASEXTERNAL != 0;
+    let heaptup: Option<HeapTuple<'mcx>> = if state.rs_new_relkind == RELKIND_TOASTVALUE {
+        debug_assert!(!has_external);
+        None
+    } else if has_external || tup.t_len as usize > heaptoast::TOAST_TUPLE_THRESHOLD {
+        // XLOG FPI pages are not logically decoded; the toast writes must not
+        // be either.
+        let options = heapam::hio::HEAP_INSERT_SKIP_FSM | heapam::hio::HEAP_INSERT_NO_LOGICAL;
+        heaptoast::heap_toast_insert_or_update(
+            state.mcx,
+            new_heap,
+            tup,
+            None,
+            state.rs_toastoid,
+            options,
+        )?
+    } else {
+        None
+    };
+    let img_len = match heaptup.as_ref() {
+        Some(t) => t.as_tuple().t_len as usize,
+        None => tup.t_len as usize,
+    };
+
+    let len = transam_xlog::MAXALIGN(img_len);
+    if len > MaxHeapTupleSize {
+        return Err(Box::new(
+            PgError::new(
+                ERROR,
+                format!("row is too big: size {len}, maximum size {MaxHeapTupleSize}"),
+            )
+            .with_sqlstate(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+        ));
+    }
+
+    if let Some(buffer) = state.rs_buffer.as_mut() {
+        let page_free = page_mut_of(buffer).as_ref().heap_free_space();
+        if len + state.rs_new_save_free_space > page_free {
+            let buffer = state.rs_buffer.take().unwrap();
+            let blockno = state.rs_blockno;
+            bulkwrite::smgr_bulk_write(bulk_state(state), blockno, buffer, true)?;
+            state.rs_blockno += 1;
+        }
+    }
+
+    if state.rs_buffer.is_none() {
+        let mut buffer = bulkwrite::smgr_bulk_get_buf(bulk_state(state));
+        page_mut_of(&mut buffer).init(0);
+        state.rs_buffer = Some(buffer);
+    }
+
+    let buffer = state.rs_buffer.as_mut().unwrap();
+    let mut page = page_mut_of(buffer);
+    // Extracted adjacent to the copy: no code between raw view and read.
+    let img_ptr = match heaptup.as_ref() {
+        Some(t) => t.as_tuple().header_ptr(),
+        None => tup.header_ptr(),
+    };
+    // SAFETY: img_ptr/img_len delimit a live tuple image (HeapTupleData invariant).
+    let item = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
+    // rewriteheap.c:679 elog(ERROR, "failed to add tuple"): catchable XX000.
+    let newoff: OffsetNumber = page
+        .add_item(item, 0, PAI_IS_HEAP)
+        .ok_or_else(|| Box::new(PgError::new(ERROR, "failed to add tuple")))?;
+
+    tup.t_self = ItemPointerData::new(state.rs_blockno, newoff);
+
+    if !ItemPointerIsValid(&tup.t_data().t_ctid) {
+        let r = page.as_ref();
+        let id = r.item_id(newoff);
+        let (ptr, _) = r.item_raw(id);
+        // SAFETY: freshly added heap tuple image on an exclusively owned build
+        // page; t_ctid sits inside the fixed 23-byte header.
+        unsafe {
+            let onpage: *mut HeapTupleHeaderData = ptr.cast_mut().cast();
+            (*onpage).t_ctid = tup.t_self;
+        }
+    }
+    Ok(())
+}
+
+fn page_mut_of(buf: &mut bulkwrite::BulkWriteBuffer) -> PageMut<'_> {
+    // SAFETY: exclusively owned, aligned build page.
+    unsafe { PageMut::from_raw(core::ptr::NonNull::new_unchecked(buf.page_mut().as_mut_ptr())) }
+}
+
+// CheckPointLogicalRewriteHeap (rewriteheap.c:1155): remove mapping files no
+// decoding slot can still need (below the logical restart LSN), fsync the
+// rest so post-checkpoint replay only handles bytes written after the redo
+// pointer. Runs in checkpoints AND restartpoints (CheckPointGuts).
+pub fn CheckPointLogicalRewriteHeap() -> PgResult<()> {
+    // Minimum: the last redo pointer — no new decoding slot will start
+    // before that.
+    let redo = transam_xlog::GetRedoRecPtr();
+    let mut cutoff = if slot_seams::replication_slots_compute_logical_restart_lsn::is_installed() {
+        slot_seams::replication_slots_compute_logical_restart_lsn::call()?
+    } else {
+        types_core::InvalidXLogRecPtr
+    };
+    if cutoff != types_core::InvalidXLogRecPtr && redo < cutoff {
+        cutoff = redo;
+    }
+
+    let dir = mappings_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        // rewriteheap.c:1176-1177 AllocateDir + ReadDir: a directory that
+        // cannot be opened (a missing pg_logical/mappings included) fails the
+        // checkpoint with errcode_for_file_access() and C's "%m" text.
+        Err(e) => {
+            return ereport(ERROR)
+                .with_saved_errno(e.raw_os_error().unwrap_or(0))
+                .errcode_for_file_access()
+                .errmsg(format!("could not open directory \"{PG_LOGICAL_MAPPINGS_DIR}\": %m"))
+                .finish(loc(1177, "CheckPointLogicalRewriteHeap"));
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(en) => en,
+            Err(e) => {
+                return ereport(ERROR)
+                    .errcode_for_file_access()
+                    .errmsg(format!("could not read directory \"{}\": {e}", dir.display()))
+                    .finish(loc(1178, "CheckPointLogicalRewriteHeap"));
+            }
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy().into_owned();
+        // Skip over files that cannot be ours.
+        if !name.starts_with("map-") {
+            continue;
+        }
+        let path = dir.join(&name);
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+
+        // rewriteheap.c:1203-1206: sscanf(LOGICAL_REWRITE_FORMAT) must
+        // convert all six components.
+        let Some(lsn) = parse_logical_rewrite_name(&name) else {
+            return Err(Box::new(PgError::new(
+                ERROR,
+                format!("could not parse filename \"{name}\""),
+            )));
+        };
+
+        if lsn < cutoff || cutoff == types_core::InvalidXLogRecPtr {
+            let _ = elog::elog(
+                DEBUG1,
+                format!("removing logical rewrite file \"{}\"", path.display()),
+            );
+            if let Err(e) = std::fs::remove_file(&path) {
+                return ereport(ERROR)
+                    .errcode_for_file_access()
+                    .errmsg(format!("could not remove file \"{}\": {e}", path.display()))
+                    .finish(loc(1224, "CheckPointLogicalRewriteHeap"));
+            }
+        } else {
+            // The file cannot vanish concurrently: this function is the only
+            // remover and one checkpoint runs at a time.
+            let f = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    return ereport(ERROR)
+                        .errcode_for_file_access()
+                        .errmsg(format!("could not open file \"{}\": {e}", path.display()))
+                        .finish(loc(1237, "CheckPointLogicalRewriteHeap"));
+                }
+            };
+            checkpoint_fsync_mapping_file(&f, &path)?;
+            // rewriteheap.c:1243: a failing close(2) is an ERROR.
+            if let Err(e) = close_checked(f) {
+                fd::set_errno(e.raw_os_error().unwrap_or(0));
+                return ereport(ERROR)
+                    .errcode_for_file_access()
+                    .errmsg(format!("could not close file \"{}\": %m", path.display()))
+                    .finish(loc(1244, "CheckPointLogicalRewriteHeap"));
+            }
+        }
+    }
+    // Persist directory entries to disk. C rewriteheap.c:1252:
+    // fsync_fname(PG_LOGICAL_MAPPINGS_DIR, true) — failure raises at
+    // data_sync_elevel(ERROR), i.e. PANIC at default data_sync_retry=off.
+    fd::fsync_fname(
+        dir.to_str().expect("pg_logical/mappings path is not valid UTF-8"),
+        true,
+    )?;
+    Ok(())
+}
+
+pub fn init_seams() {
+    rewriteheap_seams::check_point_logical_rewrite_heap::set(CheckPointLogicalRewriteHeap);
+}
+
+#[cfg(test)]
+mod tests;

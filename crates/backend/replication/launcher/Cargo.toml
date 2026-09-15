@@ -1,0 +1,50 @@
+[package]
+name = "launcher"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "launcher"
+path = "src/lib.rs"
+
+[dependencies]
+pgsync = { path = "../../../_support/pgsync" }
+datum = { path = "../../../_support/types/datum" }
+types_fmgr = { path = "../../../_support/types/fmgr" }
+fmgr_core = { path = "../../utils/fmgr/fmgr_core" }
+funcapi = { path = "../../utils/fmgr/funcapi" }
+varlena = { path = "../../utils/adt/varlena" }
+procarray = { path = "../../storage/ipc/procarray" }
+ipc = { path = "../../storage/ipc/ipc" }
+guc_tables = { path = "../../utils/misc/guc_tables" }
+init_small = { path = "../../utils/init/init_small" }
+launcher_seams = { path = "../launcher_seams" }
+logical_worker_seams = { path = "../logical_worker_seams" }
+bgworker = { path = "../../postmaster/bgworker" }
+elog = { path = "../../utils/error/elog" }
+latch = { path = "../../storage/ipc/latch" }
+lmgr_proc = { path = "../../storage/lmgr/lmgr_proc" }
+procsignal = { path = "../../storage/ipc/procsignal" }
+postgres = { path = "../../tcop/postgres" }
+postgres_seams = { path = "../../tcop/postgres_seams" }
+interrupt = { path = "../../postmaster/interrupt" }
+guc_file = { path = "../../utils/misc/guc_file" }
+types_guc = { path = "../../../_support/types/types_guc" }
+types_core = { path = "../../../_support/types/types_core" }
+types_error = { path = "../../../_support/types/types_error" }
+types_storage = { path = "../../../_support/types/types_storage" }
+timestamp_seams = { path = "../../utils/adt/timestamp_seams" }
+adt_timestamp = { path = "../../utils/adt/adt_timestamp" }
+shmem = { path = "../../storage/ipc/shmem" }
+lock_seams = { path = "../../storage/lmgr/lock_seams" }
+mcx = { path = "../../../_support/mcx" }
+xact = { path = "../../access/transam/xact" }
+pg_subscription = { path = "../../catalog/pg_subscription" }
+libc = "0.2"
+
+[dev-dependencies]
+lmgr_proc_seams = { path = "../../storage/lmgr/lmgr_proc_seams" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

@@ -1,0 +1,90 @@
+[package]
+name = "main_main"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "main_main"
+path = "src/lib.rs"
+
+[[bin]]
+name = "postgres"
+path = "src/bin/postgres.rs"
+
+[features]
+# Antithesis harness builds only (antithesis/ directory): SDK assertions +
+# sancov coverage instrumentation. OFF by default — product builds compile
+# none of it. The harness image build (root Dockerfile, ARG ANTITHESIS=1)
+# enables it together with the coverage rustflags; the crate and the flags
+# are a single unit (either alone produces an invalid binary).
+antithesis = [
+    "dep:antithesis_sdk",
+    "dep:antithesis-instrumentation",
+    # Steering assertions in the SUT (already in the dependency graph
+    # transitively; the direct optional rows below exist only to flip their
+    # features from here): FPI restore during redo, ParkLot interrupt probe.
+    "dep:pgsync",
+    "pgsync/antithesis",
+    "dep:xlogutils",
+    "xlogutils/antithesis",
+]
+
+# Registers the C regression module's OAuth validators (`validator`,
+# `fail_validator`, `oauth_test_validator`) and their oauth_validator.* GUCs.
+# Test/CI builds only: these authorize any bearer token. Product builds
+# (default features) compile none of it — see the oauth_validators crate
+# header for why this is a feature and not a GUC.
+oauth-test-validator = [
+    "oauth_validators/test-validator",
+    "guc_tables/oauth-test-validator",
+]
+
+[dependencies]
+# Feature carriers for oauth-test-validator (both already in the graph
+# transitively via seams_init / guc).
+oauth_validators = { path = "../../libpq/oauth_validators" }
+guc_tables = { path = "../../utils/misc/guc_tables" }
+# Antithesis SDK (assertions/lifecycle); portable, but only compiled under
+# the `antithesis` feature.
+antithesis_sdk = { version = "0.2.9", optional = true }
+# Antithesis-only install rows (see the `antithesis` feature): probe
+# registration target + feature carriers for the SUT steering assertions.
+pgsync = { path = "../../../_support/pgsync", optional = true }
+xlogutils = { path = "../../access/transam/xlogutils", optional = true }
+ipc = { path = "../../storage/ipc/ipc" }
+libc = "0.2"
+mcx = { path = "../../../_support/mcx" }
+types_error = { path = "../../../_support/types/types_error" }
+elog = { path = "../../utils/error/elog" }
+guc = { path = "../../utils/misc/guc" }
+init_small = { path = "../../utils/init/init_small" }
+stack_depth = { path = "../../utils/misc/stack_depth" }
+ps_status = { path = "../../utils/misc/ps_status" }
+pg_locale = { path = "../../utils/adt/pg_locale" }
+pg_path = { path = "../../../port/pg_path" }
+postmaster = { path = "../../postmaster/postmaster" }
+memwatchdog = { path = "../../postmaster/memwatchdog" }
+# GL-CONCMEM-1: the POOL-QOS memory governor's fallback usage probe
+# (install_qos_mem_probe) — install-only dep, mirroring memwatchdog's
+# allocator-stats install above it in bin/postgres.rs.
+runtime = { path = "../../executor/runtime" }
+postgres_seams = { path = "../../tcop/postgres_seams" }
+seams_init = { path = "../../../_support/seams_init" }
+
+# mimalloc is a C allocator; wasm32 std already defaults to dlmalloc, and
+# bin/postgres.rs cfg-outs the global-alloc + release hook there.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+mimalloc = "0.1"
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
+
+# The Antithesis coverage runtime links only on the platform Antithesis runs
+# (linux/amd64); target-scoping keeps macOS/aarch64 dev builds working even
+# under --all-features.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+antithesis-instrumentation = { version = "0.1.0", optional = true }
+
+# `pgrust_sim` (non-default cfg): P4 sim arms live behind it; empty/absent
+# in product builds (law 0.1).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(pgrust_sim)'] }

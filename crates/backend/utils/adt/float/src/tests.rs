@@ -1,0 +1,1056 @@
+use super::*;
+use crate::aggregates::*;
+use crate::builtins::*;
+
+use ::datum::Datum;
+use ::types_error::{
+    SoftErrorContext, ERRCODE_DIVISION_BY_ZERO, ERRCODE_INVALID_ARGUMENT_FOR_LOG,
+    ERRCODE_INVALID_ARGUMENT_FOR_POWER_FUNCTION,
+    ERRCODE_INVALID_ARGUMENT_FOR_WIDTH_BUCKET_FUNCTION, ERRCODE_INVALID_TEXT_REPRESENTATION,
+    ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE, ERRCODE_PROTOCOL_VIOLATION,
+};
+use ::types_fmgr::{FmgrInfo, LocalFcinfo, PGFunction};
+
+fn out8(v: f64) -> String {
+    let mut buf = [0u8; MAXDOUBLEWIDTH];
+    let n = float8out(v, &mut buf);
+    core::str::from_utf8(&buf[..n]).unwrap().into()
+}
+
+fn out8_with(v: f64, efd: i32) -> String {
+    let mut buf = [0u8; MAXDOUBLEWIDTH];
+    let n = float8out_internal_with(v, efd, &mut buf);
+    core::str::from_utf8(&buf[..n]).unwrap().into()
+}
+
+fn out4_with(v: f32, efd: i32) -> String {
+    let mut buf = [0u8; MAXDOUBLEWIDTH];
+    let n = float4out_with(v, efd, &mut buf);
+    core::str::from_utf8(&buf[..n]).unwrap().into()
+}
+
+#[test]
+fn float8in_basic_and_specials() {
+    assert_eq!(float8in("1.5", None).unwrap(), 1.5);
+    assert_eq!(float8in("  -2.25  ", None).unwrap(), -2.25);
+    assert_eq!(float8in("1e10", None).unwrap(), 1e10);
+    assert_eq!(float8in(".5", None).unwrap(), 0.5);
+    assert_eq!(float8in("5.", None).unwrap(), 5.0);
+    assert_eq!(float8in("\x0b1.5", None).unwrap(), 1.5); // \v is C isspace
+
+    assert!(float8in("NaN", None).unwrap().is_nan());
+    assert!(float8in("nan", None).unwrap().is_nan());
+    assert!(float8in("-nan", None).unwrap().is_nan());
+    assert!(float8in("+nan", None).unwrap().is_nan());
+    assert!(float8in("nan(123)", None).unwrap().is_nan()); // live PG 18.3: NaN
+    assert!(float8in("nan(0x1)", None).unwrap().is_nan());
+    assert!(float8in("NAN()", None).unwrap().is_nan());
+    assert!(float8in("nan()x", None).is_err()); // live PG 18.3: 22P02
+    assert!(float8in("nan(12", None).is_err());
+    assert_eq!(float8in("Infinity", None).unwrap(), f64::INFINITY);
+    assert_eq!(float8in("-Infinity", None).unwrap(), f64::NEG_INFINITY);
+    assert_eq!(float8in(" +inf ", None).unwrap(), f64::INFINITY);
+    assert_eq!(float8in("-inf", None).unwrap(), f64::NEG_INFINITY);
+    assert!(float4in("nan(xyz_12)", None).unwrap().is_nan());
+    assert_eq!(float4in("-Infinity", None).unwrap(), f32::NEG_INFINITY);
+}
+
+// strtod's nan(n-char-sequence) payload lands in the mantissa (glibc:
+// strtoull base 0); float8send/float4send expose the bits.
+#[test]
+fn nan_payload_bits_follow_strtod() {
+    for (lit, bits8, bits4) in [
+        ("NaN", 0x7ff8_0000_0000_0000u64, 0x7fc0_0000u32),
+        ("NaN(1)", 0x7ff8_0000_0000_0001, 0x7fc0_0001),
+        ("nan(0x10)", 0x7ff8_0000_0000_0010, 0x7fc0_0010),
+        ("nan(07)", 0x7ff8_0000_0000_0007, 0x7fc0_0007),
+        ("NaN(123456789)", 0x7ff8_0000_075b_cd15, 0x7fdb_cd15),
+        ("-NaN(2)", 0xfff8_0000_0000_0002, 0xffc0_0002),
+        ("NaN(4294967295)", 0x7ff8_0000_ffff_ffff, 0x7fff_ffff),
+        ("NaN(8388608)", 0x7ff8_0000_0080_0000, 0x7fc0_0000),
+        ("NaN(abc)", 0x7ff8_0000_0000_0000, 0x7fc0_0000),
+        ("NaN(0xg)", 0x7ff8_0000_0000_0000, 0x7fc0_0000),
+        ("NaN()", 0x7ff8_0000_0000_0000, 0x7fc0_0000),
+        (" NaN(5) ", 0x7ff8_0000_0000_0005, 0x7fc0_0005),
+    ] {
+        assert_eq!(float8in(lit, None).unwrap().to_bits(), bits8, "float8 {lit}");
+        assert_eq!(float4in(lit, None).unwrap().to_bits(), bits4, "float4 {lit}");
+    }
+    assert!(float8in("NaN(1)x", None).is_err());
+}
+
+#[test]
+fn float8in_error_surface_matches_live_pg() {
+    let err = float8in("1e400", None).unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE);
+    assert_eq!(err.message(), "\"1e400\" is out of range for type double precision");
+    let err = float8in("1e-400", None).unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE);
+    let err = float8in(" 1.5x", None).unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_INVALID_TEXT_REPRESENTATION);
+    assert_eq!(err.message(), "invalid input syntax for type double precision: \" 1.5x\"");
+    let err = float4in("1e40", None).unwrap_err();
+    assert_eq!(err.message(), "\"1e40\" is out of range for type real");
+    assert!(float4in("1e-50", None).is_err());
+    let err = float8in("", None).unwrap_err();
+    assert_eq!(err.message(), "invalid input syntax for type double precision: \"\"");
+    assert!(float8in("  ", None).is_err());
+    assert!(float8in("xyz", None).is_err());
+
+    let mut soft = SoftErrorContext::new(true);
+    assert_eq!(float8in("bogus", Some(&mut soft)).unwrap(), 0.0);
+    assert!(soft.error_occurred());
+}
+
+#[test]
+fn hex_floats_match_pg() {
+    let cases: &[(&str, u64)] = &[
+        ("0x1p4", 0x4030000000000000),
+        ("0X1.8p1", 0x4008000000000000),
+        ("0x10", 0x4030000000000000),
+        ("0xA", 0x4024000000000000),
+        ("0x.8p1", 0x3ff0000000000000),
+        ("-0x1p4", 0xc030000000000000),
+        ("0x1.999999999999ap-4", 0x3fb999999999999a),
+        ("0x0", 0x0000000000000000),
+        ("0x1p-1074", 0x0000000000000001),
+        ("0x1.fffffffffffffp1023", 0x7fefffffffffffff),
+        ("0x1.0000000000001p0", 0x3ff0000000000001),
+        ("0x1.00000000000008p0", 0x3ff0000000000000),
+        ("0x1.00000000000018p0", 0x3ff0000000000002),
+        ("0x1.fffffffffffff8p0", 0x4000000000000000),
+        ("0x3p-1", 0x3ff8000000000000),
+        ("0xabcdefp0", 0x416579bde0000000),
+        ("0x1p-1022", 0x0010000000000000),
+        ("0x1p-1023", 0x0008000000000000),
+    ];
+    for &(lit, bits) in cases {
+        let v = float8in(lit, None).unwrap_or_else(|e| panic!("{lit}: {}", e.message()));
+        assert_eq!(v.to_bits(), bits, "float8 {lit}");
+    }
+
+    let cases4: &[(&str, u32)] = &[
+        ("0x1p4", 0x41800000),
+        ("0x1.8p1", 0x40400000),
+        ("0x1p-149", 0x00000001),
+        ("0x1.fffffep127", 0x7f7fffff),
+        ("0x1.000001p0", 0x3f800000),
+        ("0x1.000002p0", 0x3f800001),
+        ("0x1.000003p0", 0x3f800002),
+        ("0x1p-126", 0x00800000),
+        ("0x1p-127", 0x00400000),
+    ];
+    for &(lit, bits) in cases4 {
+        let v = float4in(lit, None).unwrap_or_else(|e| panic!("{lit}: {}", e.message()));
+        assert_eq!(v.to_bits(), bits, "float4 {lit}");
+    }
+
+    let err = float8in("0x1p1024", None).unwrap_err();
+    assert_eq!(err.message(), "\"0x1p1024\" is out of range for type double precision");
+    assert!(float8in("0x1p-1075", None).is_err());
+    assert!(float4in("0x1p128", None).is_err());
+    assert!(float8in("0x", None).is_err());
+    assert!(float8in("0x1p", None).unwrap_err().sqlstate() == ERRCODE_INVALID_TEXT_REPRESENTATION);
+    assert_eq!(float8in("  0x1p4  ", None).unwrap(), 16.0);
+}
+
+#[test]
+fn endptr_path_reports_consumed() {
+    let mut endptr = 0usize;
+    let v = float8in_internal("2.71, 2.0", Some(&mut endptr), "point", "2.71, 2.0", None).unwrap();
+    assert_eq!((v, endptr), (2.71, 4));
+
+    let mut endptr = 0usize;
+    let v = float8in_internal("  2.71  rest", Some(&mut endptr), "box", "  2.71  rest", None).unwrap();
+    assert_eq!((v, endptr), (2.71, 8));
+
+    let mut endptr = 0usize;
+    let v = float8in_internal("0x1p,5", Some(&mut endptr), "point", "0x1p,5", None).unwrap();
+    assert_eq!((v, endptr), (1.0, 3));
+}
+
+// Expected strings are live psql output from PostgreSQL 18.3.
+#[test]
+fn out_shortest_matches_live_pg() {
+    assert_eq!(out8(0.1), "0.1");
+    assert_eq!(out8(1e-5), "1e-05");
+    assert_eq!(out8(3.141592653589793), "3.141592653589793");
+    assert_eq!(out8(1e300), "1e+300");
+    assert_eq!(out8(5e-324), "5e-324");
+    assert_eq!(out8(123456.789), "123456.789");
+    assert_eq!(out8(f64::NAN), "NaN");
+    assert_eq!(out8(f64::INFINITY), "Infinity");
+    assert_eq!(out8(-0.0), "-0");
+
+    assert_eq!(out4_with(0.1, 1), "0.1");
+    assert_eq!(out4_with(1.234567, 1), "1.234567");
+    assert_eq!(out4_with(1e-5, 1), "1e-05");
+    assert_eq!(out4_with(1e20, 1), "1e+20");
+    assert_eq!(out4_with(3.4028235e38, 1), "3.4028235e+38");
+}
+
+// Expected strings are live psql output from PostgreSQL 18.3 under
+// set extra_float_digits = {0, -5, -15, -3}.
+#[test]
+fn out_legacy_g_matches_live_pg() {
+    assert_eq!(out8_with(0.1, 0), "0.1");
+    assert_eq!(out8_with(1.0, 0), "1");
+    assert_eq!(out8_with(1e-5, 0), "1e-05");
+    assert_eq!(out8_with(1e20, 0), "1e+20");
+    assert_eq!(out8_with(123456.789, 0), "123456.789");
+    assert_eq!(out8_with(3.141592653589793, 0), "3.14159265358979");
+    assert_eq!(out8_with(f64::INFINITY, 0), "Infinity");
+    assert_eq!(out8_with(-0.0, 0), "-0");
+    assert_eq!(out8_with(0.000123, 0), "0.000123");
+
+    assert_eq!(out8_with(3.141592653589793, -5), "3.141592654");
+    assert_eq!(out8_with(123456.789, -5), "123456.789");
+    assert_eq!(out8_with(0.1, -5), "0.1");
+
+    assert_eq!(out8_with(3.141592653589793, -15), "3");
+    assert_eq!(out8_with(123456.789, -15), "1e+05");
+    assert_eq!(out8_with(0.5, -15), "0.5");
+
+    assert_eq!(out4_with(0.1, 0), "0.1");
+    assert_eq!(out4_with(1.234567, 0), "1.23457");
+    assert_eq!(out4_with(1e-5, 0), "1e-05");
+    assert_eq!(out4_with(1e20, 0), "1e+20");
+    assert_eq!(out4_with(123456.7, 0), "123457");
+
+    assert_eq!(out4_with(0.1, -3), "0.1");
+    assert_eq!(out4_with(123456.7, -3), "1.23e+05");
+}
+
+#[test]
+fn guc_default_and_live_read() {
+    assert_eq!(get_extra_float_digits(), 1);
+    set_extra_float_digits(0);
+    assert_eq!(out8(3.141592653589793), "3.14159265358979");
+    set_extra_float_digits(1);
+    assert_eq!(out8(3.141592653589793), "3.141592653589793");
+}
+
+#[test]
+fn roundtrip_in_out() {
+    for &s in &["1.5", "3.14159265358979", "1e10", "-2.5e-3", "0", "123456.789"] {
+        let v = float8in(s, None).unwrap();
+        assert_eq!(float8in(&out8(v), None).unwrap(), v, "roundtrip {s}");
+    }
+}
+
+#[test]
+fn wire_codec() {
+    assert_eq!(float8send(1.0), [0x3F, 0xF0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(float4send(1.0_f32), [0x3F, 0x80, 0, 0]);
+    for &v in &[0.0_f64, 1.5, -2.25, 1e10, f64::INFINITY] {
+        assert_eq!(float8recv(&float8send(v)).unwrap(), v);
+    }
+    assert!(float8recv(&float8send(f64::NAN)).unwrap().is_nan());
+    for &v in &[0.0_f32, 1.5, -2.25, f32::NEG_INFINITY] {
+        assert_eq!(float4recv(&float4send(v)).unwrap(), v);
+    }
+    let e = float4recv(&[0u8; 3]).unwrap_err();
+    assert_eq!(e.sqlstate(), ERRCODE_PROTOCOL_VIOLATION);
+    assert_eq!(e.message(), "insufficient data left in message");
+    assert!(float8recv(&[0u8; 7]).is_err());
+}
+
+#[test]
+fn nan_ordering_and_arith_errors() {
+    let nan = f64::NAN;
+    assert!(float8_eq(nan, nan));
+    assert!(!float8_eq(nan, 1.0));
+    assert!(float8_gt(nan, f64::INFINITY));
+    assert!(float8_ge(nan, nan));
+    assert_eq!(float8_cmp_internal(nan, nan), 0);
+    assert_eq!(float8_cmp_internal(nan, 1.0), 1);
+    assert_eq!(float8_cmp_internal(1.0, nan), -1);
+    assert_eq!(btfloat48cmp(1.0_f32, 2.0), -1);
+    assert_eq!(btfloat84cmp(2.0, 1.0_f32), 1);
+    assert!(float8larger(nan, 1.0).is_nan());
+    assert_eq!(float8smaller(1.0, 2.0), 1.0);
+
+    let err = float8_pl(f64::MAX, f64::MAX).unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE);
+    assert_eq!(err.message(), "value out of range: overflow");
+    assert_eq!(float8_pl(f64::INFINITY, 1.0).unwrap(), f64::INFINITY);
+
+    let err = float8_div(1.0, 0.0).unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_DIVISION_BY_ZERO);
+    assert_eq!(err.message(), "division by zero");
+    assert!(float8_div(f64::NAN, 0.0).unwrap().is_nan());
+
+    let err = float8_mul(f64::MIN_POSITIVE, f64::MIN_POSITIVE).unwrap_err();
+    assert_eq!(err.message(), "value out of range: underflow");
+    assert!(float4_mul(1e30_f32, 1e30_f32).is_err());
+    assert_eq!(float48pl(1.5_f32, 2.5).unwrap(), 4.0);
+    assert_eq!(float84mul(2.0, 3.0_f32).unwrap(), 6.0);
+    assert!(float48eq(1.0_f32, 1.0));
+    assert!(float84lt(1.0, 2.0_f32));
+}
+
+#[test]
+fn conversions_match_live_pg() {
+    // live PG 18.3: 2147483647|2|4|-2
+    assert_eq!(dtoi4(2147483647.4).unwrap(), 2147483647);
+    assert_eq!(dtoi4(2.5).unwrap(), 2);
+    assert_eq!(dtoi4(3.5).unwrap(), 4);
+    assert_eq!(dtoi4(-2.5).unwrap(), -2);
+    let err = dtoi4(2147483648.0).unwrap_err();
+    assert_eq!(err.message(), "integer out of range");
+    assert!(dtoi4(f64::NAN).is_err());
+    let err = dtoi2(40000.0).unwrap_err();
+    assert_eq!(err.message(), "smallint out of range");
+    assert_eq!(ftoi2(100.4_f32).unwrap(), 100);
+
+    assert!(dtof(1e40).is_err());
+    assert!(dtof(1e-50).is_err());
+    assert_eq!(dtof(1.5).unwrap(), 1.5_f32);
+    assert_eq!(dtof(f64::INFINITY).unwrap(), f32::INFINITY);
+    assert_eq!(ftod(1.5_f32), 1.5);
+    assert_eq!(i4tod(7), 7.0);
+    assert_eq!(i2tof(-3), -3.0_f32);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // Miri approximates libm; exact-value KATs
+fn math_domains_and_live_pg_values() {
+    let err = dsqrt(-1.0).unwrap_err();
+    assert_eq!(err.message(), "cannot take square root of a negative number");
+    assert_eq!(err.sqlstate(), ERRCODE_INVALID_ARGUMENT_FOR_POWER_FUNCTION);
+    let err = dpow(0.0, -1.0).unwrap_err();
+    assert_eq!(err.message(), "zero raised to a negative power is undefined");
+    let err = dlog1(0.0).unwrap_err();
+    assert_eq!(err.message(), "cannot take logarithm of zero");
+    assert_eq!(err.sqlstate(), ERRCODE_INVALID_ARGUMENT_FOR_LOG);
+    assert_eq!(dlog1(-1.0).unwrap_err().message(), "cannot take logarithm of a negative number");
+    assert_eq!(
+        dpow(-2.0, 0.5).unwrap_err().message(),
+        "a negative number raised to a non-integer power yields a complex result"
+    );
+
+    // live PG 18.3 values, byte-compared through float8out.
+    assert_eq!(out8(dcbrt(27.0).unwrap()), "3");
+    assert_eq!(out8(dexp(1.0).unwrap()), "2.718281828459045");
+    assert_eq!(out8(dpow(2.0, 0.5).unwrap()), "1.4142135623730951");
+    assert_eq!(out8(datan2(1.0, 2.0).unwrap()), "0.4636476090008061");
+    assert_eq!(out8(dsinh(1.0)), "1.1752011936438014");
+    assert_eq!(out8(dcosh(1.0).unwrap()), "1.5430806348152437");
+    assert_eq!(out8(dtanh(1.0).unwrap()), "0.7615941559557649");
+    // macOS libm's erf(1.0) is 1 ULP below glibc's; funcs.rs binds the
+    // SYSTEM libm (C parity), so each OS byte-matches its own live C PG
+    // (same pattern as the lgamma arch split below).
+    #[cfg(target_os = "macos")]
+    assert_eq!(out8(derf(1.0).unwrap()), "0.8427007929497148");
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(out8(derf(1.0).unwrap()), "0.8427007929497149");
+    #[cfg(target_os = "macos")]
+    assert_eq!(out8(derfc(1.0).unwrap()), "0.15729920705028516");
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(out8(derfc(1.0).unwrap()), "0.15729920705028513");
+    assert_eq!(out8(dgamma(5.5).unwrap()), "52.34277778455352");
+    // glibc's lgamma(10.5) differs by 1 ULP between aarch64 and x86_64;
+    // funcs.rs binds the SYSTEM libm (C's parity reference), so each arm
+    // below byte-matches the same-arch live C PG (x86 stage-1 bring-up
+    // lane, 2026-07-17: PGDG 18.4 x86_64 SELECT lgamma(10.5) =
+    // 13.940625219403762 verified in-pod; every other literal in this
+    // block matched cross-arch).
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(out8(dlgamma(10.5).unwrap()), "13.940625219403762");
+    #[cfg(not(target_arch = "x86_64"))]
+    assert_eq!(out8(dlgamma(10.5).unwrap()), "13.940625219403763");
+
+    assert_eq!(dpow(f64::NAN, 0.0).unwrap(), 1.0);
+    assert_eq!(dpow(1.0, f64::NAN).unwrap(), 1.0);
+    assert!(dpow(f64::NAN, 2.0).unwrap().is_nan());
+    assert_eq!(dpow(2.0, f64::INFINITY).unwrap(), f64::INFINITY);
+    assert_eq!(dpow(f64::NEG_INFINITY, 3.0).unwrap(), f64::NEG_INFINITY);
+    assert!(dpow(10.0, 400.0).is_err());
+    assert_eq!(dexp(f64::NEG_INFINITY).unwrap(), 0.0);
+    assert!(dexp(1000.0).is_err());
+    assert!(dgamma(f64::NEG_INFINITY).is_err());
+    assert!(dlgamma(0.0).is_err());
+
+    assert!(dacos(2.0).is_err());
+    assert!(dacos(f64::NAN).unwrap().is_nan());
+    assert!(dsin(f64::INFINITY).is_err());
+    assert!(dcos(f64::INFINITY).unwrap_err().message() == "input is out of range");
+    assert!(dacosh(0.5).is_err());
+    assert!(datanh(1.0).unwrap().is_infinite());
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // Miri approximates libm; exact-value KATs
+fn degree_trig_exact_cardinals() {
+    // live PG 18.3: 60|30|1|0.5|0.5|45
+    assert_eq!(dacosd(0.5).unwrap(), 60.0);
+    assert_eq!(dasind(0.5).unwrap(), 30.0);
+    assert_eq!(dtand(45.0).unwrap(), 1.0);
+    assert_eq!(dsind(30.0).unwrap(), 0.5);
+    assert_eq!(dcosd(60.0).unwrap(), 0.5);
+    assert_eq!(datand(1.0).unwrap(), 45.0);
+    assert_eq!(dsind(90.0).unwrap(), 1.0);
+    assert_eq!(dsind(180.0).unwrap(), 0.0);
+    assert_eq!(dcosd(0.0).unwrap(), 1.0);
+    assert_eq!(dcosd(90.0).unwrap(), 0.0);
+    assert!(dsind(f64::INFINITY).is_err());
+    assert!(dsind(f64::NAN).unwrap().is_nan());
+    assert_eq!(dpi(), core::f64::consts::PI);
+}
+
+#[test]
+fn width_bucket_and_in_range() {
+    // live PG 18.3: width_bucket(5.35, 0.024, 10.06, 5) = 3
+    assert_eq!(width_bucket_float8(5.35, 0.024, 10.06, 5).unwrap(), 3);
+    assert_eq!(width_bucket_float8(-1.0, 0.0, 10.0, 5).unwrap(), 0);
+    assert_eq!(width_bucket_float8(100.0, 0.0, 10.0, 5).unwrap(), 6);
+    assert_eq!(width_bucket_float8(5.0, 10.0, 0.0, 5).unwrap(), 3);
+    let err = width_bucket_float8(5.0, 0.0, 10.0, 0).unwrap_err();
+    assert_eq!(err.sqlstate(), ERRCODE_INVALID_ARGUMENT_FOR_WIDTH_BUCKET_FUNCTION);
+    assert!(width_bucket_float8(f64::NAN, 0.0, 10.0, 5).is_err());
+    assert!(width_bucket_float8(5.0, 0.0, 0.0, 5).is_err());
+    assert!(width_bucket_float8(5.0, f64::INFINITY, 10.0, 5).is_err());
+
+    assert!(in_range_float8_float8(5.0, 3.0, 2.0, false, false).unwrap());
+    assert!(!in_range_float8_float8(6.0, 3.0, 2.0, false, true).unwrap());
+    let err = in_range_float8_float8(1.0, 1.0, -1.0, false, false).unwrap_err();
+    assert_eq!(err.message(), "invalid preceding or following size in window function");
+    assert!(in_range_float8_float8(f64::NAN, f64::NAN, 1.0, false, true).unwrap());
+    assert!(in_range_float4_float8(1.0, 1.0, f64::INFINITY, false, true).unwrap());
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // Miri approximates libm; exact-value KATs
+fn aggregates_match_live_pg() {
+    // avg/var_samp/var_pop/stddev_samp over (1.0, 2.5, 4.25, -3.5).
+    let mut t = [0.0f64; 3];
+    for v in [1.0, 2.5, 4.25, -3.5] {
+        t = float8_accum(t, v).unwrap();
+    }
+    assert_eq!(out8(float8_avg(t).unwrap()), "1.0625");
+    assert_eq!(out8(float8_var_samp(t).unwrap()), "11.015625");
+    assert_eq!(out8(float8_var_pop(t).unwrap()), "8.26171875");
+    assert_eq!(out8(float8_stddev_samp(t).unwrap()), "3.3189795118379384");
+    assert_eq!(float8_avg([0.0; 3]), None);
+    assert_eq!(float8_var_samp([1.0, 5.0, 0.0]), None);
+
+    // regr family over (y,x) = (1,2),(2.5,4.1),(4.25,7.9),(-3.5,-6).
+    let mut r = [0.0f64; 6];
+    for (y, x) in [(1.0, 2.0), (2.5, 4.1), (4.25, 7.9), (-3.5, -6.0)] {
+        r = float8_regr_accum(r, y, x).unwrap();
+    }
+    // Pinned to x86-64 (SSE2, unfused) PostgreSQL 18 — the C-parity
+    // reference. An FMA-contracted build (e.g. Homebrew arm64) is 1 ulp off
+    // on several of these; see RB-6.
+    assert_eq!(out8(float8_corr(r).unwrap()), "0.9986369273154669");
+    assert_eq!(out8(float8_regr_slope(r).unwrap()), "0.5650552218562295");
+    assert_eq!(out8(float8_regr_intercept(r).unwrap()), "-0.06761044371245895");
+    assert_eq!(out8(float8_regr_r2(r).unwrap()), "0.9972757125980773");
+    assert_eq!(out8(float8_covar_pop(r).unwrap()), "14.58125");
+    assert_eq!(out8(float8_covar_samp(r).unwrap()), "19.441666666666666");
+    assert_eq!(float8_corr([0.0; 6]), None);
+
+    // combine = concat of halves.
+    let mut a = [0.0f64; 3];
+    let mut b = [0.0f64; 3];
+    for v in [1.0, 2.5] {
+        a = float8_accum(a, v).unwrap();
+    }
+    for v in [4.25, -3.5] {
+        b = float8_accum(b, v).unwrap();
+    }
+    let c = float8_combine(a, b).unwrap();
+    assert_eq!(c[0], 4.0);
+    assert_eq!(out8(float8_avg(c).unwrap()), "1.0625");
+    assert_eq!(float8_combine([0.0; 3], b).unwrap(), b);
+
+    // NaN/Inf poisoning.
+    let t = float8_accum([2.0, 3.0, 1.0], f64::INFINITY).unwrap();
+    assert!(t[1].is_infinite() && t[2].is_nan());
+    assert!(float8_accum([1.0, f64::MAX, 0.0], f64::MAX).is_err());
+}
+
+// RB-6 (a fuzzing round): corr() was 1 ulp off C PostgreSQL because the
+// accumulator used f64::mul_add (FMA contraction). The parity reference —
+// PostgreSQL built for x86-64 SSE2, which cannot fuse — rounds every C
+// operation separately: tmpX = fl(fl(newvalX*N) - Sx), then
+// S += fl(fl(tmpX*tmpX) * scale). All expected bits below verified against
+// x86-64 PostgreSQL 18 (Debian, gcc 14, SSE2).
+#[test]
+fn rb6_regr_family_c_bit_parity() {
+    // SELECT corr(y,x), ... FROM (VALUES (1,2),(2,4),(3,7),(4,11)) v(x,y)
+    // → accum args (Y=y, X=x).
+    let rows: [(f64, f64); 4] = [(1.0, 2.0), (2.0, 4.0), (3.0, 7.0), (4.0, 11.0)];
+    let mut r = [0.0f64; 6];
+    for (x, y) in rows {
+        r = float8_regr_accum(r, y, x).unwrap();
+    }
+    // Transition state [N, Sx, Sxx, Sy, Syy, Sxy]. Syy is the sensitive one:
+    // C gives 0x4046FFFFFFFFFFFF (45.99999999999999); the old FMA path gave
+    // exactly 46.0, shifting corr by 1 ulp.
+    let expect_bits: [u64; 6] = [
+        0x4010000000000000, // N   = 4
+        0x4024000000000000, // Sx  = 10
+        0x4014000000000000, // Sxx = 5
+        0x4038000000000000, // Sy  = 24
+        0x4046FFFFFFFFFFFF, // Syy = 45.99999999999999
+        0x402E000000000000, // Sxy = 15
+    ];
+    assert_eq!(r.map(f64::to_bits), expect_bits);
+
+    // Finals, pinned to C bit patterns / float8out text.
+    let corr = float8_corr(r).unwrap();
+    assert_eq!(corr.to_bits(), 0x3FEFA6779E291558); // 0.9890707100936806
+    assert_eq!(out8(corr), "0.9890707100936806");
+    assert_eq!(out8(float8_regr_r2(r).unwrap()), "0.9782608695652175");
+    assert_eq!(out8(float8_regr_slope(r).unwrap()), "3");
+    assert_eq!(out8(float8_regr_intercept(r).unwrap()), "-1.5");
+    assert_eq!(out8(float8_covar_pop(r).unwrap()), "3.75");
+    assert_eq!(out8(float8_covar_samp(r).unwrap()), "5");
+    assert_eq!(out8(float8_regr_sxx(r).unwrap()), "5");
+    assert_eq!(out8(float8_regr_syy(r).unwrap()), "45.99999999999999");
+    assert_eq!(out8(float8_regr_sxy(r).unwrap()), "15");
+
+    // Moving/parallel path: float8_regr_combine over the two halves must use
+    // C's combine formula (Sxx1 + Sxx2 + N1*N2*tmp*tmp/N, left-to-right).
+    // Note the combine path legitimately lands on Syy = 46.0 exactly (and so
+    // corr ...805) — real PostgreSQL's parallel plan differs from its serial
+    // plan by the same ulp; parity is per-formula, not serial-vs-parallel.
+    let mut a = [0.0f64; 6];
+    let mut b = [0.0f64; 6];
+    for (x, y) in &rows[..2] {
+        a = float8_regr_accum(a, *y, *x).unwrap();
+    }
+    for (x, y) in &rows[2..] {
+        b = float8_regr_accum(b, *y, *x).unwrap();
+    }
+    let c = float8_regr_combine(a, b).unwrap();
+    let expect_combined: [u64; 6] = [
+        0x4010000000000000, // N   = 4
+        0x4024000000000000, // Sx  = 10
+        0x4014000000000000, // Sxx = 5
+        0x4038000000000000, // Sy  = 24
+        0x4047000000000000, // Syy = 46 (combine formula's own rounding)
+        0x402E000000000000, // Sxy = 15
+    ];
+    assert_eq!(c.map(f64::to_bits), expect_combined);
+    assert_eq!(float8_corr(c).unwrap().to_bits(), 0x3FEFA6779E291557);
+
+    // float8_accum shares the tmp = newval*N - Sx pattern; pin its unfused
+    // Sxx bits on the same x column (stddev family flows through this).
+    let mut t = [0.0f64; 3];
+    for (x, _) in rows {
+        t = float8_accum(t, x).unwrap();
+    }
+    assert_eq!(t.map(f64::to_bits), [
+        0x4010000000000000,                        // N = 4
+        0x4024000000000000,                        // Sx = 10
+        0x4014000000000000,                        // Sxx = 5
+    ]);
+    assert_eq!(out8(float8_stddev_samp(t).unwrap()), "1.2909944487358056");
+}
+
+// Round-12 (Antithesis sqldiff, fz_fma fixture, seeds 3446924009097215843 /
+// 2383620390565615383 / 1345841888102124772): var/stddev/corr/covar/regr_*
+// rowset diffs vs the C oracle. The parity reference is x86-64 SSE2 (no FMA)
+// PostgreSQL 18. Expected bits below were produced TWO independent ways on
+// linux/amd64 postgres:18 (Debian, docker --platform linux/amd64):
+//   1. live SQL over the exact fuzzgen fixture (float8send output), and
+//   2. a standalone C mirror of float.c's accum/combine/finals compiled
+//      gcc -O2 -ffp-contract=off — both agree bit-for-bit.
+// Fixture (crates/bin/fuzzgen/src/floatmath.rs gen_agg):
+//   v = ((i % 64)::float8)/2.0, w = ((i % 32) - 16)::float8,
+//   r = ((i % 16)::float4), i in 1..=n, n in 200..500.
+#[test]
+fn round12_fz_fma_aggregate_amd64_bit_parity() {
+    let v = |i: i64| (i % 64) as f64 / 2.0;
+    let w = |i: i64| ((i % 32) - 16) as f64;
+    let r = |i: i64| ((i % 16) as f32) as f64; // float4_accum widens to f64
+
+    // (n, var_pop(v), var_samp(v), stddev_pop(v), stddev_samp(v),
+    //  var_pop(r), stddev_samp(r))
+    let plain: [(i64, [u64; 6]); 3] = [
+        (200, [
+            0x40563cdb8bac710a,
+            0x40565977054cd360,
+            0x4022dcdda3d090b2,
+            0x4022e8fbc074a280,
+            0x4034f4a2339c0ebd,
+            0x40125b5b77ed36c4,
+        ]),
+        (350, [
+            0x405527bc4a65906b,
+            0x40553740dd50953b,
+            0x402265de19ec1ab5,
+            0x40226c9c44554743,
+            0x40350cccccccccce,
+            0x401260ddda6c68c2,
+        ]),
+        (499, [
+            0x4054b4af09997564,
+            0x4054bf53e3108382,
+            0x4022339223e29d1d,
+            0x4022383f2e255653,
+            0x40354e990ce54393,
+            0x40127b7ab31f883a,
+        ]),
+    ];
+    for (n, exp) in plain {
+        let mut tv = [0.0f64; 3];
+        let mut tr = [0.0f64; 3];
+        for i in 1..=n {
+            tv = float8_accum(tv, v(i)).unwrap();
+            // float4_accum is float8_accum over the f32-widened value; r()
+            // spells out the widening the fixture's float4 column goes through.
+            tr = float4_accum(tr, (i % 16) as f32).unwrap();
+            debug_assert_eq!(r(i), (i % 16) as f32 as f64);
+        }
+        let got = [
+            float8_var_pop(tv).unwrap(),
+            float8_var_samp(tv).unwrap(),
+            float8_stddev_pop(tv).unwrap(),
+            float8_stddev_samp(tv).unwrap(),
+            float8_var_pop(tr).unwrap(),
+            float8_stddev_samp(tr).unwrap(),
+        ];
+        assert_eq!(got.map(f64::to_bits), exp, "n={n}");
+    }
+
+    // regr family, accum args (Y=v, X=w):
+    // (n, corr, covar_pop, covar_samp, regr_slope, regr_intercept, regr_r2,
+    //  regr_avgx, regr_avgy, regr_sxx, regr_syy, regr_sxy)
+    let regr: [(i64, [u64; 11]); 3] = [
+        (200, [
+            0x3fe106fd6500fe92,
+            0x40475d1b71758e1f,
+            0x40477b29bb5b217d,
+            0x3fe13f4d86aaba61,
+            0x402f6eeb464fca4f,
+            0x3fd21edd845aea71,
+            0xbfee147ae147ae14,
+            0x402e6b851eb851ec,
+            0x40d0eed1eb851eb9,
+            0x40d15f8b851eb850,
+            0x40c240bd70a3d708,
+        ]),
+        (350, [
+            0x3fdff3922a5cb88d,
+            0x4045175075075076,
+            0x404526c8fc5516bf,
+            0x3fe0000000000002,
+            0x402ea0ea0ea0ea0f,
+            0x3fcfe7292892a88b,
+            0xbfe0000000000000,
+            0x402e20ea0ea0ea0f,
+            0x40dcd5dfffffffff,
+            0x40dcec536db6db72,
+            0x40ccd5e000000002,
+        ]),
+        (499, [
+            0x3fde9528f7f34c28,
+            0x4043f57be7088e0d,
+            0x4043ffbe76eb4557,
+            0x3fde5262df69f303,
+            0x402f9c2ee3ab9d88,
+            0x3fcd3a6416a1abe0,
+            0xbfe6b38f225f6c40,
+            0x402ef018a0106ab6,
+            0x40e4875bb412780d,
+            0x40e42e1897db0fe9,
+            0x40d373c041aad672,
+        ]),
+    ];
+    for (n, exp) in regr {
+        let mut t = [0.0f64; 6];
+        for i in 1..=n {
+            t = float8_regr_accum(t, v(i), w(i)).unwrap();
+        }
+        let got = [
+            float8_corr(t).unwrap(),
+            float8_covar_pop(t).unwrap(),
+            float8_covar_samp(t).unwrap(),
+            float8_regr_slope(t).unwrap(),
+            float8_regr_intercept(t).unwrap(),
+            float8_regr_r2(t).unwrap(),
+            float8_regr_avgx(t).unwrap(),
+            float8_regr_avgy(t).unwrap(),
+            float8_regr_sxx(t).unwrap(),
+            float8_regr_syy(t).unwrap(),
+            float8_regr_sxy(t).unwrap(),
+        ];
+        assert_eq!(got.map(f64::to_bits), exp, "n={n}");
+    }
+
+    // Parallel leg: split the rows at k, accumulate the halves separately,
+    // combine, then run the finals — pinned to the same amd64 C mirror
+    // (float8_combine / float8_regr_combine round every op separately).
+    // (n, k, var_samp(v), stddev_pop(v), corr, regr_intercept, Sxx, Syy, Sxy)
+    let combined: [(i64, i64, [u64; 7]); 3] = [
+        (200, 73, [
+            0x40565977054cd364,
+            0x4022dcdda3d090b4,
+            0x3fe106fd6500fe93,
+            0x402f6eeb464fca4f,
+            0x40d0eed1eb851eb7,
+            0x40d15f8b851eb853,
+            0x40c240bd70a3d70a,
+        ]),
+        (350, 175, [
+            0x40553740dd509537,
+            0x402265de19ec1ab3,
+            0x3fdff3922a5cb886,
+            0x402ea0ea0ea0ea0f,
+            0x40dcd5e000000005,
+            0x40dcec536db6db6c,
+            0x40ccd5dffffffffc,
+        ]),
+        (499, 168, [
+            0x4054bf53e3108382,
+            0x4022339223e29d1d,
+            0x3fde9528f7f34c28,
+            0x402f9c2ee3ab9d88,
+            0x40e4875bb412780a,
+            0x40e42e1897db0fe9,
+            0x40d373c041aad671,
+        ]),
+    ];
+    for (n, k, exp) in combined {
+        let mut a3 = [0.0f64; 3];
+        let mut b3 = [0.0f64; 3];
+        let mut a6 = [0.0f64; 6];
+        let mut b6 = [0.0f64; 6];
+        for i in 1..=k {
+            a3 = float8_accum(a3, v(i)).unwrap();
+            a6 = float8_regr_accum(a6, v(i), w(i)).unwrap();
+        }
+        for i in (k + 1)..=n {
+            b3 = float8_accum(b3, v(i)).unwrap();
+            b6 = float8_regr_accum(b6, v(i), w(i)).unwrap();
+        }
+        let c3 = float8_combine(a3, b3).unwrap();
+        let c6 = float8_regr_combine(a6, b6).unwrap();
+        let got = [
+            float8_var_samp(c3).unwrap(),
+            float8_stddev_pop(c3).unwrap(),
+            float8_corr(c6).unwrap(),
+            float8_regr_intercept(c6).unwrap(),
+            float8_regr_sxx(c6).unwrap(),
+            float8_regr_syy(c6).unwrap(),
+            float8_regr_sxy(c6).unwrap(),
+        ];
+        assert_eq!(got.map(f64::to_bits), exp, "n={n} k={k}");
+    }
+}
+
+#[test]
+fn transarray_image_layout() {
+    let vals = [1.0f64, -2.5, 0.0];
+    let mut img = [0u8; float8_transarray_size(3)];
+    let n = write_float8_transarray(&vals, &mut img);
+    assert_eq!(n, 48);
+    let words: Vec<i32> = img[..24]
+        .chunks(4)
+        .map(|c| i32::from_ne_bytes(c.try_into().unwrap()))
+        .collect();
+    // vl_len_ == SET_VARSIZE(48), ndim 1, dataoffset 0 (no nulls),
+    // elemtype FLOAT8OID, dim1 3, lbound1 1.
+    assert_eq!(words, [48 << 2, 1, 0, 701, 3, 1]);
+    assert_eq!(check_float8_array::<3>(&img, "t").unwrap(), vals);
+
+    let err = check_float8_array::<6>(&img, "float8_regr_sxx").unwrap_err();
+    assert_eq!(err.message(), "float8_regr_sxx: expected 6-element float8 array");
+    assert!(check_float8_array::<3>(&img[..20], "t").is_err());
+}
+
+#[test]
+fn fmgr_wrappers_and_table() {
+    let mut flinfo = FmgrInfo::new(fc_float8pl, 218, 2, true, false);
+    let mut fci = LocalFcinfo::<2>::new(0);
+    fci.set_arg(0, Datum::from_f64(40.5));
+    fci.set_arg(1, Datum::from_f64(1.5));
+    assert_eq!(flinfo.invoke(&mut fci).unwrap().as_f64(), 42.0);
+    fci.set_arg(0, Datum::from_f64(f64::MAX));
+    fci.set_arg(1, Datum::from_f64(f64::MAX));
+    let err = flinfo.invoke(&mut fci).unwrap_err();
+    assert_eq!(err.message(), "value out of range: overflow");
+
+    let mut fci = LocalFcinfo::<2>::new(0);
+    fci.set_arg(0, Datum::from_f32(1.5));
+    fci.set_arg(1, Datum::from_f32(1.5));
+    assert!(fc_float4eq(None, &mut fci).unwrap().as_bool());
+    fci.set_arg(1, Datum::from_f32(2.0));
+    assert!(!fc_float4eq(None, &mut fci).unwrap().as_bool());
+    assert_eq!(fc_btfloat4cmp(None, &mut fci).unwrap().as_i32(), -1);
+
+    let mut flinfo = FmgrInfo::new(fc_float8out, 215, 1, true, false);
+    let mut fci = LocalFcinfo::<1>::new(0);
+    for v in [0.1f64, -0.0, 1e300, f64::NAN, 3.141592653589793] {
+        fci.set_arg(0, Datum::from_f64(v));
+        let d = flinfo.invoke(&mut fci).unwrap();
+        let s = unsafe { core::ffi::CStr::from_ptr(d.as_usize() as *const core::ffi::c_char) };
+        assert_eq!(s.to_bytes(), out8(v).as_bytes());
+    }
+
+    let mut fci = LocalFcinfo::<1>::new(0);
+    let num = b"-2.5e-3\0";
+    fci.set_arg(0, Datum::from_usize(num.as_ptr() as usize));
+    assert_eq!(fc_float8in(None, &mut fci).unwrap().as_f64(), -2.5e-3);
+    let num = b"0x1p4\0";
+    fci.set_arg(0, Datum::from_usize(num.as_ptr() as usize));
+    assert_eq!(fc_float4in(None, &mut fci).unwrap().as_f32(), 16.0);
+
+    let mut fci = LocalFcinfo::<0>::new(0);
+    assert_eq!(fc_dpi(None, &mut fci).unwrap().as_f64(), core::f64::consts::PI);
+
+    // Table sanity: unique OIDs, all rows strict/non-retset, and every row
+    // matches the canonical pg_proc projection (name + nargs).
+    let mut oids: Vec<u32> = FLOAT_BUILTINS.iter().map(|b| b.foid).collect();
+    oids.sort_unstable();
+    let n = oids.len();
+    oids.dedup();
+    assert_eq!(n, oids.len());
+    assert_eq!(n, 155);
+    for b in FLOAT_BUILTINS {
+        assert!(b.strict && !b.retset);
+        let c = fmgr_core::CANONICAL
+            .iter()
+            .find(|c| c.0 == b.foid)
+            .unwrap_or_else(|| panic!("OID {} not in canonical table", b.foid));
+        assert_eq!((c.1, c.2), (b.name, b.nargs), "OID {}", b.foid);
+    }
+}
+
+// hashfloat4/8 (hashfunc.c): ±0 collapse, float4 widens to float8 (cross-type
+// joins), NaN bit patterns collapse to the standard NaN.
+#[test]
+fn float_hash_image_rules() {
+    use crate::builtins::float8_hash_image;
+    assert_eq!(float8_hash_image(f64::NAN), float8_hash_image(-f64::NAN));
+    assert_eq!(
+        float8_hash_image(1.5f32 as f64),
+        float8_hash_image(1.5f64),
+        "float4 widening must hash like the equal float8"
+    );
+    let h0 = ::hashfn::hash_bytes(&float8_hash_image(0.0));
+    let hneg0 = ::hashfn::hash_bytes(&float8_hash_image(-0.0));
+    assert_eq!(h0, hneg0);
+}
+
+// fmgr frames for the float8[] transvalue family: the agg-context leg
+// updates arg0 in place (C's AggCheckCallContext cheat); the bare leg
+// builds a fresh construct_array image in the result mcx.
+#[test]
+#[cfg_attr(miri, ignore)] // exact-value KATs shared with aggregates_match_live_pg
+fn float_agg_fmgr_frames() {
+    use ::mcx::MemoryContext;
+    use ::types_fmgr::AggStateNode;
+
+    let ctx = MemoryContext::new_bump("float-agg-test");
+    let read3 = |d: Datum| {
+        // SAFETY: a live float8[3] image datum from the frame under test.
+        let img = unsafe {
+            core::slice::from_raw_parts(d.as_usize() as *const u8, float8_transarray_size(3))
+        };
+        check_float8_array::<3>(img, "t").unwrap()
+    };
+
+    // Bare call: fresh image, source untouched.
+    let mut img = [0u8; float8_transarray_size(3)];
+    write_float8_transarray(&[0.0; 3], &mut img);
+    let mut fci = LocalFcinfo::<2>::fresh(0);
+    // SAFETY: ctx outlives every call through the frame.
+    unsafe { fci.set_result_mcx(ctx.mcx()) };
+    fci.set_arg(0, Datum::from_usize(img.as_ptr() as usize));
+    fci.set_arg(1, Datum::from_f64(2.0));
+    let d = fc_float8_accum(None, &mut fci).unwrap();
+    assert_ne!(d.as_usize(), img.as_ptr() as usize);
+    assert_eq!(read3(d), [1.0, 2.0, 0.0]);
+    assert_eq!(check_float8_array::<3>(&img, "t").unwrap(), [0.0; 3]);
+
+    // Agg frame: in-place, avg/stddev finals match the kernel KATs.
+    let mut agg = AggStateNode::new(MemoryContext::new_bump("float-aggctx"));
+    let mut trans = [0u8; float8_transarray_size(3)];
+    write_float8_transarray(&[0.0; 3], &mut trans);
+    let tp = trans.as_ptr() as usize;
+    for v in [1.0f64, 2.5, 4.25, -3.5] {
+        let mut fci = LocalFcinfo::<2>::fresh(0);
+        fci.context = agg.fm_node_ptr();
+        fci.set_arg(0, Datum::from_usize(tp));
+        fci.set_arg(1, Datum::from_f64(v));
+        assert_eq!(fc_float8_accum(None, &mut fci).unwrap().as_usize(), tp);
+    }
+    let mut fci = LocalFcinfo::<1>::fresh(0);
+    fci.set_arg(0, Datum::from_usize(tp));
+    assert_eq!(out8(fc_float8_avg(None, &mut fci).unwrap().as_f64()), "1.0625");
+    assert!(!fci.isnull);
+    let mut fci = LocalFcinfo::<1>::fresh(0);
+    fci.set_arg(0, Datum::from_usize(tp));
+    assert_eq!(
+        out8(fc_float8_stddev_samp(None, &mut fci).unwrap().as_f64()),
+        "3.3189795118379384"
+    );
+
+    // Empty-state final: SQL NULL.
+    let mut empty = [0u8; float8_transarray_size(3)];
+    write_float8_transarray(&[0.0; 3], &mut empty);
+    let mut fci = LocalFcinfo::<1>::fresh(0);
+    fci.set_arg(0, Datum::from_usize(empty.as_ptr() as usize));
+    fc_float8_avg(None, &mut fci).unwrap();
+    assert!(fci.isnull);
+
+    // combine in the agg frame folds t2 into t1 in place.
+    let mut t1 = [0u8; float8_transarray_size(3)];
+    write_float8_transarray(&float8_accum(float8_accum([0.0; 3], 1.0).unwrap(), 2.5).unwrap(), &mut t1);
+    let mut t2 = [0u8; float8_transarray_size(3)];
+    write_float8_transarray(&float8_accum(float8_accum([0.0; 3], 4.25).unwrap(), -3.5).unwrap(), &mut t2);
+    let mut fci = LocalFcinfo::<2>::fresh(0);
+    fci.context = agg.fm_node_ptr();
+    fci.set_arg(0, Datum::from_usize(t1.as_ptr() as usize));
+    fci.set_arg(1, Datum::from_usize(t2.as_ptr() as usize));
+    let d = fc_float8_combine(None, &mut fci).unwrap();
+    assert_eq!(d.as_usize(), t1.as_ptr() as usize);
+    let c = check_float8_array::<3>(&t1, "t").unwrap();
+    assert_eq!(c[0], 4.0);
+    assert_eq!(out8(float8_avg(c).unwrap()), "1.0625");
+
+    // regr transfn (state, Y, X) + finals through the frame.
+    let mut r = [0u8; float8_transarray_size(6)];
+    write_float8_transarray(&[0.0; 6], &mut r);
+    let rp = r.as_ptr() as usize;
+    for (y, x) in [(1.0, 2.0), (2.5, 4.1), (4.25, 7.9), (-3.5, -6.0)] {
+        let mut fci = LocalFcinfo::<3>::fresh(0);
+        fci.context = agg.fm_node_ptr();
+        fci.set_arg(0, Datum::from_usize(rp));
+        fci.set_arg(1, Datum::from_f64(y));
+        fci.set_arg(2, Datum::from_f64(x));
+        assert_eq!(fc_float8_regr_accum(None, &mut fci).unwrap().as_usize(), rp);
+    }
+    let final6 = |f: PGFunction| {
+        let mut fci = LocalFcinfo::<1>::fresh(0);
+        fci.set_arg(0, Datum::from_usize(rp));
+        out8(f(None, &mut fci).unwrap().as_f64())
+    };
+    assert_eq!(final6(fc_float8_regr_slope), "0.5650552218562295");
+    assert_eq!(final6(fc_float8_corr), "0.9986369273154669");
+    assert_eq!(final6(fc_float8_covar_samp), "19.441666666666666");
+
+    // Wrong-shape transarray: C's elog text.
+    let mut fci = LocalFcinfo::<1>::fresh(0);
+    fci.set_arg(0, Datum::from_usize(tp));
+    let err = fc_float8_regr_sxx(None, &mut fci).unwrap_err();
+    assert_eq!(err.message(), "float8_regr_sxx: expected 6-element float8 array");
+}
+
+// fnconf batch-1, OID 2467 (atanh): C calls platform libm atanh; Rust std's
+// 0.5*ln_1p(2x/(1-x)) formula is one ulp off on some inputs, which the
+// shortest-round-trip float8out then renders as different bytes.
+// The exact bits differ per libm (macOS 0x...3ff, glibc-aarch64 0x...3fe),
+// so the pin is the CALL: bit-equality vs this platform's own atanh — C on
+// the same box returns the same bits by the same call.
+#[test]
+fn datanh_matches_platform_libm() {
+    extern "C" {
+        fn atanh(x: f64) -> f64;
+    }
+    let x = -1.3990760221756862e-5;
+    // SAFETY: pure libm function, no preconditions.
+    let expect = unsafe { atanh(x) };
+    let r = funcs::datanh(x).unwrap();
+    assert_eq!(r.to_bits(), expect.to_bits());
+    // Endpoints and out-of-range behavior unchanged.
+    assert_eq!(funcs::datanh(1.0).unwrap(), f64::INFINITY);
+    assert_eq!(funcs::datanh(-1.0).unwrap(), f64::NEG_INFINITY);
+    assert!(funcs::datanh(1.5).is_err());
+    assert_eq!(funcs::datanh(0.0).unwrap(), 0.0);
+}
+
+// strtod_c ERANGE model vs glibc ground truth (C probe run in the
+// postgres:18.3 Debian image, glibc 2.36, 2026-07-31; the
+// interval_engine_diff CI cluster campaign's "P1e-322" divergence). ISO C
+// underflow: ERANGE iff the result is subnormal-or-zero AND inexact;
+// EXACT subnormals set no errno; overflow always does.
+#[test]
+fn strtod_c_glibc_erange_model() {
+    let cases: &[(&str, bool)] = &[
+        ("1e-322", true),                  // subnormal, inexact
+        ("4.9406564584124654e-324", true), // ~min subnormal, inexact
+        ("1e-308", true),                  // below DBL_MIN -> subnormal
+        ("2.2250738585072014e-308", false), // DBL_MIN exactly (normal)
+        ("2.2250738585072011e-308", true), // just below DBL_MIN
+        ("2.2250738585072012e-308", true), // below DBL_MIN, rounds up to it: tininess before rounding
+        ("0x1.fffffffffffffp-1023", true), // same, hex
+        ("0x1p-1022", false),             // DBL_MIN exactly (hex)
+        ("1e-400", true),                  // rounds to zero
+        ("0x1p-1050", false),              // EXACT subnormal (hex)
+        ("0x1p-1074", false),              // min subnormal, exact
+        ("0x1p-1075", true),               // rounds to zero
+        ("0x1.8p-1074", true),             // ties-to-even, inexact
+        ("1e308", false),                  // large normal
+        ("1e309", true),                   // overflow -> inf
+        ("0", false),
+        ("0.0e5", false),
+        ("infinity", false),               // words: no errno
+    ];
+    for (s, want) in cases {
+        let (_, _, range) =
+            io::strtod_c(s.as_bytes()).unwrap_or_else(|| panic!("{s}: no token"));
+        assert_eq!(range, *want, "ERANGE mismatch for {s:?}");
+    }
+    // decimal spelling of an exact subnormal: 2^-1074 written in full is
+    // exact; glibc sets no errno for it. Build it as 5^1074 * 10^-1074.
+    let mut n = vec![1u8]; // little-endian digits of 5^1074
+    for _ in 0..1074 {
+        let mut carry = 0u16;
+        for d in n.iter_mut() {
+            let t = *d as u16 * 5 + carry;
+            *d = (t % 10) as u8;
+            carry = t / 10;
+        }
+        while carry > 0 {
+            n.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    let digits: String = n.iter().rev().map(|d| (d + b'0') as char).collect();
+    let exact_min_subnormal = format!("0.{}{}", "0".repeat(1074 - digits.len()), digits);
+    let (v, _, range) = io::strtod_c(exact_min_subnormal.as_bytes()).unwrap();
+    assert_eq!(v.to_bits(), 1, "should parse to the minimum subnormal");
+    assert!(!range, "exact decimal subnormal must not set ERANGE");
+}
+
+#[test]
+fn float4out_results_do_not_alias_across_carriers() {
+    let mut f1 = types_fmgr::FmgrInfo::new(fc_float4out, 201, 1, true, false);
+    let mut f2 = types_fmgr::FmgrInfo::new(fc_float4out, 201, 1, true, false);
+    let mut fci = types_fmgr::LocalFcinfo::<1>::new(0);
+    fci.set_arg(0, Datum::from_f32(12.0));
+    let d1 = f1.invoke(&mut fci).unwrap();
+    fci.set_arg(0, Datum::from_f32(34.0));
+    let d2 = f2.invoke(&mut fci).unwrap();
+    let cstr = |d: Datum| unsafe { core::ffi::CStr::from_ptr(d.as_usize() as *const core::ffi::c_char) }.to_bytes().to_vec();
+    assert_eq!(cstr(d1), b"12");
+    assert_eq!(cstr(d2), b"34");
+}
+
+#[cfg(test)]
+mod dblmin_tests {
+    use crate::io::token_true_value_below_dblmin;
+
+    #[test]
+    fn long_tokens_stay_bounded_and_exact() {
+        // DBL_MIN = 2.2250738585072013830902...e-308; this decimal is above it.
+        assert!(!token_true_value_below_dblmin(b"2.2250738585072014e-308", false));
+        assert!(token_true_value_below_dblmin(b"2.2250738585072013e-308", false));
+        // Leading zeros are not stored: 1e-308 and 3e-308 through 100k zeros.
+        let z = "0.".to_string() + &"0".repeat(100_000);
+        assert!(token_true_value_below_dblmin(format!("{z}1e+99693").as_bytes(), false));
+        assert!(!token_true_value_below_dblmin(format!("{z}3e+99693").as_bytes(), false));
+        // Significant digits past the cut cannot flip the verdict.
+        let ones = "1".repeat(5000);
+        // 5000 digits: 1.1...e-308 is below DBL_MIN, 3.3...e-308 is above.
+        assert!(token_true_value_below_dblmin(format!("{ones}e-5307").as_bytes(), false));
+        let threes = "3".repeat(5000);
+        assert!(!token_true_value_below_dblmin(format!("{threes}e-5307").as_bytes(), false));
+        assert!(!token_true_value_below_dblmin(b"0.000", false));
+    }
+}

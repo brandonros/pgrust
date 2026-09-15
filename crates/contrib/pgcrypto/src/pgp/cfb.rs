@@ -1,0 +1,180 @@
+
+use super::consts::*;
+use crate::cipher::BlockEncryptor;
+
+pub struct PgpCfb {
+    ciph: BlockEncryptor,
+    block_size: usize,
+    pos: usize,
+    block_no: i32,
+    resync: bool,
+    // upstream 4c5128ca0b30 (18.6): pgcrypto: Add option to revert to prior decryption behavior.
+    // C's cfb_process drops its px_cipher_encrypt init-failure ERROR on the decrypt
+    // path when this is set; create() builds the cipher eagerly and encrypt_block()
+    // is infallible, so nothing here can fail to be ignored.
+    #[allow(dead_code)] // C-parity: pgp_cfb_decrypt's guard input
+    ignore_decrypt_cipher_failure: bool,
+    fr: Vec<u8>,
+    fre: Vec<u8>,
+    encbuf: Vec<u8>,
+}
+
+impl PgpCfb {
+    pub fn create(
+        algo: i32,
+        key: &[u8],
+        resync: bool,
+        iv: Option<&[u8]>,
+        ignore_decrypt_cipher_failure: bool,
+    ) -> Result<PgpCfb, &'static str> {
+        // pgp.c:163 pgp_load_cipher: an id outside the cipher table is
+        // PXE_PGP_CORRUPT_DATA; the key is padded by the cipher init
+        // (openssl.c:541 ossl_aes_init, :504 ossl_des3_init).
+        let int_name = cipher_int_name(algo).ok_or(CORRUPT_DATA)?;
+        let key = crate::cipher::pgp_init_key(int_name, key);
+        let ciph = BlockEncryptor::new(int_name, &key).ok_or(UNSUPPORTED_CIPHER)?;
+        let bs = ciph.block_size();
+        let mut fr = vec![0u8; bs];
+        if let Some(iv) = iv {
+            let n = iv.len().min(bs);
+            fr[..n].copy_from_slice(&iv[..n]);
+        }
+        Ok(PgpCfb {
+            ciph,
+            block_size: bs,
+            pos: 0,
+            block_no: 0,
+            resync,
+            ignore_decrypt_cipher_failure,
+            fr,
+            fre: vec![0u8; bs],
+            encbuf: vec![0u8; bs],
+        })
+    }
+
+    #[allow(dead_code)] // C-parity: pgp_cfb_* surface kept complete
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    fn ecb(&mut self) {
+        self.fre.copy_from_slice(&self.fr);
+        self.ciph.encrypt_block(&mut self.fre);
+    }
+
+    pub fn encrypt(&mut self, data: &[u8]) -> Vec<u8> {
+        let mut dst = vec![0u8; data.len()];
+        self.process(data, &mut dst, true);
+        dst
+    }
+
+    pub fn decrypt(&mut self, data: &[u8]) -> Vec<u8> {
+        let mut dst = vec![0u8; data.len()];
+        self.process(data, &mut dst, false);
+        dst
+    }
+
+    fn process(&mut self, data: &[u8], dst: &mut [u8], enc: bool) {
+        let bs = self.block_size;
+        let mut di = 0usize; // index into data/dst
+        let mut len = data.len();
+
+        while len > 0 && self.pos > 0 {
+            let mut n = bs - self.pos;
+            if len < n {
+                n = len;
+            }
+            let consumed = self.mix(&data[di..di + n], &mut dst[di..di + n], enc);
+            di += consumed;
+            len -= consumed;
+            if self.pos == bs {
+                self.fr.copy_from_slice(&self.encbuf);
+                self.pos = 0;
+            }
+        }
+
+        while len > 0 {
+            self.ecb();
+            if self.block_no < 5 {
+                self.block_no += 1;
+            }
+            let mut n = bs;
+            if len < n {
+                n = len;
+            }
+            let consumed = self.mix(&data[di..di + n], &mut dst[di..di + n], enc);
+            di += consumed;
+            len -= consumed;
+            if self.pos == bs {
+                self.fr.copy_from_slice(&self.encbuf);
+                self.pos = 0;
+            }
+        }
+    }
+
+    fn mix(&mut self, data: &[u8], dst: &mut [u8], enc: bool) -> usize {
+        if self.resync {
+            self.mix_resync(data, dst, enc)
+        } else {
+            self.mix_normal(data, dst, enc)
+        }
+    }
+
+    fn mix_normal(&mut self, data: &[u8], dst: &mut [u8], enc: bool) -> usize {
+        let len = data.len();
+        for k in 0..len {
+            let i = self.pos + k;
+            if enc {
+                self.encbuf[i] = self.fre[i] ^ data[k];
+                dst[k] = self.encbuf[i];
+            } else {
+                self.encbuf[i] = data[k];
+                dst[k] = self.fre[i] ^ self.encbuf[i];
+            }
+        }
+        self.pos += len;
+        len
+    }
+
+    fn mix_resync(&mut self, data: &[u8], dst: &mut [u8], enc: bool) -> usize {
+        let bs = self.block_size;
+        if self.block_no == 2 {
+            let mut n = 2 - self.pos;
+            if data.len() < n {
+                n = data.len();
+            }
+            for k in 0..n {
+                let i = self.pos + k;
+                if enc {
+                    self.encbuf[i] = self.fre[i] ^ data[k];
+                    dst[k] = self.encbuf[i];
+                } else {
+                    self.encbuf[i] = data[k];
+                    dst[k] = self.fre[i] ^ self.encbuf[i];
+                }
+            }
+            self.pos += n;
+            if self.pos == 2 {
+                let mut newfr = vec![0u8; bs];
+                newfr[..bs - 2].copy_from_slice(&self.encbuf[2..bs]);
+                newfr[bs - 2..].copy_from_slice(&self.encbuf[..2]);
+                self.fr.copy_from_slice(&newfr);
+                self.pos = 0;
+            }
+            return n;
+        }
+        let len = data.len();
+        for k in 0..len {
+            let i = self.pos + k;
+            if enc {
+                self.encbuf[i] = self.fre[i] ^ data[k];
+                dst[k] = self.encbuf[i];
+            } else {
+                self.encbuf[i] = data[k];
+                dst[k] = self.fre[i] ^ self.encbuf[i];
+            }
+        }
+        self.pos += len;
+        len
+    }
+}

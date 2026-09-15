@@ -1,0 +1,493 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, Once};
+
+use types_error::WARNING;
+use types_storage::PGShmemHeader;
+
+use crate::dsm::*;
+use crate::dsm_impl::*;
+
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+// pgstat wait reporting trace: each start pushes its wait_event_info, each
+// end pushes 0.
+static WAIT_EVENTS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static REGISTERED_EXITS: AtomicUsize = AtomicUsize::new(0);
+static EXIT_CALLBACKS: Mutex<Vec<(fn(i32, usize), usize)>> = Mutex::new(Vec::new());
+
+static STARTUP_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn startup_capture(err: &types_error::PgError, _output_to_server: &mut bool) {
+    STARTUP_LOG.lock().unwrap().push(err.message.clone());
+}
+
+fn bringup() -> MutexGuard<'static, ()> {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        shmem_seams::shmem_alloc::set(|size| {
+            let layout = std::alloc::Layout::from_size_align(size, 128).unwrap();
+            let p = unsafe { std::alloc::alloc_zeroed(layout) };
+            assert!(!p.is_null());
+            Ok(p)
+        });
+        shmem_seams::add_size::set(|a, b| Ok(a.checked_add(b).unwrap()));
+        elog::init_seams();
+        waitevent_seams::pgstat_report_wait_start::set(|info| {
+            WAIT_EVENTS.lock().unwrap().push(info);
+        });
+        waitevent_seams::pgstat_report_wait_end::set(|| {
+            WAIT_EVENTS.lock().unwrap().push(0);
+        });
+        shmem_seams::mul_size::set(|a, b| Ok(a.checked_mul(b).unwrap()));
+        ipc_seams::on_shmem_exit::set(|cb, arg| {
+            REGISTERED_EXITS.fetch_add(1, Ordering::Relaxed);
+            EXIT_CALLBACKS.lock().unwrap().push((cb, arg));
+        });
+        // splitmix64 stand-in until port/pg_prng lands.
+        pg_prng_seams::global_prng_uint32::set(|| {
+            static STATE: AtomicUsize = AtomicUsize::new(0x5851_f42d);
+            let mut x = STATE.fetch_add(0x9e37_79b9, Ordering::Relaxed) as u64;
+            x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            (x ^ (x >> 31)) as u32
+        });
+        lwlock::CreateLWLocks(false).unwrap();
+        init_small::globals::SetMaxBackends(1);
+        let shim = Box::leak(Box::new(PGShmemHeader {
+            magic: 0,
+            creatorPID: 0,
+            totalsize: 0,
+            freeoffset: 0,
+            dsm_control: 0,
+            index: std::ptr::null_mut(),
+            device: 0,
+            inode: 0,
+        }));
+        // Capture the startup DEBUG2 lines (control-segment size witness).
+        let prev = elog::set_emit_log_hook(Some(startup_capture));
+        elog::config::set_log_min_messages(types_error::DEBUG2);
+        dsm_postmaster_startup(shim).unwrap();
+        elog::config::set_log_min_messages(types_error::WARNING);
+        elog::set_emit_log_hook(prev);
+        assert_eq!(REGISTERED_EXITS.load(Ordering::Relaxed), 1);
+        assert_ne!(shim.dsm_control, 0);
+        assert_eq!(shim.dsm_control & 1, 0);
+    });
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[test]
+fn create_maps_zeroed_and_destroys_on_last_detach() {
+    let _g = bringup();
+    let seg = dsm_create(1024, 0).unwrap().unwrap();
+    let id = seg.id();
+    let handle = dsm_segment_handle(id);
+    assert_ne!(handle, 0);
+    assert_eq!(handle & 1, 0);
+    assert_eq!(dsm_segment_map_length(id), 1024);
+    let p = dsm_segment_address(id);
+    assert!(!p.is_null());
+    let bytes = unsafe { std::slice::from_raw_parts(p, 1024) };
+    assert!(bytes.iter().all(|&b| b == 0));
+    assert_eq!(dsm_find_mapping(handle), Some(id));
+
+    dsm_detach(seg.into_id()).unwrap();
+    assert_eq!(dsm_find_mapping(handle), None);
+    assert!(dsm_attach(handle).unwrap().is_none());
+}
+
+#[test]
+fn attach_shares_memory_across_backends() {
+    let _g = bringup();
+    let seg = dsm_create(64, 0).unwrap().unwrap();
+    let id = seg.id();
+    let handle = dsm_segment_handle(id);
+    unsafe { *dsm_segment_address(id) = 0xAB };
+
+    dsm_pin_segment(id).unwrap();
+    let observed = std::thread::spawn(move || {
+        let seg = dsm_attach(handle).unwrap().unwrap();
+        let p = dsm_segment_address(seg.id());
+        let seen = unsafe { *p };
+        unsafe { *p.add(1) = 0xCD };
+        assert_eq!(dsm_segment_map_length(seg.id()), 64);
+        dsm_detach(seg.into_id()).unwrap();
+        seen
+    })
+    .join()
+    .unwrap();
+    assert_eq!(observed, 0xAB);
+    assert_eq!(unsafe { *dsm_segment_address(id).add(1) }, 0xCD);
+
+    drop(seg);
+    assert!(dsm_attach(handle).unwrap().is_some_and(|s| {
+        dsm_detach(s.into_id()).unwrap();
+        true
+    }));
+    dsm_unpin_segment(handle).unwrap();
+    assert!(dsm_attach(handle).unwrap().is_none());
+}
+
+#[test]
+fn cannot_attach_same_segment_twice() {
+    let _g = bringup();
+    let seg = dsm_create(32, 0).unwrap().unwrap();
+    let handle = dsm_segment_handle(seg.id());
+    let err = dsm_attach(handle).unwrap_err();
+    assert_eq!(err.message, "can't attach the same segment more than once");
+}
+
+#[test]
+fn guard_drop_detaches() {
+    let _g = bringup();
+    let seg = dsm_create(32, 0).unwrap().unwrap();
+    let handle = dsm_segment_handle(seg.id());
+    drop(seg);
+    assert_eq!(dsm_find_mapping(handle), None);
+    assert!(dsm_attach(handle).unwrap().is_none());
+}
+
+#[test]
+fn pin_mapping_outlives_guard_and_unpin_mapping_restores_it() {
+    let _g = bringup();
+    let seg = dsm_create(32, 0).unwrap().unwrap();
+    let handle = dsm_segment_handle(seg.id());
+    let id = dsm_pin_mapping(seg);
+    assert_eq!(dsm_find_mapping(handle), Some(id));
+
+    let seg = dsm_unpin_mapping(id);
+    drop(seg);
+    assert_eq!(dsm_find_mapping(handle), None);
+    assert!(dsm_attach(handle).unwrap().is_none());
+}
+
+#[test]
+fn pin_segment_lifecycle_and_errors() {
+    let _g = bringup();
+    let seg = dsm_create(32, 0).unwrap().unwrap();
+    let id = seg.id();
+    let handle = dsm_segment_handle(id);
+
+    dsm_pin_segment(id).unwrap();
+    let err = dsm_pin_segment(id).unwrap_err();
+    assert_eq!(err.message, "cannot pin a segment that is already pinned");
+
+    drop(seg);
+    let seg2 = dsm_attach(handle).unwrap().unwrap();
+    drop(seg2);
+
+    dsm_unpin_segment(handle).unwrap();
+    assert!(dsm_attach(handle).unwrap().is_none());
+
+    let err = dsm_unpin_segment(handle).unwrap_err();
+    assert_eq!(err.message, "cannot unpin unknown segment handle");
+
+    let seg3 = dsm_create(32, 0).unwrap().unwrap();
+    let err = dsm_unpin_segment(dsm_segment_handle(seg3.id())).unwrap_err();
+    assert_eq!(err.message, "cannot unpin a segment that is not pinned");
+}
+
+static CB_TRACE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn trace_cb(_seg: DsmSegmentId, arg: usize) -> types_error::PgResult<()> {
+    CB_TRACE.lock().unwrap().push(arg);
+    Ok(())
+}
+
+fn err_cb(_seg: DsmSegmentId, arg: usize) -> types_error::PgResult<()> {
+    CB_TRACE.lock().unwrap().push(arg);
+    Err(Box::new(types_error::PgError::error("detach callback failed")))
+}
+
+#[test]
+fn detach_callbacks_run_lifo_and_cancel_removes() {
+    let _g = bringup();
+    CB_TRACE.lock().unwrap().clear();
+    let seg = dsm_create(32, 0).unwrap().unwrap();
+    let id = seg.id();
+    on_dsm_detach(id, trace_cb, 1).unwrap();
+    on_dsm_detach(id, trace_cb, 2).unwrap();
+    on_dsm_detach(id, trace_cb, 3).unwrap();
+    cancel_on_dsm_detach(id, trace_cb, 2);
+    dsm_detach(seg.into_id()).unwrap();
+    assert_eq!(*CB_TRACE.lock().unwrap(), vec![3, 1]);
+}
+
+#[test]
+fn erroring_callback_leaves_rest_for_retry() {
+    let _g = bringup();
+    CB_TRACE.lock().unwrap().clear();
+    let seg = dsm_create(32, 0).unwrap().unwrap();
+    let id = dsm_pin_mapping(seg);
+    on_dsm_detach(id, trace_cb, 1).unwrap();
+    on_dsm_detach(id, err_cb, 2).unwrap();
+    assert!(dsm_detach(id).is_err());
+    assert_eq!(*CB_TRACE.lock().unwrap(), vec![2]);
+    dsm_detach(id).unwrap();
+    assert_eq!(*CB_TRACE.lock().unwrap(), vec![2, 1]);
+}
+
+#[test]
+fn reset_on_dsm_detach_forgets_callbacks_and_slots() {
+    let _g = bringup();
+    CB_TRACE.lock().unwrap().clear();
+    let seg = dsm_create(32, 0).unwrap().unwrap();
+    let id = seg.id();
+    let handle = dsm_segment_handle(id);
+    on_dsm_detach(id, trace_cb, 7).unwrap();
+    reset_on_dsm_detach();
+    dsm_detach(seg.into_id()).unwrap();
+    assert!(CB_TRACE.lock().unwrap().is_empty());
+    // Refcount was not decremented, so the segment is still attachable.
+    let seg2 = dsm_attach(handle).unwrap().unwrap();
+    dsm_detach(seg2.into_id()).unwrap();
+}
+
+#[test]
+fn backend_shutdown_detaches_everything() {
+    let _g = bringup();
+    let a = dsm_pin_mapping(dsm_create(32, 0).unwrap().unwrap());
+    let b = dsm_pin_mapping(dsm_create(32, 0).unwrap().unwrap());
+    let (ha, hb) = (dsm_segment_handle(a), dsm_segment_handle(b));
+    dsm_backend_shutdown().unwrap();
+    assert_eq!(dsm_find_mapping(ha), None);
+    assert_eq!(dsm_find_mapping(hb), None);
+    assert!(dsm_attach(ha).unwrap().is_none());
+    assert!(dsm_attach(hb).unwrap().is_none());
+}
+
+#[test]
+fn create_reports_max_segments() {
+    let _g = bringup();
+    let mut guards = Vec::new();
+    let mut hit_none = false;
+    for _ in 0..200 {
+        match dsm_create(16, DSM_CREATE_NULL_IF_MAXSEGMENTS).unwrap() {
+            Some(seg) => guards.push(seg),
+            None => {
+                hit_none = true;
+                break;
+            }
+        }
+    }
+    assert!(hit_none, "control segment never filled");
+    let err = dsm_create(16, 0).unwrap_err();
+    assert_eq!(err.message, "too many dynamic shared memory segments");
+    drop(guards);
+    let seg = dsm_create(16, 0).unwrap().unwrap();
+    drop(seg);
+}
+
+#[test]
+fn crash_cycle_recreates_control_segment() {
+    let _g = bringup();
+    // shmem_exit(1)'s dsm arm: the exit callback registered at boot startup.
+    let (shutdown, arg) = EXIT_CALLBACKS.lock().unwrap()[0];
+    let exits_before = REGISTERED_EXITS.load(Ordering::Relaxed);
+    shutdown(1, arg);
+
+    dsm_postmaster_startup_after_crash().unwrap();
+    assert_eq!(REGISTERED_EXITS.load(Ordering::Relaxed), exits_before + 1);
+    let shim = unsafe { &*(arg as *const PGShmemHeader) };
+    assert_ne!(shim.dsm_control, 0);
+
+    let seg = dsm_create(48, 0).unwrap().unwrap();
+    let handle = dsm_segment_handle(seg.id());
+    assert_ne!(handle, 0);
+    dsm_detach(seg.into_id()).unwrap();
+}
+
+#[test]
+fn cleanup_using_control_segment_is_quiet_on_missing() {
+    let _g = bringup();
+    dsm_cleanup_using_control_segment(0x7fff_fffe).unwrap();
+}
+
+// docs/design/carve-ratifications.md §6 (RATIFIED): min_dynamic_shared_memory
+// accepts only 0. C 18.6 (guc_tables.c:2371) has no check hook on it and
+// takes any value up to INT_MAX; pgrust's pin is the check hook dsm_core's
+// init_seams installs, which must refuse every nonzero value with the
+// ratified errdetail (a clean GUC error at load, never the
+// main_region_unported tripwire) and accept 0. audit-18.6 w2-051.
+#[test]
+fn min_dynamic_shared_memory_hook_pins_zero_per_carve_s6() {
+    static DETAILS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        guc_seams::guc_check_errdetail::set(|d| DETAILS.lock().unwrap().push(d));
+        crate::init_seams();
+    });
+    let hook = guc_tables::hooks::check_min_dynamic_shared_memory.get();
+    let mut extra = None;
+    for v in [1, 10, 100, i32::MAX] {
+        DETAILS.lock().unwrap().clear();
+        let mut newval = v;
+        let accepted = hook(&mut newval, &mut extra, types_guc::GucSource::PGC_S_FILE).unwrap();
+        assert!(!accepted, "min_dynamic_shared_memory={v} must be refused");
+        assert_eq!(
+            *DETAILS.lock().unwrap(),
+            vec!["min_dynamic_shared_memory is not yet supported by pgrust; only 0 (disabled) is accepted."
+                .to_string()],
+            "errdetail for min_dynamic_shared_memory={v}"
+        );
+    }
+    DETAILS.lock().unwrap().clear();
+    let mut zero = 0;
+    assert!(hook(&mut zero, &mut extra, types_guc::GucSource::PGC_S_FILE).unwrap());
+    assert!(DETAILS.lock().unwrap().is_empty());
+}
+
+#[test]
+fn estimate_size_and_shmem_init_zero() {
+    let _g = bringup();
+    assert_eq!(dsm_estimate_size(), 0);
+    dsm_shmem_init().unwrap();
+    set_min_dynamic_shared_memory(3);
+    assert_eq!(dsm_estimate_size(), 3 * 1024 * 1024);
+    set_min_dynamic_shared_memory(0);
+}
+
+#[test]
+fn impl_op_collision_and_missing_semantics() {
+    let _g = bringup();
+    let handle = 0x6000_0000;
+    let mut ma = std::ptr::null_mut();
+    let mut ms = 0usize;
+    assert!(dsm_impl_op(DsmOp::Create, handle, 128, &mut ma, &mut ms, WARNING).unwrap());
+    let mut ma2 = std::ptr::null_mut();
+    let mut ms2 = 0usize;
+    assert!(!dsm_impl_op(DsmOp::Create, handle, 128, &mut ma2, &mut ms2, WARNING).unwrap());
+    assert!(dsm_impl_op(DsmOp::Destroy, handle, 0, &mut ma, &mut ms, WARNING).unwrap());
+    assert!(!dsm_impl_op(DsmOp::Destroy, handle, 0, &mut ma, &mut ms, WARNING).unwrap());
+    assert!(!dsm_impl_op(DsmOp::Attach, handle, 0, &mut ma, &mut ms, WARNING).unwrap());
+}
+
+#[test]
+fn guc_defaults() {
+    assert_eq!(dynamic_shared_memory_type(), DSM_IMPL_POSIX);
+    assert_eq!(min_dynamic_shared_memory(), 0);
+    assert_eq!(DYNAMIC_SHARED_MEMORY_OPTIONS.len(), 3);
+}
+
+// dsm.c:813 — dsm_detach runs the on-detach callbacks under HOLD_INTERRUPTS
+// and RESUME_INTERRUPTS afterwards; a callback ERROR must not leave the
+// holdoff count raised (C's longjmp handler resets it; the Err return here
+// has to release it itself), on the propagating path and on the Drop
+// (WARNING-demoted) path alike. A leaked holdoff disables query cancel and
+// statement_timeout for the rest of the session.
+#[test]
+fn erroring_detach_callback_does_not_leak_interrupt_holdoff() {
+    let _g = bringup();
+    CB_TRACE.lock().unwrap().clear();
+    let before = init_small::globals::InterruptHoldoffCount();
+
+    let seg = dsm_create(32, 0).unwrap().unwrap();
+    let id = dsm_pin_mapping(seg);
+    on_dsm_detach(id, err_cb, 21).unwrap();
+    assert!(dsm_detach(id).is_err());
+    assert_eq!(
+        init_small::globals::InterruptHoldoffCount(),
+        before,
+        "InterruptHoldoffCount leaked by the erroring detach callback"
+    );
+    dsm_detach(id).unwrap();
+    assert_eq!(init_small::globals::InterruptHoldoffCount(), before);
+
+    let seg = dsm_create(32, 0).unwrap().unwrap();
+    on_dsm_detach(seg.id(), err_cb, 22).unwrap();
+    drop(seg);
+    assert_eq!(
+        init_small::globals::InterruptHoldoffCount(),
+        before,
+        "InterruptHoldoffCount leaked by the Drop-demoted detach error"
+    );
+}
+
+// dsm_impl.c:366 — a request the platform cannot size is reported at the
+// caller's elevel ("could not resize shared memory segment ... : %m",
+// ERRCODE_OUT_OF_MEMORY for EFBIG/ENOMEM) and DSM_OP_CREATE returns false;
+// it never aborts the process.
+#[test]
+fn create_reports_unrepresentable_size_as_error_not_panic() {
+    let _g = bringup();
+    let handle: types_storage::dsm_handle = 0xDEAD_BEE0;
+    let mut ma: *mut u8 = std::ptr::null_mut();
+    let mut ms: usize = 0;
+    let err = dsm_impl_op(DsmOp::Create, handle, usize::MAX, &mut ma, &mut ms, types_error::ERROR)
+        .expect_err("oversized create is an ERROR, not a panic");
+    assert!(
+        err.message.starts_with("could not resize shared memory segment \"/PostgreSQL.3735928544\" to 18446744073709551615 bytes: "),
+        "{}",
+        err.message
+    );
+    assert_eq!(err.sqlstate(), types_error::ERRCODE_OUT_OF_MEMORY);
+    assert!(ma.is_null() && ms == 0);
+
+    // WARNING elevel: false, no Err (dsm.c retries under a new handle).
+    let ok = dsm_impl_op(DsmOp::Create, handle, usize::MAX, &mut ma, &mut ms, WARNING).unwrap();
+    assert!(!ok);
+    // Nothing was registered under that handle.
+    assert!(!dsm_impl_op(DsmOp::Attach, handle, 0, &mut ma, &mut ms, WARNING).unwrap());
+}
+
+// dsm_impl.c:366 — segment allocation is bracketed by
+// pgstat_report_wait_start(WAIT_EVENT_DSM_ALLOCATE) / pgstat_report_wait_end
+// (pg_stat_activity wait_event DsmAllocate, class IO).
+#[test]
+fn create_reports_dsm_allocate_wait_event() {
+    // wait_event_names.txt IO row "DsmAllocate" (waitevent IO row 25).
+    const PG_WAIT_IO: u32 = 0x0A00_0000;
+    const WAIT_EVENT_DSM_ALLOCATE: u32 = PG_WAIT_IO | 25;
+    let _g = bringup();
+    WAIT_EVENTS.lock().unwrap().clear();
+    let seg = dsm_create(64, 0).unwrap().unwrap();
+    let trace = std::mem::take(&mut *WAIT_EVENTS.lock().unwrap());
+    assert_eq!(
+        trace,
+        vec![WAIT_EVENT_DSM_ALLOCATE, 0],
+        "segment allocation must report DsmAllocate"
+    );
+    dsm_detach(seg.into_id()).unwrap();
+}
+
+// dsm.c:79 dsm_control_item carries impl_private_pm_handle on every platform
+// (40 bytes per item on 64-bit), so the control segment for maxitems =
+// 64 + 5 * MaxBackends (MaxBackends = 1 here, 69 items) is 16 + 40 * 69 =
+// 2776 bytes in dsm.c:221's DEBUG2 line.
+#[test]
+fn control_segment_size_matches_c_item_layout() {
+    let _g = bringup();
+    let log = STARTUP_LOG.lock().unwrap().clone();
+    let line = log
+        .iter()
+        .find(|l| l.starts_with("created dynamic shared memory control segment "))
+        .unwrap_or_else(|| panic!("no DEBUG2 control-segment line captured: {log:?}"));
+    assert!(line.ends_with(" (2776 bytes)"), "{line}");
+}
+
+// dsm.c:320 dsm_cleanup_for_mmap: every "mmap.*" entry is unlinked (DEBUG2
+// 'removing file "<dir>/<name>"'), other entries stay; a directory that
+// cannot be opened is errcode_for_file_access "could not open directory".
+#[test]
+fn mmap_cleanup_unlinks_only_mmap_files() {
+    let _g = bringup();
+    let dir = std::env::temp_dir().join(format!("pgrust_dsm_mmap_cleanup_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("mmap.123"), b"leftover").unwrap();
+    std::fs::write(dir.join("mmap.7"), b"leftover").unwrap();
+    std::fs::write(dir.join("other.txt"), b"junk").unwrap();
+    let dirname = dir.to_str().unwrap().to_string();
+    // fd's AllocateDir records the allocating subtransaction.
+    xact_seams::get_current_sub_transaction_id::set(|| 1);
+    cleanup_mmap_dir(&dirname).unwrap();
+    assert!(!dir.join("mmap.123").exists());
+    assert!(!dir.join("mmap.7").exists());
+    assert!(dir.join("other.txt").exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+    let err = cleanup_mmap_dir(&dirname).unwrap_err();
+    assert_eq!(
+        err.message,
+        format!("could not open directory \"{dirname}\": No such file or directory")
+    );
+    assert_eq!(err.sqlstate, types_error::ERRCODE_UNDEFINED_FILE);
+}

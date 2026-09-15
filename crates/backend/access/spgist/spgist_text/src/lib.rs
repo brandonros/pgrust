@@ -1,0 +1,698 @@
+//! spgtextproc.c: radix tree (compressed trie) over text — the text_ops
+//! SP-GiST opclass.
+#![allow(non_snake_case)]
+#![allow(non_upper_case_globals)]
+
+use ::datum::Datum;
+use ::mcx::Mcx;
+use ::types_core::{Oid, BLCKSZ};
+use ::types_error::{PgError, PgResult};
+use ::types_fmgr::{FmgrBuiltin, FmgrInfo, FunctionCallInfoBaseData as Fcinfo};
+use ::types_spgist::state::{
+    spgChooseIn, spgChooseOut, spgInnerConsistentIn, spgInnerConsistentOut, spgLeafConsistentIn,
+    spgLeafConsistentOut, spgPickSplitIn, spgPickSplitOut,
+};
+use ::types_spgist::spgConfigOut;
+
+const TEXTOID: Oid = 25;
+const INT2OID: Oid = 21;
+const VARHDRSZ: usize = 4;
+const VARHDRSZ_SHORT: usize = 1;
+const VARATT_SHORT_MAX: usize = 0x7F;
+
+const SPGIST_MAX_PREFIX_LENGTH: usize = {
+    let v = BLCKSZ as isize - 258 * 16 - 100;
+    if v > 32 { v as usize } else { 32 }
+};
+
+const SPG_STRATEGY_ADDITION: u16 = 10;
+const RTPrefixStrategyNumber: u16 = 28;
+const BTLessStrategyNumber: u16 = 1;
+const BTLessEqualStrategyNumber: u16 = 2;
+const BTEqualStrategyNumber: u16 = 3;
+const BTGreaterEqualStrategyNumber: u16 = 4;
+const BTGreaterStrategyNumber: u16 = 5;
+
+#[inline]
+fn is_collation_aware(strategy: u16) -> bool {
+    strategy > SPG_STRATEGY_ADDITION && strategy != RTPrefixStrategyNumber
+}
+
+#[track_caller]
+#[cold]
+fn unrecognized_strategy(strategy: u16) -> Box<PgError> {
+    Box::new(PgError::error(format!(
+        "unrecognized strategy number: {strategy}"
+    )))
+}
+
+// VARDATA_ANY/VARSIZE_ANY_EXHDR over an untoasted (possibly short) text datum.
+// Only for datums this opclass itself formed (reconstructed values), which are
+// never toasted or compressed. Everything that arrives from the outside goes
+// through text_bytes_pp below, mirroring C's DatumGetTextPP.
+// SAFETY: datum points at a live, untoasted varlena (opclass protocol).
+unsafe fn text_bytes<'a>(d: Datum) -> &'a [u8] {
+    let p = d.as_usize() as *const u8;
+    if ::types_tuple::varatt::varatt_is_1b(p) {
+        let len = ::types_tuple::varatt::varsize_1b(p);
+        core::slice::from_raw_parts(p.add(VARHDRSZ_SHORT), len - VARHDRSZ_SHORT)
+    } else {
+        let len = ::types_tuple::varatt::varsize_4b(p);
+        core::slice::from_raw_parts(p.add(VARHDRSZ), len - VARHDRSZ)
+    }
+}
+
+// DatumGetTextPP: the datum may be toasted or inline-compressed — e.g.
+// spgChooseIn.datum is the raw column value during build/insert (spgdoinsert
+// passes datums[spgKeyColumn] through untouched, and FormIndexDatum does not
+// guarantee an untoasted value), and scankey arguments are arbitrary query
+// datums. C detoasts at every read site via pg_detoast_datum_packed and reads
+// with VARDATA_ANY; mirror that exactly. Short-header values are read in
+// place; compressed/external values are detoasted into `mcx` (per-call temp
+// context, outlives all uses within the support-function call).
+// SAFETY: datum points at a live varlena image (fmgr protocol).
+unsafe fn text_bytes_pp<'m>(mcx: Mcx<'m>, d: Datum) -> PgResult<&'m [u8]> {
+    let p = d.as_usize() as *const u8;
+    let b0 = *p;
+    if b0 == 0x01 || (b0 & 0x03) == 0x02 {
+        // external toast pointer or inline-compressed: detoast
+        let total = ::types_tuple::varatt::varsize_any(p);
+        let image = core::slice::from_raw_parts(p, total);
+        let v = ::detoast_seams::detoast_attr::call(mcx, image)?;
+        let ptr = v.as_ptr();
+        let len = v.len();
+        core::mem::forget(v); // arena-owned; lives as long as mcx
+        debug_assert!(len >= VARHDRSZ);
+        return Ok(core::slice::from_raw_parts(ptr.add(VARHDRSZ), len - VARHDRSZ));
+    }
+    // plain 1B- or 4B-header value: read in place. The bytes live at least as
+    // long as the datum (page item or arena allocation), which outlives the
+    // support-function call; 'm is the per-call context so this is sound.
+    Ok(text_bytes(d))
+}
+
+// formTextDatum: short header when possible, allocated in `mcx` (arena-owned).
+fn form_text_datum(mcx: Mcx<'_>, data: &[u8]) -> PgResult<Datum> {
+    let datalen = data.len();
+    let (total, hdr) = if datalen + VARHDRSZ_SHORT <= VARATT_SHORT_MAX {
+        (datalen + VARHDRSZ_SHORT, VARHDRSZ_SHORT)
+    } else {
+        (datalen + VARHDRSZ, VARHDRSZ)
+    };
+    let mut buf: ::mcx::PgVec<'_, u8> = ::mcx::vec_with_capacity_in(mcx, total.max(VARHDRSZ))?;
+    if hdr == VARHDRSZ_SHORT {
+        buf.push(((total << 1) | 1) as u8);
+    } else {
+        buf.extend_from_slice(&((total << 2) as u32).to_ne_bytes());
+    }
+    buf.extend_from_slice(data);
+    let p = buf.as_ptr() as usize;
+    core::mem::forget(buf);
+    Ok(Datum::from_usize(p))
+}
+
+// 4B-header text in `mcx` with uninitialized-then-filled body; returns the
+// datum and a raw pointer to the data area.
+fn form_text_4b(mcx: Mcx<'_>, len: usize) -> PgResult<(Datum, *mut u8)> {
+    let total = len + VARHDRSZ;
+    let mut buf: ::mcx::PgVec<'_, u8> = ::mcx::vec_with_capacity_in(mcx, total)?;
+    buf.extend_from_slice(&((total << 2) as u32).to_ne_bytes());
+    buf.resize(total, 0);
+    let p = buf.as_mut_ptr();
+    core::mem::forget(buf);
+    // SAFETY: arena-owned allocation of `total` bytes.
+    Ok((Datum::from_usize(p as usize), unsafe { p.add(VARHDRSZ) }))
+}
+
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+// searchChar: binary search over int16 label datums.
+// SAFETY: labels points at n live datums (opclass protocol).
+unsafe fn search_char(labels: *const Datum, n: i32, c: i16) -> (bool, i32) {
+    let mut lo = 0i32;
+    let mut hi = n;
+    while lo < hi {
+        let mid = (lo + hi) >> 1;
+        let middle = (*labels.add(mid as usize)).as_i16();
+        if c < middle {
+            hi = mid;
+        } else if c > middle {
+            lo = mid + 1;
+        } else {
+            return (true, mid);
+        }
+    }
+    (false, hi)
+}
+
+pub fn spg_text_config(_cfgin: &::types_spgist::spgConfigIn, cfg: &mut spgConfigOut) {
+    cfg.prefixType = TEXTOID;
+    cfg.labelType = INT2OID;
+    cfg.canReturnData = true;
+    cfg.longValuesOK = true;
+}
+
+fn fc_spg_text_config(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: spgist opclass fmgr protocol — args are live in/out structs.
+    let cfgin = unsafe { &*(fcinfo.arg(0).as_usize() as *const ::types_spgist::spgConfigIn) };
+    let cfg = unsafe { &mut *(fcinfo.arg(1).as_usize() as *mut spgConfigOut) };
+    spg_text_config(cfgin, cfg);
+    Ok(Datum::null())
+}
+
+fn fc_spg_text_choose(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: spgist opclass fmgr protocol.
+    let input = unsafe { &*(fcinfo.arg(0).as_usize() as *const spgChooseIn) };
+    let out = unsafe { &mut *(fcinfo.arg(1).as_usize() as *mut spgChooseOut) };
+    let mcx = fcinfo.result_mcx();
+
+    // SAFETY: live text datum; may be toasted/compressed (C: DatumGetTextPP).
+    let in_str = unsafe { text_bytes_pp(mcx, input.datum) }?;
+    let in_size = in_str.len();
+    let level = input.level as usize;
+
+    let mut common_len = 0usize;
+    #[allow(unused_assignments)] // C-parity dead initializer (spgtextproc.c:194)
+    let mut node_char: i16 = 0;
+
+    if input.hasPrefix {
+        // SAFETY: prefix datum is a live text value (C: DatumGetTextPP).
+        let prefix = unsafe { text_bytes_pp(mcx, input.prefixDatum) }?;
+        common_len = common_prefix(&in_str[level..], prefix);
+
+        if common_len == prefix.len() {
+            node_char = if in_size - level > common_len {
+                in_str[level + common_len] as i16
+            } else {
+                -1
+            };
+        } else {
+            // incoming value doesn't match prefix: split
+            let prefix_has_prefix = common_len != 0;
+            let prefix_prefix = if prefix_has_prefix {
+                form_text_datum(mcx, &prefix[..common_len])?
+            } else {
+                Datum::null()
+            };
+            let mut labels: ::mcx::PgVec<'_, Datum> = ::mcx::vec_with_capacity_in(mcx, 1)?;
+            labels.push(Datum::from_i16(prefix[common_len] as i16));
+            let labels_ptr = labels.as_ptr();
+            core::mem::forget(labels);
+
+            let postfix_has_prefix = prefix.len() - common_len != 1;
+            let postfix_prefix = if postfix_has_prefix {
+                form_text_datum(mcx, &prefix[common_len + 1..])?
+            } else {
+                Datum::null()
+            };
+
+            *out = spgChooseOut::SplitTuple {
+                prefixHasPrefix: prefix_has_prefix,
+                prefixPrefixDatum: prefix_prefix,
+                prefixNNodes: 1,
+                prefixNodeLabels: labels_ptr,
+                childNodeN: 0,
+                postfixHasPrefix: postfix_has_prefix,
+                postfixPrefixDatum: postfix_prefix,
+            };
+            return Ok(Datum::null());
+        }
+    } else if in_size > level {
+        node_char = in_str[level] as i16;
+    } else {
+        node_char = -1;
+    }
+
+    // SAFETY: nodeLabels live per protocol (null only when nNodes == 0,
+    // which searchChar handles by returning (false, 0)).
+    let (found, i) = unsafe { search_char(input.nodeLabels, input.nNodes, node_char) };
+    if found {
+        let mut level_add = common_len as i32;
+        if node_char >= 0 {
+            level_add += 1;
+        }
+        let rest = if in_size as i32 - input.level - level_add > 0 {
+            form_text_datum(mcx, &in_str[level + level_add as usize..])?
+        } else {
+            form_text_datum(mcx, &[])?
+        };
+        *out = spgChooseOut::MatchNode {
+            nodeN: i,
+            levelAdd: level_add,
+            restDatum: rest,
+        };
+    } else if input.allTheSame {
+        let mut labels: ::mcx::PgVec<'_, Datum> = ::mcx::vec_with_capacity_in(mcx, 1)?;
+        labels.push(Datum::from_i16(-2));
+        let labels_ptr = labels.as_ptr();
+        core::mem::forget(labels);
+        *out = spgChooseOut::SplitTuple {
+            prefixHasPrefix: input.hasPrefix,
+            prefixPrefixDatum: input.prefixDatum,
+            prefixNNodes: 1,
+            prefixNodeLabels: labels_ptr,
+            childNodeN: 0,
+            postfixHasPrefix: false,
+            postfixPrefixDatum: Datum::null(),
+        };
+    } else {
+        *out = spgChooseOut::AddNode {
+            nodeLabel: Datum::from_i16(node_char),
+            nodeN: i,
+        };
+    }
+    Ok(Datum::null())
+}
+
+#[derive(Clone, Copy)]
+struct SpgNodePtr<'a> {
+    t: &'a [u8],
+    i: i32,
+    c: i16,
+}
+
+fn fc_spg_text_picksplit(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: spgist opclass fmgr protocol.
+    let input = unsafe { &*(fcinfo.arg(0).as_usize() as *const spgPickSplitIn) };
+    let out = unsafe { &mut *(fcinfo.arg(1).as_usize() as *mut spgPickSplitOut) };
+    let mcx = fcinfo.result_mcx();
+    let n = input.nTuples as usize;
+
+    // SAFETY: nTuples datums per protocol.
+    let datums = unsafe { core::slice::from_raw_parts(input.datums, n) };
+
+    // Open every input datum once, DatumGetTextPP-style (C re-opens at each
+    // read site; identical bytes either way).
+    let mut texts: ::mcx::PgVec<'_, &[u8]> = ::mcx::vec_with_capacity_in(mcx, n)?;
+    for &d in datums {
+        // SAFETY: live text datums (C: DatumGetTextPP).
+        texts.push(unsafe { text_bytes_pp(mcx, d) }?);
+    }
+
+    let text0 = texts[0];
+    let mut common_len = text0.len();
+    for &ti in texts.iter().skip(1) {
+        if common_len == 0 {
+            break;
+        }
+        let tmp = common_prefix(text0, ti);
+        if tmp < common_len {
+            common_len = tmp;
+        }
+    }
+    common_len = common_len.min(SPGIST_MAX_PREFIX_LENGTH);
+
+    if common_len == 0 {
+        out.hasPrefix = false;
+    } else {
+        out.hasPrefix = true;
+        out.prefixDatum = form_text_datum(mcx, &text0[..common_len])?;
+    }
+
+    let mut nodes: ::mcx::PgVec<'_, SpgNodePtr<'_>> = ::mcx::vec_with_capacity_in(mcx, n)?;
+    for (i, &ti) in texts.iter().enumerate() {
+        let c = if common_len < ti.len() {
+            ti[common_len] as i16
+        } else {
+            -1
+        };
+        nodes.push(SpgNodePtr { t: ti, i: i as i32, c });
+    }
+
+    // pg_qsort is unstable; keys can tie, but grouping only needs the sort
+    // order of c and C's qsort on equal keys is order-unspecified too. Use a
+    // stable sort so tuple->node mapping is deterministic (matches C's
+    // practical med3 behavior for the regression corpus).
+    nodes.sort_by(|a, b| a.c.cmp(&b.c));
+
+    let mut labels: ::mcx::PgVec<'_, Datum> = ::mcx::vec_with_capacity_in(mcx, n)?;
+    let mut map: ::mcx::PgVec<'_, i32> = ::mcx::vec_with_capacity_in(mcx, n)?;
+    map.resize(n, 0);
+    let mut leaf_datums: ::mcx::PgVec<'_, Datum> = ::mcx::vec_with_capacity_in(mcx, n)?;
+    leaf_datums.resize(n, Datum::null());
+
+    let mut n_nodes = 0i32;
+    for i in 0..n {
+        let ti = nodes[i].t;
+        if i == 0 || nodes[i].c != nodes[i - 1].c {
+            labels.push(Datum::from_i16(nodes[i].c));
+            n_nodes += 1;
+        }
+        let leaf_d = if common_len < ti.len() {
+            form_text_datum(mcx, &ti[common_len + 1..])?
+        } else {
+            form_text_datum(mcx, &[])?
+        };
+        leaf_datums[nodes[i].i as usize] = leaf_d;
+        map[nodes[i].i as usize] = n_nodes - 1;
+    }
+
+    out.nNodes = n_nodes;
+    out.nodeLabels = labels.as_ptr();
+    core::mem::forget(labels);
+    out.mapTuplesToNodes = map.as_mut_ptr();
+    core::mem::forget(map);
+    out.leafTupleDatums = leaf_datums.as_ptr();
+    core::mem::forget(leaf_datums);
+
+    Ok(Datum::null())
+}
+
+fn fc_spg_text_inner_consistent(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: spgist opclass fmgr protocol.
+    let input = unsafe { &*(fcinfo.arg(0).as_usize() as *const spgInnerConsistentIn) };
+    let out = unsafe { &mut *(fcinfo.arg(1).as_usize() as *mut spgInnerConsistentOut) };
+    let mcx = fcinfo.result_mcx();
+    let collation = fcinfo.fncollation;
+
+    let collate_is_c = pg_locale::pg_newlocale_from_collation(collation)?.collate_is_c;
+
+    let level = input.level as usize;
+    // C: Assert(reconstructedValue == NULL ? in->level == 0 :
+    //           VARSIZE_ANY_EXHDR(reconstructedValue) == in->level);
+    // A non-NULL zero-length reconstruction at level 0 is legal (e.g. the
+    // dummy-labeled child of a prefix-less allTheSame root).
+    debug_assert!(if input.reconstructedValue.as_usize() == 0 {
+        level == 0
+    } else {
+        // SAFETY: long-format text emitted by this routine.
+        unsafe { text_bytes(input.reconstructedValue) }.len() == level
+    });
+
+    let mut max_reconstr_len = level + 1;
+    let prefix: &[u8] = if input.hasPrefix {
+        // SAFETY: live text prefix (C: DatumGetTextPP).
+        unsafe { text_bytes_pp(mcx, input.prefixDatum) }?
+    } else {
+        &[]
+    };
+    max_reconstr_len += prefix.len();
+
+    // reconstrText: always long-format
+    let (_reconstr_datum, reconstr_data) = form_text_4b(mcx, max_reconstr_len)?;
+    // SAFETY: max_reconstr_len writable bytes at reconstr_data.
+    let reconstr = unsafe { core::slice::from_raw_parts_mut(reconstr_data, max_reconstr_len) };
+    if level > 0 {
+        // SAFETY: reconstructedValue is a long-format text of length `level`
+        // (always emitted by this routine; C reads it with plain VARDATA).
+        let prev = unsafe { text_bytes(input.reconstructedValue) };
+        reconstr[..level].copy_from_slice(&prev[..level]);
+    }
+    if !prefix.is_empty() {
+        reconstr[level..level + prefix.len()].copy_from_slice(prefix);
+    }
+
+    let n_nodes_in = input.nNodes as usize;
+    let mut node_numbers: ::mcx::PgVec<'_, i32> = ::mcx::vec_with_capacity_in(mcx, n_nodes_in)?;
+    let mut level_adds: ::mcx::PgVec<'_, i32> = ::mcx::vec_with_capacity_in(mcx, n_nodes_in)?;
+    let mut recon_values: ::mcx::PgVec<'_, Datum> = ::mcx::vec_with_capacity_in(mcx, n_nodes_in)?;
+
+    // SAFETY: nNodes labels; scankeys nkeys entries (protocol).
+    let labels = unsafe { core::slice::from_raw_parts(input.nodeLabels, n_nodes_in) };
+    let scankeys =
+        unsafe { core::slice::from_raw_parts(input.scankeys, input.nkeys.max(0) as usize) };
+
+    for (i, &label) in labels.iter().enumerate() {
+        let node_char = label.as_i16();
+        let this_len = if node_char <= 0 {
+            max_reconstr_len - 1
+        } else {
+            reconstr[max_reconstr_len - 1] = node_char as u8;
+            max_reconstr_len
+        };
+
+        let mut res = true;
+        for key in scankeys {
+            let mut strategy = key.sk_strategy;
+            if is_collation_aware(strategy) {
+                if collate_is_c {
+                    strategy -= SPG_STRATEGY_ADDITION;
+                } else {
+                    continue;
+                }
+            }
+
+            // SAFETY: scankey argument is a live text datum, possibly
+            // toasted/compressed (C: DatumGetTextPP).
+            let in_text = unsafe { text_bytes_pp(mcx, key.sk_argument) }?;
+            let cmp_len = in_text.len().min(this_len);
+            let r = cmp_bytes(&reconstr[..cmp_len], &in_text[..cmp_len]);
+
+            res = match strategy {
+                BTLessStrategyNumber | BTLessEqualStrategyNumber => r <= 0,
+                BTEqualStrategyNumber => r == 0 && in_text.len() >= this_len,
+                BTGreaterEqualStrategyNumber | BTGreaterStrategyNumber => r >= 0,
+                RTPrefixStrategyNumber => r == 0,
+                // C (spgtextproc.c:550) reports in->scankeys[j].sk_strategy,
+                // the original number, not the SPG_STRATEGY_ADDITION-adjusted copy.
+                _ => return Err(unrecognized_strategy(key.sk_strategy)),
+            };
+            if !res {
+                break;
+            }
+        }
+
+        if res {
+            node_numbers.push(i as i32);
+            level_adds.push((this_len - level) as i32);
+            let copy = form_text_4b(mcx, this_len)?;
+            // SAFETY: this_len writable bytes at copy.1.
+            unsafe {
+                core::ptr::copy_nonoverlapping(reconstr.as_ptr(), copy.1, this_len);
+            }
+            recon_values.push(copy.0);
+        }
+    }
+
+    out.nNodes = node_numbers.len() as i32;
+    out.nodeNumbers = node_numbers.as_ptr();
+    core::mem::forget(node_numbers);
+    out.levelAdds = level_adds.as_ptr();
+    core::mem::forget(level_adds);
+    out.reconstructedValues = recon_values.as_ptr();
+    core::mem::forget(recon_values);
+
+    Ok(Datum::null())
+}
+
+#[inline]
+fn cmp_bytes(a: &[u8], b: &[u8]) -> i32 {
+    match a.cmp(b) {
+        core::cmp::Ordering::Less => -1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => 1,
+    }
+}
+
+fn fc_spg_text_leaf_consistent(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: spgist opclass fmgr protocol.
+    let input = unsafe { &*(fcinfo.arg(0).as_usize() as *const spgLeafConsistentIn) };
+    let out = unsafe { &mut *(fcinfo.arg(1).as_usize() as *mut spgLeafConsistentOut) };
+    let mcx = fcinfo.result_mcx();
+    let collation = fcinfo.fncollation;
+    let level = input.level as usize;
+
+    out.recheck = false;
+
+    // SAFETY: live leaf text (C: DatumGetTextPP; page-stored leaves are never
+    // compressed, but keep the PP read for exact parity).
+    let leaf = unsafe { text_bytes_pp(mcx, input.leafDatum) }?;
+
+    let reconstr: &[u8] = if input.reconstructedValue.as_usize() != 0 {
+        // SAFETY: long-format reconstructed text (C reads with plain VARDATA).
+        unsafe { text_bytes(input.reconstructedValue) }
+    } else {
+        &[]
+    };
+    debug_assert!(reconstr.len() == level);
+
+    let full_len = level + leaf.len();
+    let full_value: &[u8];
+    if leaf.is_empty() && level > 0 {
+        full_value = reconstr;
+        out.leafValue = input.reconstructedValue;
+    } else {
+        let (d, p) = form_text_4b(mcx, full_len)?;
+        // SAFETY: full_len writable bytes at p.
+        unsafe {
+            if level > 0 {
+                core::ptr::copy_nonoverlapping(reconstr.as_ptr(), p, level);
+            }
+            if !leaf.is_empty() {
+                core::ptr::copy_nonoverlapping(leaf.as_ptr(), p.add(level), leaf.len());
+            }
+            full_value = core::slice::from_raw_parts(p, full_len);
+        }
+        out.leafValue = d;
+    }
+
+    // SAFETY: nkeys scankeys (protocol).
+    let scankeys =
+        unsafe { core::slice::from_raw_parts(input.scankeys, input.nkeys.max(0) as usize) };
+
+    let mut res = true;
+    for key in scankeys {
+        let mut strategy = key.sk_strategy;
+        // SAFETY: live query text datum, possibly toasted/compressed
+        // (C: DatumGetTextPP).
+        let query = unsafe { text_bytes_pp(mcx, key.sk_argument) }?;
+
+        if strategy == RTPrefixStrategyNumber {
+            // C: DirectFunctionCall2Coll(text_starts_with, ...) — which raises
+            // the 0A000 "nondeterministic collations are not supported for
+            // substring searches" error itself (varlena.c) before comparing.
+            res = level >= query.len()
+                || varlena::text_starts_with(full_value, query, collation)?;
+            if !res {
+                break;
+            }
+            continue;
+        }
+
+        let r = if is_collation_aware(strategy) {
+            strategy -= SPG_STRATEGY_ADDITION;
+            varlena::varstr_cmp(full_value, query, collation)?
+        } else {
+            let n = query.len().min(full_value.len());
+            let mut r = cmp_bytes(&full_value[..n], &query[..n]);
+            if r == 0 {
+                if query.len() > full_value.len() {
+                    r = -1;
+                } else if query.len() < full_value.len() {
+                    r = 1;
+                }
+            }
+            r
+        };
+
+        res = match strategy {
+            BTLessStrategyNumber => r < 0,
+            BTLessEqualStrategyNumber => r <= 0,
+            BTEqualStrategyNumber => r == 0,
+            BTGreaterEqualStrategyNumber => r >= 0,
+            BTGreaterStrategyNumber => r > 0,
+            // C (spgtextproc.c:690): the original sk_strategy, as above.
+            _ => return Err(unrecognized_strategy(key.sk_strategy)),
+        };
+        if !res {
+            break;
+        }
+    }
+
+    Ok(Datum::from_bool(res))
+}
+
+const fn b(foid: Oid, name: &'static str, nargs: i16, func: ::types_fmgr::PGFunction) -> FmgrBuiltin {
+    FmgrBuiltin {
+        foid,
+        name,
+        nargs,
+        strict: true,
+        retset: false,
+        func,
+    }
+}
+
+pub const SPGIST_TEXT_BUILTINS: &[FmgrBuiltin] = &[
+    b(334, "spghandler", 1, ::types_fmgr::fc_am_handler_stub),
+    b(4027, "spg_text_config", 2, fc_spg_text_config),
+    b(4028, "spg_text_choose", 2, fc_spg_text_choose),
+    b(4029, "spg_text_picksplit", 2, fc_spg_text_picksplit),
+    b(4030, "spg_text_inner_consistent", 2, fc_spg_text_inner_consistent),
+    b(4031, "spg_text_leaf_consistent", 2, fc_spg_text_leaf_consistent),
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::types_core::C_COLLATION_OID;
+    use ::types_scan::ScanKeyData;
+
+    fn scankey(strategy: u16, arg: Datum) -> ScanKeyData {
+        ScanKeyData {
+            sk_flags: 0,
+            sk_attno: 1,
+            sk_strategy: strategy,
+            sk_subtype: 0,
+            sk_collation: C_COLLATION_OID,
+            sk_func: FmgrInfo::new(fc_spg_text_config, 0, 2, true, false),
+            sk_argument: arg,
+        }
+    }
+
+    // spgtextproc.c:550: the switch runs on a local copy with
+    // SPG_STRATEGY_ADDITION subtracted, but the default arm reports
+    // `in->scankeys[j].sk_strategy` — the ORIGINAL number (16), not the
+    // decremented 6 (audit row spgtextproc-27ed5e5b). C collation makes the
+    // collation-aware strategy take the subtracting path.
+    #[test]
+    fn inner_consistent_reports_the_original_strategy_number() {
+        let ctx = ::mcx::MemoryContext::new("spgist_text inner_consistent test");
+        let mcx = ctx.mcx();
+        let query = form_text_datum(mcx, b"k").unwrap();
+        let keys = [scankey(16, query)];
+        let labels = [Datum::from_i16(b'k' as i16)];
+        let input = spgInnerConsistentIn {
+            scankeys: keys.as_ptr(),
+            orderbys: core::ptr::null(),
+            nkeys: 1,
+            norderbys: 0,
+            reconstructedValue: Datum::from_usize(0),
+            traversalValue: 0,
+            traversalMemoryContext: mcx,
+            level: 0,
+            returnData: false,
+            allTheSame: false,
+            hasPrefix: false,
+            prefixDatum: Datum::from_usize(0),
+            nNodes: 1,
+            nodeLabels: labels.as_ptr(),
+        };
+        let mut out = spgInnerConsistentOut::default();
+        let mut frame: ::types_fmgr::LocalFcinfo<2> = ::types_fmgr::LocalFcinfo::fresh(C_COLLATION_OID);
+        // SAFETY: ctx outlives the call.
+        unsafe { frame.set_result_mcx(mcx) };
+        frame.set_arg(0, Datum::from_usize(&input as *const spgInnerConsistentIn as usize));
+        frame.set_arg(1, Datum::from_usize(&mut out as *mut spgInnerConsistentOut as usize));
+        let err = fc_spg_text_inner_consistent(None, &mut frame).unwrap_err();
+        assert_eq!(err.message(), "unrecognized strategy number: 16");
+        assert_eq!(err.sqlstate(), ::types_error::ERRCODE_INTERNAL_ERROR);
+    }
+
+    // spgtextproc.c:690: same contract on the leaf side.
+    #[test]
+    fn leaf_consistent_reports_the_original_strategy_number() {
+        let ctx = ::mcx::MemoryContext::new("spgist_text leaf_consistent test");
+        let mcx = ctx.mcx();
+        let query = form_text_datum(mcx, b"k5").unwrap();
+        let leaf = form_text_datum(mcx, b"k5").unwrap();
+        let keys = [scankey(16, query)];
+        let input = spgLeafConsistentIn {
+            scankeys: keys.as_ptr(),
+            orderbys: core::ptr::null(),
+            nkeys: 1,
+            norderbys: 0,
+            reconstructedValue: Datum::from_usize(0),
+            traversalValue: 0,
+            level: 0,
+            returnData: false,
+            leafDatum: leaf,
+        };
+        let mut out = spgLeafConsistentOut::default();
+        let mut frame: ::types_fmgr::LocalFcinfo<2> = ::types_fmgr::LocalFcinfo::fresh(C_COLLATION_OID);
+        // SAFETY: ctx outlives the call.
+        unsafe { frame.set_result_mcx(mcx) };
+        frame.set_arg(0, Datum::from_usize(&input as *const spgLeafConsistentIn as usize));
+        frame.set_arg(1, Datum::from_usize(&mut out as *mut spgLeafConsistentOut as usize));
+        let err = fc_spg_text_leaf_consistent(None, &mut frame).unwrap_err();
+        assert_eq!(err.message(), "unrecognized strategy number: 16");
+        assert_eq!(err.sqlstate(), ::types_error::ERRCODE_INTERNAL_ERROR);
+    }
+}

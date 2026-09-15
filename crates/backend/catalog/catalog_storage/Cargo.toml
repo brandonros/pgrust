@@ -1,0 +1,43 @@
+[package]
+name = "catalog_storage"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+mcx = { path = "../../../_support/mcx" }
+types_core = { path = "../../../_support/types/types_core" }
+types_error = { path = "../../../_support/types/types_error" }
+types_storage = { path = "../../../_support/types/types_storage" }
+smgr = { path = "../../storage/smgr/smgr" }
+bulkwrite = { path = "../../storage/smgr/bulkwrite" }
+bufmgr = { path = "../../storage/buffer/bufmgr" }
+pgstat = { path = "../../utils/activity/pgstat" }
+init_small = { path = "../../utils/init/init_small" }
+postgres_seams = { path = "../../tcop/postgres_seams" }
+types_rel = { path = "../../../_support/types/rel" }
+xact = { path = "../../access/transam/xact" }
+transam_xlog = { path = "../../access/transam/transam_xlog" }
+xloginsert_seams = { path = "../../access/transam/xloginsert_seams" }
+catalog_storage_seams = { path = "../storage_seams" }
+storage_xlog = { path = "../storage_xlog" }
+xloginsert = { path = "../../access/transam/xloginsert" }
+xlogutils = { path = "../../access/transam/xlogutils" }
+guc_tables = { path = "../../utils/misc/guc_tables" }
+visibilitymap = { path = "../../access/heap/visibilitymap" }
+freespace = { path = "../../storage/freespace/freespace" }
+lmgr_proc = { path = "../../storage/lmgr/lmgr_proc" }
+elog = { path = "../../utils/error/elog" }
+
+[dev-dependencies]
+fd = { path = "../../storage/file/fd" }
+xact_seams = { path = "../../access/transam/xact_seams" }
+aio_seams = { path = "../../storage/aio/aio_seams" }
+waitevent_seams = { path = "../../utils/activity/waitevent_seams" }
+pgstat_seams = { path = "../../utils/activity/pgstat_seams" }
+relpath_seams = { path = "../../../common/relpath_seams" }
+sync_seams = { path = "../../storage/sync/sync_seams" }
+tablespace_seams = { path = "../../commands/tablespace_seams" }
+pg_sema_seams = { path = "../../port/pg_sema_seams" }

@@ -1,0 +1,992 @@
+-- pgrust-fast M1/M2 differential-regress corpus.
+-- Curated from PostgreSQL 18.3 src/test/regress idioms (select, int4, text,
+-- errors, guc, prepare, transactions, limit) down to the M1 surface:
+-- constants through the tcop/parse/analyze/plan/execute/printtup spine.
+-- Run via scripts/regress-diff.sh (psql -X -q -a on stdin; VERBOSITY verbose
+-- captures SQLSTATE + message + cursor; LOCATION lines stripped by the
+-- harness). Statements after the '-- REQUIRES: table' marker need CREATE
+-- TABLE/INSERT; gate with --skip-tables until DML lands.
+\set VERBOSITY verbose
+\pset pager off
+-- ===== constants & arithmetic [tcop simple-query -> parser -> analyze -> planner Result -> execExpr -> printtup] =====
+SELECT 1;
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT 1 + 2;
+ ?column? 
+----------
+        3
+(1 row)
+
+SELECT 2 * 3 - 4;
+ ?column? 
+----------
+        2
+(1 row)
+
+SELECT 7 / 2;
+ ?column? 
+----------
+        3
+(1 row)
+
+SELECT 7 % 3;
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT -5;
+ ?column? 
+----------
+       -5
+(1 row)
+
+SELECT 1.1 + 2.2;
+ ?column? 
+----------
+      3.3
+(1 row)
+
+SELECT 2 ^ 10;
+ ?column? 
+----------
+     1024
+(1 row)
+
+SELECT 'foo' || 'bar';
+ ?column? 
+----------
+ foobar
+(1 row)
+
+SELECT NULL;
+ ?column? 
+----------
+ 
+(1 row)
+
+SELECT NULL + 1;
+ ?column? 
+----------
+         
+(1 row)
+
+SELECT 1 = 1, 1 <> 2, 1 < 2, 2 >= 2;
+ ?column? | ?column? | ?column? | ?column? 
+----------+----------+----------+----------
+ t        | t        | t        | t
+(1 row)
+
+SELECT true AND false, true OR false, NOT true;
+ ?column? | ?column? | ?column? 
+----------+----------+----------
+ f        | t        | f
+(1 row)
+
+SELECT coalesce(NULL, 42);
+ coalesce 
+----------
+       42
+(1 row)
+
+SELECT greatest(1, 2, 3), least(1, 2, 3);
+ greatest | least 
+----------+-------
+        3 |     1
+(1 row)
+
+SELECT CASE WHEN 1 < 2 THEN 'lt' ELSE 'ge' END;
+ case 
+------
+ lt
+(1 row)
+
+SELECT length('postgres');
+ length 
+--------
+      8
+(1 row)
+
+SELECT upper('abc'), lower('ABC');
+ upper | lower 
+-------+-------
+ ABC   | abc
+(1 row)
+
+-- ===== column aliases [analyze target-list naming; commit "Add column alias (AS) support"] =====
+SELECT 1 AS one;
+ one 
+-----
+   1
+(1 row)
+
+SELECT 1 one;
+ one 
+-----
+   1
+(1 row)
+
+SELECT 1 AS "Quoted Alias";
+ Quoted Alias 
+--------------
+            1
+(1 row)
+
+SELECT 1 + 2 AS sum, 3 * 4 AS product;
+ sum | product 
+-----+---------
+   3 |      12
+(1 row)
+
+-- ===== casts [parse_coerce + I/O functions (types-* lanes)] =====
+SELECT 'x'::text;
+ text 
+------
+ x
+(1 row)
+
+SELECT CAST('42' AS integer);
+ int4 
+------
+   42
+(1 row)
+
+SELECT 42::bigint;
+ int8 
+------
+   42
+(1 row)
+
+SELECT 42::int2;
+ int2 
+------
+   42
+(1 row)
+
+SELECT 1.5::float8;
+ float8 
+--------
+    1.5
+(1 row)
+
+SELECT '3.14'::numeric;
+ numeric 
+---------
+    3.14
+(1 row)
+
+SELECT 42::text;
+ text 
+------
+ 42
+(1 row)
+
+SELECT 't'::bool, 'f'::boolean;
+ bool | bool 
+------+------
+ t    | f
+(1 row)
+
+SELECT CAST(1.4 AS int4), CAST(1.5 AS int4);
+ int4 | int4 
+------+------
+    1 |    2
+(1 row)
+
+SELECT '  7  '::int4;
+ int4 
+------
+    7
+(1 row)
+
+-- ===== SET/SHOW round-trips [guc lane: set_config_option / GetConfigOptionByName] =====
+SHOW work_mem;
+ work_mem 
+----------
+ 4MB
+(1 row)
+
+SET work_mem = '8MB';
+SHOW work_mem;
+ work_mem 
+----------
+ 8MB
+(1 row)
+
+RESET work_mem;
+SHOW work_mem;
+ work_mem 
+----------
+ 4MB
+(1 row)
+
+SET datestyle = 'ISO, YMD';
+SHOW datestyle;
+ DateStyle 
+-----------
+ ISO, YMD
+(1 row)
+
+RESET datestyle;
+SET search_path TO public;
+SHOW search_path;
+ search_path 
+-------------
+ public
+(1 row)
+
+BEGIN;
+SET LOCAL work_mem = '16MB';
+SHOW work_mem;
+ work_mem 
+----------
+ 16MB
+(1 row)
+
+COMMIT;
+SHOW work_mem;
+ work_mem 
+----------
+ 4MB
+(1 row)
+
+-- ===== EXPLAIN [planner + commands/explain lane; costs pinned by C's cost model] =====
+EXPLAIN (COSTS OFF) SELECT 1;
+ QUERY PLAN 
+------------
+ Result
+(1 row)
+
+EXPLAIN SELECT 1;
+                QUERY PLAN                
+------------------------------------------
+ Result  (cost=0.00..0.01 rows=1 width=4)
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT 1 + 2 AS three;
+ QUERY PLAN 
+------------
+ Result
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT 1 ORDER BY 1;
+ QUERY PLAN 
+------------
+ Result
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT 1 LIMIT 1;
+  QUERY PLAN  
+--------------
+ Limit
+   ->  Result
+(2 rows)
+
+EXPLAIN (VERBOSE, COSTS OFF) SELECT 1 AS one;
+ QUERY PLAN  
+-------------
+ Result
+   Output: 1
+(2 rows)
+
+-- ===== EXPLAIN ANALYZE [instrument lane; TIMING/SUMMARY/BUFFERS OFF for determinism] =====
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF) SELECT 1;
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Result  (cost=0.00..0.01 rows=1 width=4) (actual rows=1.00 loops=1)
+(1 row)
+
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF, COSTS OFF) SELECT 1;
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF, COSTS OFF) SELECT 1 LIMIT 0;
+            QUERY PLAN            
+----------------------------------
+ Limit (actual rows=0.00 loops=1)
+   ->  Result (never executed)
+(2 rows)
+
+-- ===== transactions [xact lane: BEGIN/COMMIT/ROLLBACK/SAVEPOINT state machine] =====
+BEGIN;
+SELECT 1;
+ ?column? 
+----------
+        1
+(1 row)
+
+COMMIT;
+BEGIN;
+SELECT 2;
+ ?column? 
+----------
+        2
+(1 row)
+
+ROLLBACK;
+BEGIN;
+SAVEPOINT sp1;
+SELECT 3;
+ ?column? 
+----------
+        3
+(1 row)
+
+ROLLBACK TO SAVEPOINT sp1;
+RELEASE SAVEPOINT sp1;
+COMMIT;
+COMMIT;
+WARNING:  25P01: there is no transaction in progress
+BEGIN;
+SELECT 1/0;
+ERROR:  22012: division by zero
+SELECT 1;
+ERROR:  25P02: current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK;
+BEGIN;
+SAVEPOINT sp2;
+SELECT 1/0;
+ERROR:  22012: division by zero
+ROLLBACK TO SAVEPOINT sp2;
+SELECT 42;
+ ?column? 
+----------
+       42
+(1 row)
+
+COMMIT;
+ROLLBACK TO SAVEPOINT nope;
+ERROR:  25P01: ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+-- ===== PREPARE/EXECUTE/DEALLOCATE [commands/prepare + plancache lane] =====
+PREPARE regress_m1_p1 AS SELECT 1;
+EXECUTE regress_m1_p1;
+ ?column? 
+----------
+        1
+(1 row)
+
+PREPARE regress_m1_p2(int) AS SELECT $1 + 1;
+EXECUTE regress_m1_p2(41);
+ ?column? 
+----------
+       42
+(1 row)
+
+EXECUTE regress_m1_p2('not_an_int');
+ERROR:  22P02: invalid input syntax for type integer: "not_an_int"
+LINE 1: EXECUTE regress_m1_p2('not_an_int');
+                              ^
+PREPARE regress_m1_p1 AS SELECT 2;
+ERROR:  42P05: prepared statement "regress_m1_p1" already exists
+DEALLOCATE regress_m1_p2;
+EXECUTE regress_m1_p2(1);
+ERROR:  26000: prepared statement "regress_m1_p2" does not exist
+DEALLOCATE regress_m1_p1;
+DEALLOCATE ALL;
+-- ===== ORDER BY / LIMIT on constants [sort/limit executor nodes over Result/Values] =====
+SELECT 1 ORDER BY 1;
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT 1 LIMIT 1;
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT 1 LIMIT 0;
+ ?column? 
+----------
+(0 rows)
+
+SELECT 1 OFFSET 1;
+ ?column? 
+----------
+(0 rows)
+
+VALUES (3), (1), (2) ORDER BY 1;
+ column1 
+---------
+       1
+       2
+       3
+(3 rows)
+
+VALUES (3), (1), (2) ORDER BY 1 DESC LIMIT 2;
+ column1 
+---------
+       3
+       2
+(2 rows)
+
+SELECT * FROM (VALUES (2, 'b'), (1, 'a')) AS v(n, s) ORDER BY n;
+ n | s 
+---+---
+ 1 | a
+ 2 | b
+(2 rows)
+
+-- ===== error surface [elog lane: SQLSTATE + message + cursor position parity] =====
+SELECT nonesuch;
+ERROR:  42703: column "nonesuch" does not exist
+LINE 1: SELECT nonesuch;
+               ^
+SELECT 1 +;
+ERROR:  42601: syntax error at or near ";"
+LINE 1: SELECT 1 +;
+                  ^
+SELECT 1/0;
+ERROR:  22012: division by zero
+SELECT 'foo'::int4;
+ERROR:  22P02: invalid input syntax for type integer: "foo"
+LINE 1: SELECT 'foo'::int4;
+               ^
+SELECT ''::int4;
+ERROR:  22P02: invalid input syntax for type integer: ""
+LINE 1: SELECT ''::int4;
+               ^
+SELECT 2147483647::int4 + 1;
+ERROR:  22003: integer out of range
+SHOW no_such_parameter;
+ERROR:  42704: unrecognized configuration parameter "no_such_parameter"
+SET work_mem = 'bogus';
+ERROR:  22023: invalid value for parameter "work_mem": "bogus"
+-- REQUIRES: table
+-- ===== point select / star / WHERE [heapam + seqscan executor; setup needs DML — gate with --skip-tables until INSERT lands] =====
+CREATE TABLE regress_m1_t (id int4, val text);
+INSERT INTO regress_m1_t VALUES (1, 'one'), (2, 'two'), (3, 'three');
+SELECT * FROM regress_m1_t ORDER BY id;
+ id |  val  
+----+-------
+  1 | one
+  2 | two
+  3 | three
+(3 rows)
+
+SELECT val FROM regress_m1_t WHERE id = 2;
+ val 
+-----
+ two
+(1 row)
+
+SELECT id, val FROM regress_m1_t WHERE id > 1 ORDER BY id DESC;
+ id |  val  
+----+-------
+  3 | three
+  2 | two
+(2 rows)
+
+SELECT * FROM regress_m1_t WHERE id = 2 LIMIT 1;
+ id | val 
+----+-----
+  2 | two
+(1 row)
+
+SELECT count(*) FROM regress_m1_t;
+ count 
+-------
+     3
+(1 row)
+
+SELECT vall FROM regress_m1_t;
+ERROR:  42703: column "vall" does not exist
+LINE 1: SELECT vall FROM regress_m1_t;
+               ^
+HINT:  Perhaps you meant to reference the column "regress_m1_t.val".
+SELECT * FROM no_such_table;
+ERROR:  42P01: relation "no_such_table" does not exist
+LINE 1: SELECT * FROM no_such_table;
+                      ^
+DROP TABLE regress_m1_t;
+-- ===== jsonb core [adt_jsonb: in/out, JEntry tree, operators, cmp/hash] =====
+SELECT '{"b": 2, "a": 1, "a": 3}'::jsonb;
+      jsonb       
+------------------
+ {"a": 3, "b": 2}
+(1 row)
+
+SELECT '{"key": [1, 2.50, null, "x"], "nested": {"deep": [true, false]}}'::jsonb;
+                              jsonb                               
+------------------------------------------------------------------
+ {"key": [1, 2.50, null, "x"], "nested": {"deep": [true, false]}}
+(1 row)
+
+SELECT '[1e2, 0.5, "\u00e9\ud83d\ude00", ""]'::jsonb;
+         jsonb         
+-----------------------
+ [100, 0.5, "é😀", ""]
+(1 row)
+
+SELECT '-1.50'::jsonb::text;
+ text  
+-------
+ -1.50
+(1 row)
+
+SELECT jsonb_typeof('{"a":1}'::jsonb), jsonb_typeof('[1]'::jsonb), jsonb_typeof('"s"'::jsonb), jsonb_typeof('1'::jsonb), jsonb_typeof('true'::jsonb), jsonb_typeof('null'::jsonb);
+ jsonb_typeof | jsonb_typeof | jsonb_typeof | jsonb_typeof | jsonb_typeof | jsonb_typeof 
+--------------+--------------+--------------+--------------+--------------+--------------
+ object       | array        | string       | number       | boolean      | null
+(1 row)
+
+SELECT '{"a": {"b": [10, 20, {"c": "d"}]}}'::jsonb -> 'a';
+          ?column?           
+-----------------------------
+ {"b": [10, 20, {"c": "d"}]}
+(1 row)
+
+SELECT '{"a": {"b": "c"}}'::jsonb ->> 'a';
+  ?column?  
+------------
+ {"b": "c"}
+(1 row)
+
+SELECT '["x", 1.50, true]'::jsonb -> 1, '["x", 1.50, true]'::jsonb ->> -1;
+ ?column? | ?column? 
+----------+----------
+ 1.50     | true
+(1 row)
+
+SELECT '["x"]'::jsonb -> 5, '{"a":1}'::jsonb -> 'zz';
+ ?column? | ?column? 
+----------+----------
+          | 
+(1 row)
+
+SELECT '{"a": {"b": [10, 20]}}'::jsonb #> '{a,b,1}', '{"a": {"b": [10, 20]}}'::jsonb #>> '{a,b,-2}';
+ ?column? | ?column? 
+----------+----------
+ 20       | 10
+(1 row)
+
+SELECT '{"a":1,"b":{"c":2}}'::jsonb @> '{"b":{"c":2}}'::jsonb, '{"a":1}'::jsonb @> '{"a":2}'::jsonb;
+ ?column? | ?column? 
+----------+----------
+ t        | f
+(1 row)
+
+SELECT '[1,[2,3]]'::jsonb @> '[[3,2]]'::jsonb, '[1,2]'::jsonb <@ '[2,1,3]'::jsonb;
+ ?column? | ?column? 
+----------+----------
+ t        | t
+(1 row)
+
+SELECT '{"a":1,"b":2}'::jsonb ? 'b', '["a","b"]'::jsonb ? 'c';
+ ?column? | ?column? 
+----------+----------
+ t        | f
+(1 row)
+
+SELECT '{"a":1,"b":2}'::jsonb ?| '{x,b}', '{"a":1,"b":2}'::jsonb ?& '{a,b}';
+ ?column? | ?column? 
+----------+----------
+ t        | t
+(1 row)
+
+SELECT '{"a":1}'::jsonb = '{"a": 1}'::jsonb, '{"a":1}'::jsonb < '{"a":1,"b":0}'::jsonb;
+ ?column? | ?column? 
+----------+----------
+ t        | t
+(1 row)
+
+SELECT j FROM (VALUES (1, '[1]'::jsonb), (2, '{"a":1}'), (3, '"s"'), (4, '1'), (5, 'true'), (6, 'null'), (7, '[]'), (8, '{}')) AS v(i, j) ORDER BY j, i;
+    j     
+----------
+ []
+ null
+ "s"
+ 1
+ true
+ [1]
+ {}
+ {"a": 1}
+(8 rows)
+
+SELECT 'nope'::jsonb;
+ERROR:  22P02: invalid input syntax for type json
+LINE 1: SELECT 'nope'::jsonb;
+               ^
+DETAIL:  Token "nope" is invalid.
+CONTEXT:  JSON data, line 1: nope
+SELECT '"\u0000"'::jsonb;
+ERROR:  22P05: unsupported Unicode escape sequence
+LINE 1: SELECT '"\u0000"'::jsonb;
+               ^
+DETAIL:  \u0000 cannot be converted to text.
+CONTEXT:  JSON data, line 1: "\u0000...
+SELECT '{"a":'::jsonb;
+ERROR:  22P02: invalid input syntax for type json
+LINE 1: SELECT '{"a":'::jsonb;
+               ^
+DETAIL:  The input string ended unexpectedly.
+CONTEXT:  JSON data, line 1: {"a":
+-- ===== adt out-functions: each call's cstring is its own (bugs/batch-01) =====
+CREATE TEMP TABLE outfn_probe(a "char", b "char", n1 name, n2 name, l1 pg_lsn, l2 pg_lsn, t boolean, m1 money, m2 money, d date, r real, dp double precision, i2 smallint, i4 integer, i8 bigint, mc1 macaddr, mc2 macaddr, tm time, tz timetz);
+INSERT INTO outfn_probe VALUES ('a','b','alpha','beta','0/1','0/2',true,'1','2','2000-01-01',12,34,5,12,11,'00:11:22:33:44:55','aa:bb:cc:dd:ee:ff','01:02:03','04:05:06+02');
+SELECT charout(a), charout(b), nameout(n1), nameout(n2), pg_lsn_out(l1), pg_lsn_out(l2), boolout(t), boolout(NOT t) FROM outfn_probe;
+ charout | charout | nameout | nameout | pg_lsn_out | pg_lsn_out | boolout | boolout 
+---------+---------+---------+---------+------------+------------+---------+---------
+ a       | b       | alpha   | beta    | 0/1        | 0/2        | t       | f
+(1 row)
+
+SELECT cash_out(m1), cash_out(m2), date_out(d), date_out(d + 1), float4out(r), float8out(dp), int2out(i2), int2out((i2 + 1)::smallint), int4out(i4), int4out(i4 + 22), int8out(i8), int8out(i8 + 11) FROM outfn_probe;
+ cash_out | cash_out |  date_out  |  date_out  | float4out | float8out | int2out | int2out | int4out | int4out | int8out | int8out 
+----------+----------+------------+------------+-----------+-----------+---------+---------+---------+---------+---------+---------
+ $1.00    | $2.00    | 01-01-2000 | 01-02-2000 | 12        | 34        | 5       | 6       | 12      | 34      | 11      | 22
+(1 row)
+
+SELECT macaddr_out(mc1), macaddr_out(mc2), time_out(tm), time_out(tm + interval '1 hour'), timetz_out(tz), timetz_out(tz + interval '1 hour'), format('%s %s', int4out(i4), int4out(i4 + 22)), concat(date_out(d), date_out(d + 1)) FROM outfn_probe;
+    macaddr_out    |    macaddr_out    | time_out | time_out | timetz_out  | timetz_out  | format |        concat        
+-------------------+-------------------+----------+----------+-------------+-------------+--------+----------------------
+ 00:11:22:33:44:55 | aa:bb:cc:dd:ee:ff | 01:02:03 | 02:02:03 | 04:05:06+02 | 05:05:06+02 | 12 34  | 01-01-200001-02-2000
+(1 row)
+
+CREATE TYPE outfn_e AS ENUM ('a','b');
+CREATE TEMP TABLE outfn_et(x outfn_e, y outfn_e);
+INSERT INTO outfn_et VALUES ('a','b');
+SELECT enum_out(x), enum_out(y), format('%s %s', anyenum_out(x), anyenum_out(y)) FROM outfn_et;
+ enum_out | enum_out | format 
+----------+----------+--------
+ a        | b        | a b
+(1 row)
+
+DROP TABLE outfn_et;
+DROP TYPE outfn_e;
+DROP TABLE outfn_probe;
+-- ===== gin_cmp_tslexeme exposes memcmp's raw difference =====
+SELECT gin_cmp_tslexeme('a'::text, 'z'::text), gin_cmp_tslexeme('z'::text, 'a'::text), gin_cmp_tslexeme('ab'::text, 'a'::text);
+ gin_cmp_tslexeme | gin_cmp_tslexeme | gin_cmp_tslexeme 
+------------------+------------------+------------------
+              -25 |               25 |                1
+(1 row)
+
+-- ===== a typmodout returning NULL is an error, not a backend death =====
+CREATE DOMAIN ft_null AS integer;
+CREATE FUNCTION ft_null_out(integer) RETURNS cstring LANGUAGE internal AS 'pg_last_wal_receive_lsn';
+UPDATE pg_type SET typmodout = 'ft_null_out(integer)'::regprocedure WHERE oid = 'ft_null'::regtype;
+DO $$ BEGIN PERFORM format_type('ft_null'::regtype, 1); EXCEPTION WHEN OTHERS THEN RAISE NOTICE '%: %', SQLSTATE, regexp_replace(SQLERRM, '[0-9]+', 'N'); END $$;
+NOTICE:  00000: XX000: function N returned NULL
+DROP DOMAIN ft_null;
+DROP FUNCTION ft_null_out(integer);
+-- ===== aclexplode is value-per-call =====
+SELECT aclexplode(array_fill(makeaclitem(0, 10, 'SELECT,INSERT', false), ARRAY[3])) LIMIT 2;
+   aclexplode    
+-----------------
+ (10,0,INSERT,f)
+ (10,0,SELECT,f)
+(2 rows)
+
+SELECT * FROM aclexplode('{postgres=arwdDxtm/postgres,=r/postgres}'::aclitem[]);
+ grantor | grantee | privilege_type | is_grantable 
+---------+---------+----------------+--------------
+      10 |      10 | INSERT         | f
+      10 |      10 | SELECT         | f
+      10 |      10 | UPDATE         | f
+      10 |      10 | DELETE         | f
+      10 |      10 | TRUNCATE       | f
+      10 |      10 | REFERENCES     | f
+      10 |      10 | TRIGGER        | f
+      10 |      10 | MAINTAIN       | f
+      10 |       0 | SELECT         | f
+(9 rows)
+
+-- ===== array_append as an aggregate transition keeps linear state =====
+CREATE AGGREGATE collect_int(integer) (SFUNC = array_append, STYPE = integer[], INITCOND = '{}');
+SELECT cardinality(collect_int(i)), collect_int(i) FROM generate_series(1, 5) AS g(i);
+ cardinality | collect_int 
+-------------+-------------
+           5 | {1,2,3,4,5}
+(1 row)
+
+SELECT cardinality(collect_int(i)) FROM generate_series(1, 5000) AS g(i);
+ cardinality 
+-------------
+        5000
+(1 row)
+
+DROP AGGREGATE collect_int(integer);
+-- ===== width_bucket with a comparator that re-enters width_bucket =====
+CREATE TYPE wbt AS (v integer);
+CREATE FUNCTION wbt_cmp(a wbt, b wbt) RETURNS int LANGUAGE plpgsql AS $$ DECLARE r int; BEGIN IF a.v = 1 THEN r := width_bucket(ROW(0)::wbt, ARRAY[ROW(0)::wbt]); END IF; RETURN CASE WHEN a.v < b.v THEN -1 WHEN a.v > b.v THEN 1 ELSE 0 END; END $$;
+CREATE FUNCTION wbt_lt(wbt, wbt) RETURNS bool LANGUAGE sql AS 'SELECT wbt_cmp($1, $2) < 0';
+CREATE OPERATOR < (leftarg = wbt, rightarg = wbt, function = wbt_lt);
+CREATE OPERATOR CLASS wbt_ops DEFAULT FOR TYPE wbt USING btree AS OPERATOR 1 <, FUNCTION 1 wbt_cmp(wbt, wbt);
+SELECT width_bucket(ROW(1)::wbt, ARRAY[ROW(0)::wbt]);
+ width_bucket 
+--------------
+            1
+(1 row)
+
+DROP TYPE wbt CASCADE;
+NOTICE:  00000: drop cascades to 4 other objects
+DETAIL:  drop cascades to function wbt_cmp(wbt,wbt)
+drop cascades to function wbt_lt(wbt,wbt)
+drop cascades to operator <(wbt,wbt)
+drop cascades to operator class wbt_ops for access method btree
+-- ===== RI: PK image equality ignores the varlena header form =====
+CREATE TABLE ri_p(k text PRIMARY KEY);
+ALTER TABLE ri_p ALTER COLUMN k SET STORAGE EXTERNAL;
+INSERT INTO ri_p VALUES (repeat('ab', 1200));
+CREATE TABLE ri_c(k text REFERENCES ri_p(k) ON UPDATE CASCADE);
+INSERT INTO ri_c VALUES (repeat('ab', 1200));
+ALTER TABLE ri_p ALTER COLUMN k SET STORAGE EXTENDED;
+UPDATE ri_p SET k = k || '';
+SELECT ctid FROM ri_c;
+ ctid  
+-------
+ (0,1)
+(1 row)
+
+DROP TABLE ri_c, ri_p;
+-- ===== a LANGUAGE internal alias of a LIKE support function =====
+CREATE FUNCTION my_like_support(internal) RETURNS internal LANGUAGE internal AS 'textlike_support';
+CREATE FUNCTION my_like(text, text) RETURNS boolean LANGUAGE internal IMMUTABLE STRICT SUPPORT my_like_support AS 'textlike';
+CREATE TABLE tlike(s text);
+INSERT INTO tlike VALUES ('abcd'), ('xyz');
+CREATE INDEX ON tlike(s text_pattern_ops);
+SELECT count(*) FROM tlike WHERE my_like(s, 'abc%');
+ count 
+-------
+     1
+(1 row)
+
+DROP TABLE tlike;
+DROP FUNCTION my_like(text, text);
+DROP FUNCTION my_like_support(internal);
+-- ===== pg_timezone_abbrevs_* read the session state per row =====
+SET timezone = 'Europe/Paris';
+SELECT pg_catalog.pg_timezone_abbrevs_zone(), set_config('TimeZone', 'UTC', false) LIMIT 2;
+ pg_timezone_abbrevs_zone | set_config 
+--------------------------+------------
+ (LMT,00:09:21,f)         | UTC
+(1 row)
+
+RESET timezone;
+SELECT * FROM pg_timezone_abbrevs_abbrevs() LIMIT 1;
+ abbrev | utc_offset | is_dst 
+--------+------------+--------
+ ACDT   | 10:30:00   | t
+(1 row)
+
+SELECT count(*) > 0 FROM pg_timezone_abbrevs_abbrevs();
+ ?column? 
+----------
+ t
+(1 row)
+
+-- ===== adt out-functions: each call's cstring is its own (bugs/batch-02) =====
+CREATE TEMP TABLE b02_outfn(m1 macaddr8, m2 macaddr8, i1 inet, i2 inet, c1 cidr, c2 cidr, o1 oid, o2 oid, x1 xid, x2 xid, d1 cid, d2 cid);
+INSERT INTO b02_outfn VALUES ('00:11:22:33:44:55:66:77', '88:99:aa:bb:cc:dd:ee:ff', '1.2.3.4', '5.6.7.8', '10.0.0.0/8', '11.0.0.0/8', 11, 22, '5', '6', '7', '8');
+SELECT macaddr8_out(m1), macaddr8_out(m2), inet_out(i1), inet_out(i2), cidr_out(c1), cidr_out(c2) FROM b02_outfn;
+      macaddr8_out       |      macaddr8_out       | inet_out | inet_out |  cidr_out  |  cidr_out  
+-------------------------+-------------------------+----------+----------+------------+------------
+ 00:11:22:33:44:55:66:77 | 88:99:aa:bb:cc:dd:ee:ff | 1.2.3.4  | 5.6.7.8  | 10.0.0.0/8 | 11.0.0.0/8
+(1 row)
+
+SELECT oidout(o1), oidout(o2), xidout(x1), xidout(x2), cidout(d1), cidout(d2), format('%s/%s', oidout(o1), oidout(o2)) FROM b02_outfn;
+ oidout | oidout | xidout | xidout | cidout | cidout | format 
+--------+--------+--------+--------+--------+--------+--------
+ 11     | 22     | 5      | 6      | 7      | 8      | 11/22
+(1 row)
+
+SELECT format('%s/%s', regclassout((4000000000 + g)::oid), regclassout((4100000000 + g)::oid)), regtypeout(23), regtypeout(25), regprocout(1), regprocout(2) FROM generate_series(1, 2) AS g;
+        format         | regtypeout | regtypeout | regprocout | regprocout 
+-----------------------+------------+------------+------------+------------
+ 4000000001/4100000001 | integer    | text       | 1          | 2
+ 4000000002/4100000002 | integer    | text       | 1          | 2
+(2 rows)
+
+DROP TABLE b02_outfn;
+-- ===== multirange_constructor2 with zero arguments =====
+CREATE FUNCTION b02_mr_zero() RETURNS int4multirange AS 'multirange_constructor2' LANGUAGE internal;
+SELECT b02_mr_zero(), isempty(b02_mr_zero());
+ b02_mr_zero | isempty 
+-------------+---------
+ {}          | t
+(1 row)
+
+DROP FUNCTION b02_mr_zero();
+-- ===== regex whole match is leftmost-longest without alternation =====
+SELECT substring('aaab' FROM 'a*(?:ab)?'), substring('aaab' FROM '^a*(?:ab)?$'), regexp_replace('aaab', 'a*(?:ab)?', 'X'), substring('xaaab' FROM 'a*(?:ab)?'), 'xaaab' ~ '^a*(?:ab)?$';
+ substring | substring | regexp_replace | substring | ?column? 
+-----------+-----------+----------------+-----------+----------
+ aaab      | aaab      | X              |           | f
+(1 row)
+
+SELECT regexp_matches('aaab', '(a*)(?:ab)?'), substring('http://www.x.com/y' FROM '^https?://(?:www\.)?([^/]+)/.*$'), substring('abcabc' FROM '[a-c]*(?:cab)?');
+ regexp_matches | substring | substring 
+----------------+-----------+-----------
+ {aa}           | x.com     | abcabc
+(1 row)
+
+-- ===== reg* numeric input is oidin (strtoul base 0) =====
+SELECT '010'::regclass::oid, '010'::regtype::oid, '010'::regproc::oid, to_regclass('08') IS NULL, to_regtype('08') IS NULL;
+ oid | oid | oid | ?column? | ?column? 
+-----+-----+-----+----------+----------
+   8 |   8 |   8 | t        | t
+(1 row)
+
+SELECT '08'::regclass;
+ERROR:  22P02: invalid input syntax for type oid: "08"
+LINE 1: SELECT '08'::regclass;
+               ^
+SELECT '4294967296'::regclass;
+ERROR:  22003: value "4294967296" is out of range for type oid
+LINE 1: SELECT '4294967296'::regclass;
+               ^
+-- ===== RI key comparison over a descriptor-owned missing-column default =====
+CREATE TABLE b02_p(id int);
+INSERT INTO b02_p VALUES (1);
+ALTER TABLE b02_p ADD COLUMN k text DEFAULT 'x';
+ALTER TABLE b02_p ADD UNIQUE (k);
+CREATE TABLE b02_f(k text REFERENCES b02_p(k));
+INSERT INTO b02_f VALUES ('x');
+UPDATE b02_p SET id = 2;
+SELECT * FROM b02_p;
+ id | k 
+----+---
+  2 | x
+(1 row)
+
+DROP TABLE b02_f, b02_p;
+-- ===== pg_get_triggerdef detoasts a compressed tgargs =====
+CREATE TABLE b02_t(a int);
+CREATE FUNCTION b02_tf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+DO $$ BEGIN EXECUTE format('CREATE TRIGGER b02_trg BEFORE INSERT ON b02_t FOR EACH ROW EXECUTE FUNCTION b02_tf(%L)', repeat('x', 10000)); END $$;
+SELECT length(pg_get_triggerdef(oid)), left(pg_get_triggerdef(oid), 80) FROM pg_trigger WHERE tgname = 'b02_trg';
+ length |                                       left                                       
+--------+----------------------------------------------------------------------------------
+  10093 | CREATE TRIGGER b02_trg BEFORE INSERT ON public.b02_t FOR EACH ROW EXECUTE FUNCTI
+(1 row)
+
+DROP TABLE b02_t;
+DROP FUNCTION b02_tf();
+-- ===== opclass / collation visibility over more than 64 schemas =====
+CREATE TABLE b02_pat(v text);
+CREATE INDEX b02_pat_idx ON b02_pat(v text_pattern_ops);
+DO $$ BEGIN FOR g IN 1..70 LOOP EXECUTE 'CREATE SCHEMA b02_s' || g; END LOOP; END $$;
+CREATE COLLATION b02_s1.b02_c FROM pg_catalog."C";
+CREATE VIEW b02_v AS SELECT 'x'::text COLLATE b02_s1.b02_c AS x;
+SELECT set_config('search_path', string_agg('b02_s' || g, ',') || ',public', false) IS NOT NULL FROM generate_series(1, 70) g;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT pg_get_indexdef('b02_pat_idx'::regclass);
+                               pg_get_indexdef                               
+-----------------------------------------------------------------------------
+ CREATE INDEX b02_pat_idx ON public.b02_pat USING btree (v text_pattern_ops)
+(1 row)
+
+SELECT pg_get_viewdef('b02_v'::regclass);
+             pg_get_viewdef              
+-----------------------------------------
+  SELECT ('x'::text COLLATE b02_c) AS x;
+(1 row)
+
+RESET search_path;
+SELECT pg_get_viewdef('b02_v'::regclass);
+                 pg_get_viewdef                 
+------------------------------------------------
+  SELECT ('x'::text COLLATE b02_s1.b02_c) AS x;
+(1 row)
+
+DROP VIEW b02_v;
+DROP TABLE b02_pat;
+DO $$ BEGIN FOR g IN 1..70 LOOP EXECUTE 'DROP SCHEMA b02_s' || g || ' CASCADE'; END LOOP; END $$;
+NOTICE:  00000: drop cascades to collation b02_s1.b02_c
+-- ===== get_variable: an attnum past the relation's columns is a catchable error =====
+CREATE TABLE b02_expr_source(a int, b int CHECK (b > 0));
+CREATE TABLE b02_expr_target(a int);
+SELECT pg_get_expr(conbin, 'b02_expr_target'::regclass) FROM pg_constraint WHERE conrelid = 'b02_expr_source'::regclass AND contype = 'c';
+ERROR:  XX000: invalid attnum 2 for relation "b02_expr_target"
+DROP TABLE b02_expr_source, b02_expr_target;
+-- ===== batch-03: out-function results are per-FmgrInfo (tid, xid8, uuid, timestamp family) =====
+CREATE TEMP TABLE b03_outfn(t1 tid, t2 tid, x1 xid8, x2 xid8, u1 uuid, u2 uuid, s1 timestamp, s2 timestamp, z1 timestamptz, z2 timestamptz);
+INSERT INTO b03_outfn VALUES ('(1,2)', '(3,4)', '33', '44', '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', '2000-01-01', '2001-02-03', '2000-01-01 00:00+00', '2001-02-03 00:00+00');
+SELECT tidout(t1), tidout(t2), xid8out(x1), xid8out(x2), uuid_out(u1), uuid_out(u2) FROM b03_outfn;
+ tidout | tidout | xid8out | xid8out |               uuid_out               |               uuid_out               
+--------+--------+---------+---------+--------------------------------------+--------------------------------------
+ (1,2)  | (3,4)  | 33      | 44      | 00000000-0000-0000-0000-000000000001 | 00000000-0000-0000-0000-000000000002
+(1 row)
+
+SELECT timestamp_out(s1), timestamp_out(s2), timestamptz_out(z1), timestamptz_out(z2) FROM b03_outfn;
+      timestamp_out       |      timestamp_out       |       timestamptz_out        |       timestamptz_out        
+--------------------------+--------------------------+------------------------------+------------------------------
+ Sat Jan 01 00:00:00 2000 | Sat Feb 03 00:00:00 2001 | Fri Dec 31 16:00:00 1999 PST | Fri Feb 02 16:00:00 2001 PST
+(1 row)
+
+SELECT timestamptypmodout(3), timestamptypmodout(4), timestamptztypmodout(1), timestamptztypmodout(2), intervaltypmodout(2147418115), intervaltypmodout(2147418116);
+  timestamptypmodout   |  timestamptypmodout   | timestamptztypmodout | timestamptztypmodout | intervaltypmodout | intervaltypmodout 
+-----------------------+-----------------------+----------------------+----------------------+-------------------+-------------------
+ (3) without time zone | (4) without time zone | (1) with time zone   | (2) with time zone   | (3)               | (4)
+(1 row)
+
+DROP TABLE b03_outfn;
+-- ===== bitcmp is memcmp's raw difference =====
+SELECT bitcmp(B'11111111', B'00000000'), bitcmp(B'00000000', B'11111111'), bitcmp(B'0101', B'0100'), varbitcmp(B'11111111', B'00000000'), bitcmp(B'010', B'0100'), B'0101' > B'0100';
+ bitcmp | bitcmp | bitcmp | varbitcmp | bitcmp | ?column? 
+--------+--------+--------+-----------+--------+----------
+    255 |   -255 |     16 |       255 |     -1 | t
+(1 row)
+
+-- ===== a codepoint >= 0xF8 after '<?xml' names a processing instruction =====
+SELECT XMLPARSE(CONTENT '<?xmlα?>');
+WARNING:  01000: line 1: xmlParsePITarget: invalid name prefix 'xml'
+<?xmlα?>
+       ^
+ xmlparse 
+----------
+ <?xmlα?>
+(1 row)
+
+SELECT XMLPARSE(CONTENT '<?xmlα ?>');
+WARNING:  01000: line 1: xmlParsePITarget: invalid name prefix 'xml'
+<?xmlα ?>
+       ^
+ xmlparse  
+-----------
+ <?xmlα ?>
+(1 row)
+
+-- ===== xpath numbers print through float8out (exponent form, extra_float_digits) =====
+SELECT (xpath('100000000000000000000', '<r/>'::xml))[1]::text, (xpath('1000000000000000', '<r/>'::xml))[1]::text, (xpath('1 div 3', '<r/>'::xml))[1]::text, (xpath('1 div 0', '<r/>'::xml))[1]::text, (xpath('-1 div 0', '<r/>'::xml))[1]::text;
+ xpath | xpath |       xpath        |  xpath   |   xpath   
+-------+-------+--------------------+----------+-----------
+ 1e+20 | 1e+15 | 0.3333333333333333 | Infinity | -Infinity
+(1 row)
+
+SET extra_float_digits = 0;
+SELECT (xpath('1 div 3', '<r/>'::xml))[1]::text, (xpath('10000000000000000', '<r/>'::xml))[1]::text;
+       xpath       | xpath 
+-------------------+-------
+ 0.333333333333333 | 1e+16
+(1 row)
+
+RESET extra_float_digits;
+-- ===== XMLTABLE keeps its own libxml error context across a nested XML operation =====
+SELECT * FROM XMLTABLE('/r/a' PASSING ('<r><a/><a/></r>'::xml) COLUMNS b boolean PATH 'missing' DEFAULT xml_is_well_formed_document('<' || random()::text), c text PATH 'name()');
+ b | c 
+---+---
+ f | a
+ f | a
+(2 rows)
+
+-- ===== jsonb_object_agg finalfn is non-destructive on a shared transition state =====
+CREATE AGGREGATE b03_joaus(text, anyelement) (sfunc = jsonb_object_agg_unique_strict_transfn, stype = internal, finalfunc = jsonb_object_agg_finalfn, parallel = safe);
+SELECT jsonb_object_agg_unique_strict(k, v), b03_joaus(k, v) FROM (VALUES ('a', NULL::int), ('a2', NULL::int), ('b', 1), ('c', 2)) t(k, v);
+ jsonb_object_agg_unique_strict |    b03_joaus     
+--------------------------------+------------------
+ {"b": 1, "c": 2}               | {"b": 1, "c": 2}
+(1 row)
+
+DROP AGGREGATE b03_joaus(text, anyelement);
